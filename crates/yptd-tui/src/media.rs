@@ -7,7 +7,9 @@
 //! *before* it is decoded, caching decoded pictures, and degrading to a text
 //! line when the terminal or the file will not cooperate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use image::imageops::FilterType;
 use image::DynamicImage;
@@ -27,10 +29,35 @@ const MAX_PREVIEW_COLS: u16 = 48;
 /// Height is decided from the image's aspect ratio and reserved in the layout
 /// before the picture is drawn, so a message's height never changes between
 /// the frame that measured it and the frame that paints it.
+/// What the encoder sends back: which picture at which size, and the
+/// terminal-ready result or why there is none.
+pub type Encoded = ((String, u16, u16, bool), Result<Protocol, String>);
+
+/// One request to the encoder: the picture and the exact cells to fill.
+struct EncodeJob {
+    key: (String, u16, u16, bool),
+    source: Arc<DynamicImage>,
+}
+
+/// Decoded pictures this many and older are dropped, least recently drawn
+/// first. Each is a few megabytes; a long conversation must not keep all
+/// of them.
+const MAX_DECODED: usize = 24;
+
 pub struct Media {
     picker: Option<Picker>,
     /// Decoded pictures, already shrunk to something a terminal can use.
-    images: HashMap<String, DynamicImage>,
+    images: HashMap<String, Arc<DynamicImage>>,
+    /// When each picture was last drawn, for eviction.
+    last_used: HashMap<String, u64>,
+    tick: u64,
+    /// Where encode requests go. Encoding is a resize plus the terminal's
+    /// own encoding of the pixels, tens of milliseconds a picture; doing it
+    /// while drawing is what makes the first frame with pictures stutter.
+    encoder: Option<Sender<EncodeJob>>,
+    /// Sizes already asked for, so a frame drawn before the answer arrives
+    /// does not ask again.
+    pending: HashSet<(String, u16, u16, bool)>,
     /// One encoded protocol per picture *per size it is drawn at*.
     ///
     /// Built here rather than left to the widget: handing the library a big
@@ -55,10 +82,42 @@ impl Media {
         Self {
             picker: Picker::from_query_stdio().ok(),
             images: HashMap::new(),
+            last_used: HashMap::new(),
+            tick: 0,
+            encoder: None,
+            pending: HashSet::new(),
             protocols: HashMap::new(),
             sizes: HashMap::new(),
             failed: HashMap::new(),
             revision: 0,
+        }
+    }
+
+    /// Starts the thread that turns pictures into terminal sequences.
+    ///
+    /// `out` is the main loop's channel and `wake` wraps a result into
+    /// whatever that loop understands, the same shape as the downloader.
+    pub fn start_encoder<T, F>(&mut self, out: Sender<T>, wake: F)
+    where
+        T: Send + 'static,
+        F: Fn(Encoded) -> T + Send + 'static,
+    {
+        let Some(picker) = self.picker.clone() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<EncodeJob>();
+        let spawned = std::thread::Builder::new()
+            .name("image-encoder".into())
+            .spawn(move || {
+                for job in rx {
+                    let result = encode(&picker, &job.source, job.key.1, job.key.2, job.key.3);
+                    if out.send(wake((job.key, result))).is_err() {
+                        break;
+                    }
+                }
+            });
+        if spawned.is_ok() {
+            self.encoder = Some(tx);
         }
     }
 
@@ -67,6 +126,10 @@ impl Media {
         Self {
             picker: None,
             images: HashMap::new(),
+            last_used: HashMap::new(),
+            tick: 0,
+            encoder: None,
+            pending: HashSet::new(),
             protocols: HashMap::new(),
             sizes: HashMap::new(),
             failed: HashMap::new(),
@@ -76,6 +139,19 @@ impl Media {
 
     pub fn enabled(&self) -> bool {
         self.picker.is_some()
+    }
+
+    /// Protocol and cell size in one short label, for the status line: the
+    /// two numbers that decide whether a picture can be sharp, where the
+    /// person can see them without running a diagnostic.
+    pub fn status_label(&self) -> String {
+        match self.picker.as_ref() {
+            Some(picker) => {
+                let cell = picker.font_size();
+                format!("{} {}×{}", self.protocol_name(), cell.width, cell.height)
+            }
+            None => "off".to_owned(),
+        }
     }
 
     /// Short name of the negotiated protocol, for the status line.
@@ -100,8 +176,52 @@ impl Media {
         }
         self.revision = self.revision.wrapping_add(1);
         self.sizes.insert(key.to_owned(), natural);
-        self.images.insert(key.to_owned(), image);
+        self.images.insert(key.to_owned(), Arc::new(image));
+        self.touch(key);
+        self.evict_decoded();
         self.rows_for(key)
+    }
+
+    fn touch(&mut self, key: &str) {
+        self.tick += 1;
+        self.last_used.insert(key.to_owned(), self.tick);
+    }
+
+    /// Drops the decoded pictures drawn longest ago once there are too many.
+    /// Their sizes stay, so the rows they occupy do not change; a scroll
+    /// back to them re-downloads from the disk cache.
+    fn evict_decoded(&mut self) {
+        while self.images.len() > MAX_DECODED {
+            let Some(oldest) = self
+                .images
+                .keys()
+                .min_by_key(|k| self.last_used.get(*k).copied().unwrap_or(0))
+                .cloned()
+            else {
+                break;
+            };
+            self.images.remove(&oldest);
+            self.protocols.retain(|(k, ..), _| *k != oldest);
+            self.pending.retain(|(k, ..)| *k != oldest);
+        }
+    }
+
+    /// Whether the picture itself is still held. A size that is known while
+    /// the pixels were let go asks the caller to fetch again.
+    pub fn holds(&self, key: &str) -> bool {
+        self.images.contains_key(key)
+    }
+
+    /// Files an encoder's answer.
+    pub fn store_encoded(&mut self, (key, result): Encoded) {
+        self.pending.remove(&key);
+        match result {
+            Ok(protocol) => {
+                self.evict_if_crowded();
+                self.protocols.insert(key, protocol);
+            }
+            Err(reason) => self.mark_failed(&key.0, reason),
+        }
     }
 
     pub fn mark_failed(&mut self, key: &str, reason: impl Into<String>) {
@@ -189,7 +309,8 @@ impl Media {
     }
 
     /// Draws a registered image into `area`.
-    /// Draws a picture into `area`.
+    /// Draws a picture into `area`, or asks for it to be encoded at this size
+    /// and draws nothing until that comes back.
     ///
     /// `fill` covers the whole area, cropping what does not fit, which is what
     /// makes a row of pictures read as one block; otherwise the picture is
@@ -198,54 +319,41 @@ impl Media {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        if self.ensure_protocol(key, area.width, area.height, fill) {
-            let cached = (key.to_owned(), area.width, area.height, fill);
-            if let Some(protocol) = self.protocols.get(&cached) {
-                frame.render_widget(Image::new(protocol), area);
+        self.touch(key);
+        let cached = (key.to_owned(), area.width, area.height, fill);
+        if let Some(protocol) = self.protocols.get(&cached) {
+            frame.render_widget(Image::new(protocol), area);
+            return;
+        }
+        if self.pending.contains(&cached) {
+            return;
+        }
+        let Some(source) = self.images.get(key) else {
+            return;
+        };
+        match self.encoder.as_ref() {
+            Some(encoder) => {
+                if encoder
+                    .send(EncodeJob { key: cached.clone(), source: Arc::clone(source) })
+                    .is_ok()
+                {
+                    self.pending.insert(cached);
+                }
+            }
+            // No encoder thread (tests, the capture paths): do it here.
+            None => {
+                if let Some(picker) = self.picker.as_ref() {
+                    let source = Arc::clone(source);
+                    match encode(picker, &source, area.width, area.height, fill) {
+                        Ok(protocol) => {
+                            frame.render_widget(Image::new(&protocol), area);
+                            self.protocols.insert(cached, protocol);
+                        }
+                        Err(reason) => self.mark_failed(key, reason),
+                    }
+                }
             }
         }
-    }
-
-    /// Encodes this picture at this exact size, unless that was already done.
-    fn ensure_protocol(&mut self, key: &str, cols: u16, rows: u16, fill: bool) -> bool {
-        let cached = (key.to_owned(), cols, rows, fill);
-        if self.protocols.contains_key(&cached) {
-            return true;
-        }
-        let Some(picker) = self.picker.as_mut() else {
-            return false;
-        };
-        let Some(source) = self.images.get(key) else {
-            return false;
-        };
-        let cell = picker.font_size();
-        let (Some(canvas_w), Some(canvas_h)) = (
-            u32::from(cols).checked_mul(u32::from(cell.width)),
-            u32::from(rows).checked_mul(u32::from(cell.height)),
-        ) else {
-            return false;
-        };
-        if canvas_w == 0 || canvas_h == 0 {
-            return false;
-        }
-
-        // Lanczos, and only here: this is the one resize that decides how the
-        // picture looks, and it starts from an image already close to its
-        // final size, so the good filter costs little.
-        let canvas = if fill {
-            cover(source, canvas_w, canvas_h)
-        } else {
-            source.resize(canvas_w, canvas_h, FilterType::Lanczos3)
-        };
-        // The canvas already matches the area, so the library has nothing left
-        // to resize and its own filter never comes into it.
-        let Ok(protocol) = picker.new_protocol(canvas, Size::new(cols, rows), Resize::Fit(None))
-        else {
-            return false;
-        };
-        self.evict_if_crowded();
-        self.protocols.insert(cached, protocol);
-        true
     }
 
     /// Keeps the encoded set bounded. Pictures are cheap to re-encode and a
@@ -265,6 +373,39 @@ impl Media {
             self.protocols.remove(&victim);
         }
     }
+}
+
+/// Resizes a picture to exactly `cols` × `rows` cells and encodes it for the
+/// terminal. The canvas matches the area, so the library has nothing left to
+/// resize and its own (nearest-neighbour) filter never comes into it.
+fn encode(
+    picker: &Picker,
+    source: &DynamicImage,
+    cols: u16,
+    rows: u16,
+    fill: bool,
+) -> Result<Protocol, String> {
+    let cell = picker.font_size();
+    let (Some(canvas_w), Some(canvas_h)) = (
+        u32::from(cols).checked_mul(u32::from(cell.width)),
+        u32::from(rows).checked_mul(u32::from(cell.height)),
+    ) else {
+        return Err("画布尺寸溢出".into());
+    };
+    if canvas_w == 0 || canvas_h == 0 {
+        return Err("画布为空".into());
+    }
+    // Lanczos, and only here: this is the one resize that decides how the
+    // picture looks, and it starts from an image already close to its final
+    // size, so the good filter costs little.
+    let canvas = if fill {
+        cover(source, canvas_w, canvas_h)
+    } else {
+        source.resize(canvas_w, canvas_h, FilterType::Lanczos3)
+    };
+    picker
+        .new_protocol(canvas, Size::new(cols, rows), Resize::Fit(None))
+        .map_err(|e| format!("编码失败: {e}"))
 }
 
 /// Scales to cover the canvas and trims the overflow from the centre, so a

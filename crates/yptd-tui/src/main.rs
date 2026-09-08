@@ -512,6 +512,8 @@ enum Input {
     /// A picture finished downloading: its cache key, and the bytes or the
     /// reason there are none.
     Image(downloads::Fetched),
+    /// A picture finished encoding for the terminal at one size.
+    Encoded(media::Encoded),
     /// A staged picture finished uploading, carrying the SDK's echo of the
     /// message it became.
     Sent(Result<serde_json::Value, im_sidecar::Error>),
@@ -527,6 +529,23 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
     let theme = Theme::default();
     let (tx, rx) = mpsc::channel::<Input>();
     let cache = Paths::discover().cache_dir();
+
+    let mut terminal = ratatui::init();
+    // Bracketed paste is what turns a dragged file into one event instead of
+    // a burst of keystrokes that would land in the composer character by
+    // character.
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+
+    // Ask the terminal what it can do BEFORE anything else reads stdin. The
+    // query is a round trip on the same stream the input thread reads; start
+    // that thread first and it swallows the terminal's answer, the picker
+    // times out, and every picture degrades to half-block characters drawn
+    // with a guessed cell size -- which is what "blurry and laggy" looks
+    // like from the outside.
+    let mut media = media::Media::detect();
+    if media.enabled() {
+        media.start_encoder(tx.clone(), Input::Encoded);
+    }
 
     // Terminal input on its own thread: `event::read` blocks, and the loop
     // must also wake for sidecar traffic.
@@ -567,16 +586,8 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
         None => None,
     };
 
-    let mut terminal = ratatui::init();
-    // Bracketed paste is what turns a dragged file into one event instead of
-    // a burst of keystrokes that would land in the composer character by
-    // character.
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let mut clicks = mouse::Clicks::default();
     let mut layout_cache = ui::Cache::default();
-    // Protocol negotiation talks to the terminal, so it happens once at
-    // startup rather than on the first message that carries a picture.
-    let mut media = media::Media::detect();
     // Nothing to fetch without a server, and nothing to show without a
     // graphics protocol, so in either case the worker never starts.
     let mut downloads = if backend.is_some() && media.enabled() {
@@ -621,7 +632,7 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
         for message in app.messages() {
             if let Some(a) = message.attachment()
                 && a.kind == im_model::AttachmentKind::Image
-                && media.rows_for(a.key()) == 0
+                && (media.rows_for(a.key()) == 0 || !media.holds(a.key()))
                 && media.failure(a.key()).is_none()
             {
                 downloads.request(a.key(), &a.url);
@@ -773,7 +784,14 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
                     }
                 }
             }
+            Input::Encoded(done) => {
+                media.store_encoded(done);
+                if deadline.is_none() {
+                    deadline = Some(Instant::now() + COALESCE);
+                }
+            }
             Input::Image((key, outcome)) => {
+                downloads.delivered(&key);
                 match outcome {
                     Ok((image, natural)) => {
                         media.insert(&key, image, natural);

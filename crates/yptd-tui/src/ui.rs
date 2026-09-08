@@ -388,7 +388,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, media: &Media, theme: &
     let mut right_spans = Vec::new();
     if media.enabled() {
         right_spans.push(TuiSpan::styled(
-            format!("图 {}  ", media.protocol_name()),
+            format!("图 {}  ", media.status_label()),
             theme.style(HG::StatusLabel),
         ));
     }

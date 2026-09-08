@@ -69,6 +69,13 @@ impl Downloads {
         }
     }
 
+    /// Forgets that a picture was asked for, once its answer has arrived, so
+    /// a later request -- after the decoded copy was let go to save memory --
+    /// fetches it again, from the disk cache.
+    pub fn delivered(&mut self, key: &str) {
+        self.requested.remove(key);
+    }
+
     /// Queues a picture unless it is already on its way. Returns whether this
     /// call is what queued it.
     pub fn request(&mut self, key: &str, url: &str) -> bool {
