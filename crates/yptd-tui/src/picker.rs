@@ -27,6 +27,8 @@ pub enum Purpose {
     /// Insert `@somebody` into the draft. The `@` is already typed, so
     /// cancelling leaves it behind as ordinary text.
     Mention,
+    /// Insert an emoji, replacing the `:` that opened the list.
+    Emoji,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +177,24 @@ impl Picker {
         }
         Verdict::Continue
     }
+}
+
+/// Every emoji that has a `:shortcode:`, as picker rows.
+///
+/// Keyed by shortcode rather than by name: it is what people already type in
+/// every other chat client, and it is ASCII, so filtering works without a
+/// keyboard switch.
+pub fn emoji_rows() -> Vec<PickItem> {
+    emojis::iter()
+        .filter_map(|emoji| {
+            let shortcode = emoji.shortcode()?;
+            Some(PickItem {
+                id: emoji.as_str().to_owned(),
+                label: format!("{} :{shortcode}:", emoji.as_str()),
+                detail: emoji.name().to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// The roster the mock uses when there is no server to ask.

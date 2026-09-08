@@ -18,6 +18,7 @@ ratatui-image = { workspace = true }
 syntect = { workspace = true }
 unicode-width = { workspace = true }
 dirs = { workspace = true }
+emojis = { workspace = true }
 libc = { workspace = true }
 im-model = { workspace = true }
 im-sidecar = { workspace = true }

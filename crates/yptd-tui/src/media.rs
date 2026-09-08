@@ -102,6 +102,36 @@ impl Media {
         self.revision
     }
 
+    /// What the terminal answered when asked about its geometry.
+    ///
+    /// The one number that decides how sharp a picture can be: everything is
+    /// resized to the area's size *in pixels*, and that is cells times this.
+    /// A terminal that reports logical rather than device pixels on a
+    /// high-density screen halves the resolution of every image, and the only
+    /// way to tell is to look.
+    pub fn report(&self) -> String {
+        let Some(picker) = self.picker.as_ref() else {
+            return "图形协议: 无（这个终端不支持，图片会降级成一行文字）".to_owned();
+        };
+        let size = picker.font_size();
+        let album_cols = crate::album::MAX_COLS;
+        let album_rows = crate::album::MAX_ROWS;
+        format!(
+            "图形协议: {}\n             终端单元格: {} × {} 像素\n             单张图上限: {} 列 × {} 行 = {} × {} 像素\n             一排四张时每格: {} 列 × {} 行 = {} × {} 像素",
+            self.protocol_name(),
+            size.width,
+            size.height,
+            crate::album::SINGLE_MAX_COLS,
+            album_rows,
+            u32::from(crate::album::SINGLE_MAX_COLS) * u32::from(size.width),
+            u32::from(album_rows) * u32::from(size.height),
+            album_cols / 4,
+            album_rows,
+            u32::from(album_cols / 4) * u32::from(size.width),
+            u32::from(album_rows) * u32::from(size.height),
+        )
+    }
+
     pub fn failure(&self, key: &str) -> Option<&str> {
         self.failed.get(key).map(String::as_str)
     }

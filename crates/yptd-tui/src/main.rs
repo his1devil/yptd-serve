@@ -56,6 +56,7 @@ const USAGE: &str = "yptd — 终端 IM 客户端
   yptd doctor --new 群名 [用户…]   建群并拉人，打印结果
   yptd doctor --reply 用户 文本     引用最新一条并 @ 这个人
   yptd doctor --img 路径            发一张图片，打印回显里的 URL
+  yptd doctor --media               终端的图形能力与图片实际渲染尺寸
   yptd --mock              用内置示例数据启动，不连服务器
   yptd --snapshot WxH [scene] [palette]   离屏出帧（文本）
   yptd --ansi     WxH [scene]             离屏出帧（ANSI）
@@ -86,6 +87,7 @@ fn main() -> Fallible<()> {
             Some("--new") => cmd_doctor_new(args.get(2).map(String::as_str), args.get(3..).unwrap_or(&[])),
             Some("--reply") => cmd_doctor_reply(args.get(2).map(String::as_str), args.get(3..).unwrap_or(&[])),
             Some("--img") => cmd_doctor_image(args.get(2).map(String::as_str)),
+            Some("--media") => cmd_doctor_media(),
             text => cmd_doctor(text),
         },
         Some("--mock") => run(App::new(im_model::mock::snapshot()), None),
@@ -347,6 +349,22 @@ fn cmd_doctor_image(path: Option<&str>) -> Fallible<()> {
     let image = media::decode(&bytes)?;
     println!("  取回 {} 字节，解码 {}x{}", bytes.len(), image.width(), image.height());
     println!("  缓存在 {}", cache.display());
+    Ok(())
+}
+
+/// What this terminal can do with pictures, and how many pixels one actually
+/// gets. Needs a real terminal: the numbers come from asking it.
+fn cmd_doctor_media() -> Fallible<()> {
+    let media = media::Media::detect();
+    println!("{}", media.report());
+    if !media.enabled() {
+        println!();
+        println!("Kitty、Ghostty、iTerm2、WezTerm 支持；Terminal.app 不支持。");
+        return Ok(());
+    }
+    println!();
+    println!("像素数越大越清晰。如果这些数字明显小于你屏幕上那块区域的实际像素，");
+    println!("说明终端报的是逻辑像素而不是设备像素，图会被拉伸。");
     Ok(())
 }
 
@@ -885,6 +903,15 @@ fn on_key(
             open_mention_picker(app, &tag);
             Flow::Continue
         }
+        KeyAction::Emoji => {
+            app.picker = Some(Picker::new(
+                "表情",
+                Purpose::Emoji,
+                picker::emoji_rows(),
+                false,
+            ));
+            Flow::Continue
+        }
         KeyAction::Reply => {
             if !app.begin_reply() {
                 app.notice = Some("这条消息不能引用".into());
@@ -1126,6 +1153,16 @@ fn file_label(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Whether the cursor sits where a new word would start.
+fn at_word_start(app: &App) -> bool {
+    let text = app.composer.text();
+    let cursor = app.composer.cursor();
+    text[..cursor]
+        .chars()
+        .next_back()
+        .is_none_or(char::is_whitespace)
+}
+
 fn group_of(conv: &ConversationId) -> Option<String> {
     conv.0.strip_prefix("sg_").map(str::to_owned)
 }
@@ -1215,6 +1252,13 @@ fn complete_pick(app: &mut App, backend: Option<&mut Backend>, picker: Picker, i
                 insert_mention(app, id, &name);
             }
         }
+        Purpose::Emoji => {
+            if let Some(emoji) = ids.first() {
+                // The colon that opened the list is not part of the message.
+                app.composer.backspace();
+                app.composer.insert_str(emoji);
+            }
+        }
     }
 }
 
@@ -1301,6 +1345,8 @@ enum KeyAction {
     Command(String),
     /// `@` was typed; offer the people in this conversation.
     Mention,
+    /// `:` was typed at a word boundary; offer emoji.
+    Emoji,
     /// Quote the selected message.
     Reply,
 }
@@ -1379,6 +1425,12 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyActio
             KeyCode::Char('@') if app.mode == Mode::Insert => {
                 app.composer.insert_char('@');
                 return KeyAction::Mention;
+            }
+            // Only at a word boundary: a colon inside "10:30" or a URL is
+            // punctuation, not the start of an emoji.
+            KeyCode::Char(':') if app.mode == Mode::Insert && at_word_start(app) => {
+                app.composer.insert_char(':');
+                return KeyAction::Emoji;
             }
             KeyCode::Char(value) => app.composer.insert_char(value),
             _ => {}
@@ -1803,6 +1855,61 @@ mod tests {
         let (width, height) = parse_size("100x26");
         let out = render::to_text(&render::capture(width, height, Scene::Live).expect("render"));
         assert!(out.contains("🖼️ 3 张图片"), "the fixture's run collapses: {out}");
+    }
+
+    #[test]
+    fn a_colon_at_a_word_boundary_offers_emoji() {
+        let mut app = mock_app();
+        app.mode = Mode::Insert;
+        press(&mut app, KeyCode::Char(':'));
+        assert_eq!(app.composer.text(), ":");
+        let picker = app.picker.as_ref().expect("the emoji list opens");
+        assert!(picker.items.len() > 500, "the whole set is offered");
+        // Filtering is by shortcode, which is what people already type.
+        let mut filtered = picker.clone();
+        for c in "smile".chars() {
+            filtered.push_char(c);
+        }
+        assert!(
+            filtered.visible().iter().any(|&i| filtered.items[i].label.contains(":smile:")),
+            "typing a shortcode finds it"
+        );
+    }
+
+    #[test]
+    fn a_colon_inside_a_word_stays_punctuation() {
+        // "10:30" and "https://…" are not emoji.
+        let mut app = mock_app();
+        app.mode = Mode::Insert;
+        app.composer.insert_str("10");
+        press(&mut app, KeyCode::Char(':'));
+        assert!(app.picker.is_none(), "no list for a colon mid-word");
+        assert_eq!(app.composer.text(), "10:");
+    }
+
+    #[test]
+    fn picking_an_emoji_replaces_the_colon_that_opened_the_list() {
+        let mut app = mock_app();
+        app.mode = Mode::Insert;
+        app.composer.insert_str("好的 ");
+        press(&mut app, KeyCode::Char(':'));
+        assert!(app.picker.is_some());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        let text = app.composer.text();
+        assert!(text.starts_with("好的 "), "{text:?}");
+        assert!(!text.contains(':'), "the colon must not survive: {text:?}");
+        assert!(text.chars().count() > 3, "an emoji went in: {text:?}");
+    }
+
+    #[test]
+    fn escaping_the_emoji_list_leaves_the_colon_as_typed() {
+        let mut app = mock_app();
+        app.mode = Mode::Insert;
+        press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+        assert_eq!(app.composer.text(), ":");
     }
 
     #[test]
