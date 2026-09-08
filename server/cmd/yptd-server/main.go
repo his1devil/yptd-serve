@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/his1devil/yptd/server/internal/api"
+	"github.com/his1devil/yptd/server/internal/bot"
 	"github.com/his1devil/yptd/server/internal/config"
 	"github.com/his1devil/yptd/server/internal/invite"
 	"github.com/his1devil/yptd/server/internal/openim"
@@ -38,6 +39,12 @@ const usage = `yptd-server — yptd 服务端与管理工具
   yptd-server user revoke  <userID>        吊销该用户全部设备凭据
   yptd-server check                        自检：Mongo 与 OpenIM 连通性
 
+  yptd-server bot setup                    创建 bot 账号（不占用邀请码）
+  yptd-server bot allow  <userID>          允许这个人使唤 bot
+  yptd-server bot deny   <userID>          取消
+  yptd-server bot list                     谁被允许了
+  yptd-server bot check                    自检：opencode 是否可用
+
 配置从环境变量读取：
   YPTD_LISTEN         默认 127.0.0.1:7080
   YPTD_MONGO_URI      必填
@@ -45,6 +52,15 @@ const usage = `yptd-server — yptd 服务端与管理工具
   YPTD_OPENIM_SECRET  必填，OpenIM share.yml 里的 secret
   YPTD_OPENIM_ADMIN   默认 imAdmin
   YPTD_INVITE_TTL     默认 24h
+
+bot 相关（不设 YPTD_BOT_OPENCODE_URL 就整个关闭）：
+  YPTD_BOT_USER            默认 agentbot
+  YPTD_BOT_NICKNAME        默认 助手
+  YPTD_BOT_OPENCODE_URL    opencode serve 的地址
+  YPTD_BOT_OPENCODE_USER   默认 yptd
+  YPTD_BOT_OPENCODE_PASSWORD
+  YPTD_BOT_MODEL           默认 zhipuai/glm-5.3
+  YPTD_BOT_TIMEOUT         默认 5m
 `
 
 func main() {
@@ -66,6 +82,8 @@ func run(args []string) error {
 		return cmdInvite(args[1:])
 	case "user":
 		return cmdUser(args[1:])
+	case "bot":
+		return cmdBot(args[1:])
 	case "check":
 		return cmdCheck()
 	case "-h", "--help", "help":
@@ -320,4 +338,108 @@ func cmdCheck() error {
 	}
 	fmt.Printf("  用户 %d 个，未使用邀请码 %d 个\n", len(users), len(invs))
 	return nil
+}
+
+// ------------------------------------------------------------------- bot ---
+
+func cmdBot(args []string) error {
+	if len(args) == 0 {
+		return errors.New("用法: yptd-server bot setup|allow|deny|list|check")
+	}
+	ctx := context.Background()
+	cfg, st, im, err := open(ctx)
+	if err != nil {
+		return err
+	}
+	defer st.Close(ctx)
+
+	switch args[0] {
+	case "setup":
+		exists, err := im.UserExists(ctx, cfg.BotUserID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			if err := im.RegisterUser(ctx, cfg.BotUserID, cfg.BotNickname, ""); err != nil {
+				return err
+			}
+		}
+		// A local row too, so `user list` shows it and nobody wonders where
+		// this account came from.
+		if _, err := st.GetUser(ctx, cfg.BotUserID); err != nil {
+			_ = st.CreateUser(ctx, store.User{
+				UserID:    cfg.BotUserID,
+				Nickname:  cfg.BotNickname,
+				CreatedAt: time.Now(),
+			})
+		}
+		fmt.Printf("bot 账号就绪: %s（%s）\n", cfg.BotUserID, cfg.BotNickname)
+		fmt.Println("把它拉进群，然后 @ 它提问。先给自己开权限:")
+		fmt.Printf("  yptd-server bot allow <你的用户名>\n")
+		return nil
+
+	case "allow":
+		if len(args) < 2 {
+			return errors.New("用法: yptd-server bot allow <userID>")
+		}
+		if err := st.BotAllow(ctx, args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("%s 现在可以使唤 bot 了\n", args[1])
+		return nil
+
+	case "deny":
+		if len(args) < 2 {
+			return errors.New("用法: yptd-server bot deny <userID>")
+		}
+		removed, err := st.BotDeny(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		if !removed {
+			fmt.Printf("%s 本来就不在名单里\n", args[1])
+			return nil
+		}
+		fmt.Printf("已移除 %s\n", args[1])
+		return nil
+
+	case "list":
+		ids, err := st.BotAllowList(ctx)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			fmt.Println("名单是空的，也就是谁都不能使唤 bot。")
+			fmt.Println("这是故意的默认值：bot 背后是个会执行命令的 agent。")
+			return nil
+		}
+		for _, id := range ids {
+			fmt.Println(" ", id)
+		}
+		return nil
+
+	case "check":
+		if !cfg.BotEnabled() {
+			return errors.New("没配 YPTD_BOT_OPENCODE_URL，bot 是关着的")
+		}
+		agent := bot.NewOpencode(cfg.BotOpencodeURL, cfg.BotOpencodeUser,
+			cfg.BotOpencodePassword, cfg.BotModel, 30*time.Second)
+		version, err := agent.Health(ctx)
+		if err != nil {
+			return fmt.Errorf("opencode 不可用: %w", err)
+		}
+		fmt.Printf("opencode %s 在 %s，模型 %s\n", version, cfg.BotOpencodeURL, cfg.BotModel)
+		exists, err := im.UserExists(ctx, cfg.BotUserID)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("bot 账号 %s: %s\n", cfg.BotUserID, map[bool]string{true: "已存在", false: "还没建，跑 bot setup"}[exists])
+		ids, err := st.BotAllowList(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("白名单 %d 人\n", len(ids))
+		return nil
+	}
+	return fmt.Errorf("未知子命令 bot %s", args[0])
 }

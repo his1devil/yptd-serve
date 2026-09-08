@@ -57,9 +57,9 @@ func TestNormalizeFoldsCrockfordAliases(t *testing.T) {
 func TestNormalizeRejectsJunk(t *testing.T) {
 	for _, input := range []string{
 		"",
-		"YPTD-7K2M",           // too short
+		"YPTD-7K2M",            // too short
 		"YPTD-7K2M-9XQP-EXTRA", // too long
-		"YPTD-7K2M-9XQ!",      // illegal character
+		"YPTD-7K2M-9XQ!",       // illegal character
 		"hello world",
 	} {
 		if got := Normalize(input); got != "" {

@@ -308,3 +308,81 @@ func (s *Store) ListCredentials(ctx context.Context, userID string) ([]Credentia
 	}
 	return out, nil
 }
+
+// ---------------------------------------------------------------- the bot ---
+
+// BotSession is the opencode session that continues this chat, or "" when
+// the chat has not asked the bot anything yet.
+func (s *Store) BotSession(ctx context.Context, conversationID string) (string, error) {
+	var row struct {
+		SessionID string `bson:"session_id"`
+	}
+	err := s.db.Collection("bot_sessions").FindOne(ctx, bson.M{"_id": conversationID}).Decode(&row)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return row.SessionID, nil
+}
+
+func (s *Store) SetBotSession(ctx context.Context, conversationID, sessionID string) error {
+	_, err := s.db.Collection("bot_sessions").UpdateOne(ctx,
+		bson.M{"_id": conversationID},
+		bson.M{"$set": bson.M{"session_id": sessionID, "updated_at": time.Now()}},
+		options.Update().SetUpsert(true),
+	)
+	return err
+}
+
+// BotAllowed reports whether this user may make the bot work.
+//
+// An empty list means nobody, not everybody: the bot runs a coding agent on
+// the server, so the default has to fail closed.
+func (s *Store) BotAllowed(ctx context.Context, userID string) (bool, error) {
+	err := s.db.Collection("bot_allow").FindOne(ctx, bson.M{"_id": userID}).Err()
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) BotAllow(ctx context.Context, userID string) error {
+	_, err := s.db.Collection("bot_allow").UpdateOne(ctx,
+		bson.M{"_id": userID},
+		bson.M{"$set": bson.M{"added_at": time.Now()}},
+		options.Update().SetUpsert(true),
+	)
+	return err
+}
+
+func (s *Store) BotDeny(ctx context.Context, userID string) (bool, error) {
+	res, err := s.db.Collection("bot_allow").DeleteOne(ctx, bson.M{"_id": userID})
+	if err != nil {
+		return false, err
+	}
+	return res.DeletedCount > 0, nil
+}
+
+func (s *Store) BotAllowList(ctx context.Context) ([]string, error) {
+	cur, err := s.db.Collection("bot_allow").Find(ctx, bson.M{})
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []string
+	for cur.Next(ctx) {
+		var row struct {
+			UserID string `bson:"_id"`
+		}
+		if err := cur.Decode(&row); err != nil {
+			return nil, err
+		}
+		out = append(out, row.UserID)
+	}
+	return out, cur.Err()
+}

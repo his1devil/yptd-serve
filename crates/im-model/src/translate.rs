@@ -28,6 +28,12 @@ mod content {
     pub const MARKDOWN: i64 = 118;
     pub const NOTIFICATION_FROM: i64 = 1000;
     pub const NOTIFICATION_TO: i64 = 5000;
+    /// A message was withdrawn. The SDK also raises an event carrying which
+    /// one, and that is what removes it -- drawing the notice as well would
+    /// leave a "系统通知" line behind every revoke.
+    pub const REVOKE_NOTIFICATION: i64 = 2101;
+    /// Messages were deleted; same reasoning.
+    pub const DELETE_NOTIFICATION: i64 = 2102;
 }
 
 /// Assigns stable, time-ordered [`MessageId`]s to SDK messages.
@@ -243,6 +249,7 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
             }
         }
         content::QUOTE => Body::Text(str_of(msg.get("quoteElem")?, "text").to_owned()),
+        content::REVOKE_NOTIFICATION | content::DELETE_NOTIFICATION => return None,
         t if (content::NOTIFICATION_FROM..content::NOTIFICATION_TO).contains(&t) => {
             Body::System(notification_text(msg, t))
         }
@@ -291,7 +298,22 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
         read_by: None,
         edited: false,
         mentions,
+        transient: is_transient(str_of(msg, "ex")),
     })
+}
+
+/// Whether the sender marked this message as a placeholder it will replace.
+///
+/// The marker travels in OpenIM's free-form `ex` field, so no content type
+/// has to be invented and any other client simply sees an ordinary message.
+fn is_transient(ex: &str) -> bool {
+    if ex.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<Value>(ex)
+        .ok()
+        .and_then(|v| v.get("yptd").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|marker| marker == "pending")
 }
 
 /// The first element that actually carries a URL. The SDK fills in whichever
@@ -516,6 +538,27 @@ mod tests {
         assert_eq!(conversation(&row(2), &i).unwrap().mentions, 1, "at everyone");
         assert_eq!(conversation(&row(3), &i).unwrap().mentions, 1, "both");
         assert_eq!(conversation(&row(4), &i).unwrap().mentions, 0, "group notice");
+    }
+
+    #[test]
+    fn the_pending_marker_is_read_from_ex() {
+        assert!(is_transient(r#"{"yptd":"pending"}"#));
+        assert!(!is_transient(r#"{"yptd":"other"}"#));
+        assert!(!is_transient("not json"));
+        assert!(!is_transient(""));
+    }
+
+    #[test]
+    fn a_revoke_notice_is_not_a_message_of_its_own() {
+        // The event that carries which message was withdrawn is what removes
+        // it; rendering the notice too would leave a stray line behind.
+        let raw = serde_json::json!({
+            "clientMsgID": "rv", "sendID": "bob", "groupID": "g",
+            "contentType": 2101, "sendTime": 1_788_861_600_000i64,
+            "notificationElem": {"detail": "{}"}
+        });
+        let mut i = Interner::default();
+        assert!(message(&raw, &me(), &mut i).is_none());
     }
 
     #[test]

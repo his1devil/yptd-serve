@@ -906,7 +906,13 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
     let mut out: Vec<PaneLine> = Vec::new();
 
     let runs = album_runs(&messages);
+    let superseded = superseded_placeholders(&messages);
     for (index, message) in messages.iter().enumerate() {
+        // The agent's "working on it" has served its purpose once the answer
+        // is under it.
+        if superseded[index] {
+            continue;
+        }
         // A picture that belongs to the block started earlier draws nothing
         // of its own; its rows are inside that block.
         if runs[index].0 != index {
@@ -969,6 +975,25 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
         }
     }
     out
+}
+
+/// Which placeholder messages have been answered already.
+///
+/// A placeholder says "I am working on this"; once its sender has said
+/// something else in the same conversation, it is only clutter. Hiding it
+/// here rather than withdrawing it on the server keeps the decision local
+/// and reversible, and avoids a revoke that cannot reliably name its target.
+fn superseded_placeholders(messages: &[&Message]) -> Vec<bool> {
+    let mut hidden = vec![false; messages.len()];
+    let mut spoken_since: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.transient && spoken_since.contains(message.sender.0.as_str()) {
+            hidden[index] = true;
+        } else {
+            spoken_since.insert(message.sender.0.as_str());
+        }
+    }
+    hidden
 }
 
 /// For each message, which message starts its picture block and how long that

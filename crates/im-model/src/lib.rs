@@ -233,6 +233,13 @@ pub struct Message {
     pub edited: bool,
     /// Byte ranges in the body text that mention someone.
     pub mentions: Vec<Mention>,
+    /// A standing-in message, such as the agent's "working on it", which the
+    /// sender will follow with the real thing. Kept in the model rather than
+    /// withdrawn on the server: taking a message back needs its sequence
+    /// number, and the number is not known until after the send has
+    /// propagated, so a revoke aimed right after sending hits whatever came
+    /// before it.
+    pub transient: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -339,6 +346,17 @@ impl Snapshot {
         match self.messages.iter().position(|m| m.id == message.id) {
             Some(i) => self.messages[i] = message,
             None => self.messages.push(message),
+        }
+    }
+
+    /// Removes a message. Returns whether one was there.
+    pub fn remove_message(&mut self, id: MessageId) -> bool {
+        match self.messages.iter().position(|m| m.id == id) {
+            Some(i) => {
+                self.messages.remove(i);
+                true
+            }
+            None => false,
         }
     }
 

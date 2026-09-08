@@ -49,6 +49,7 @@ impl Builder {
             read_by: None,
             edited: false,
             mentions: Vec::new(),
+            transient: false,
         });
         self.messages.last_mut().expect("just pushed")
     }

@@ -16,10 +16,10 @@ import (
 )
 
 type Client struct {
-	base       string
-	secret     string
-	adminID    string
-	http       *http.Client
+	base    string
+	secret  string
+	adminID string
+	http    *http.Client
 
 	// The admin token is valid for 90 days but costs a round trip, so it is
 	// cached and refreshed well before OpenIM would expire it.
@@ -195,4 +195,67 @@ func asError(err error, target **Error) bool {
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.AdminToken(ctx)
 	return err
+}
+
+// SendText posts a text message as `sender`. Exactly one of recvID (a direct
+// chat) or groupID must be set.
+//
+// The admin token lets this service speak as any user, which is what makes a
+// bot possible without the bot ever holding a connection.
+func (c *Client) SendText(ctx context.Context, sender, nickname, recvID, groupID, text, ex string) error {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{
+		"sendID":           sender,
+		"senderNickname":   nickname,
+		"senderPlatformID": 7,
+		"contentType":      101,
+		"content":          map[string]string{"content": text},
+	}
+	if ex != "" {
+		body["ex"] = ex
+	}
+	if groupID != "" {
+		body["groupID"] = groupID
+		body["sessionType"] = 3
+	} else {
+		body["recvID"] = recvID
+		body["sessionType"] = 1
+	}
+	return c.post(ctx, "/msg/send_msg", body, admin, nil)
+}
+
+// NewestSeq is the highest sequence number in a conversation, as seen by
+// `userID`. Revoking needs a seq and sending does not return one, so this is
+// how a just-sent message is found again.
+func (c *Client) NewestSeq(ctx context.Context, userID, conversationID string) (int64, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		MaxSeqs map[string]int64 `json:"maxSeqs"`
+	}
+	body := map[string]any{"userID": userID, "conversationIDs": []string{conversationID}}
+	if err := c.post(ctx, "/msg/newest_seq", body, admin, &out); err != nil {
+		return 0, err
+	}
+	seq, ok := out.MaxSeqs[conversationID]
+	if !ok {
+		return 0, fmt.Errorf("openim /msg/newest_seq: no seq for %s", conversationID)
+	}
+	return seq, nil
+}
+
+// RevokeMsg withdraws one message. Used to take back a placeholder once the
+// real answer is ready.
+func (c *Client) RevokeMsg(ctx context.Context, userID, conversationID string, seq int64) error {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"userID": userID, "conversationID": conversationID, "seq": seq}
+	return c.post(ctx, "/msg/revoke_msg", body, admin, nil)
 }

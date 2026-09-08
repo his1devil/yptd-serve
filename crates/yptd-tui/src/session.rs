@@ -504,6 +504,17 @@ impl Session {
                     }
                 }
             }
+            "OnNewRecvMessageRevoked" => {
+                // The event names the withdrawn message by its client id, so
+                // it can be dropped from the list rather than left on screen
+                // with a notice beside it.
+                let client_id = event.data.get("clientMsgID").and_then(Value::as_str);
+                if let Some(id) = client_id.and_then(|c| self.interner.get(c))
+                    && snapshot.remove_message(id)
+                {
+                    changed.messages = true;
+                }
+            }
             "OnConnectSuccess" => {
                 snapshot.connected = true;
                 changed.connection = true;

@@ -7,7 +7,7 @@
 
 > **当前状态：已接真实后端。** `yptd login` 用邀请码登录一次，之后 `yptd`
 > 直接进入：会话列表、历史、群成员、发消息、引用回复、@ 提及、发图片、建群拉人、
-> 私聊、实时推送都走 OpenIM。
+> 私聊、实时推送都走 OpenIM。群里还有一个接了大模型的 agent，@ 它就能问。
 > 没账号也能跑 `yptd --mock` 看渲染。
 
 ---
@@ -245,6 +245,36 @@ crates/
 低 22 位是毫秒内计数器；`clientMsgID` ↔ ID 的映射在 `Interner` 里。
 
 ---
+
+## 群里的 agent
+
+`agentbot`（昵称「助手」）是一个普通账号，把它拉进群，@ 它提问，或者直接私聊它。
+背后是 [opencode](https://opencode.ai) 驱动的 GLM-5.3。
+
+它**不跑 IM 客户端**：没有长连接、没有 token、不需要边车。OpenIM 在有人说话时
+回调 yptd-server，服务端判断是不是在叫它，然后用管理接口以它的身份把答案发回去。
+崩了也不丢消息，OpenIM 该投递还是投递。
+
+- 每个会话（群或私聊）对应一条独立的 opencode 会话，所以在一个群里连着问几句是有
+  上下文的，换个群是另一条线
+- 答案超过 3 秒才会先发一条「⏳ 正在处理…」；这条消息带着 `ex` 标记，客户端在
+  答案到达后自动把它藏起来
+- 白名单默认是空的，也就是**谁都不能用**。这是故意的：背后是个会执行命令的 agent
+
+管理：
+
+```sh
+yptd-server bot setup                # 建 agentbot 账号
+yptd-server bot allow <userID>       # 放行一个人
+yptd-server bot deny  <userID>
+yptd-server bot list
+yptd-server bot check                # opencode 通不通、账号在不在、白名单几个人
+```
+
+服务端跑着两个东西：`yptd-opencode.service`（opencode serve，专用低权限账号
+`yptdbot`，systemd 把整个文件系统锁成只读，只有它自己的目录可写）和 `yptd-server`
+里的回调路由。OpenIM 那侧在 `webhooks.yml` 打开了 `afterSendGroupMsg` 和
+`afterSendSingleMsg`，只放行 101 和 106 两种消息类型。
 
 ## 服务端
 

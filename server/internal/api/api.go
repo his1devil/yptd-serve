@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/his1devil/yptd/server/internal/bot"
 	"github.com/his1devil/yptd/server/internal/config"
 	"github.com/his1devil/yptd/server/internal/invite"
 	"github.com/his1devil/yptd/server/internal/openim"
@@ -29,10 +30,33 @@ type Server struct {
 	store  *store.Store
 	openim *openim.Client
 	log    *slog.Logger
+
+	// bot is nil when no agent runtime is configured; the callback routes
+	// then accept and discard, so OpenIM never sees an error.
+	bot         *bot.Bot
+	botUserID   string
+	botNickname string
+	botBudget   time.Duration
 }
 
 func New(cfg config.Config, st *store.Store, im *openim.Client, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, store: st, openim: im, log: log}
+	s := &Server{cfg: cfg, store: st, openim: im, log: log}
+	if cfg.BotEnabled() {
+		agent := bot.NewOpencode(
+			cfg.BotOpencodeURL, cfg.BotOpencodeUser, cfg.BotOpencodePassword,
+			cfg.BotModel, cfg.BotTimeout,
+		)
+		s.bot = bot.New(bot.Config{
+			UserID:        cfg.BotUserID,
+			Nickname:      cfg.BotNickname,
+			Timeout:       cfg.BotTimeout,
+			MaxConcurrent: cfg.BotMaxConcurrent,
+		}, im, st, agent, log)
+		s.botUserID = cfg.BotUserID
+		s.botNickname = cfg.BotNickname
+		s.botBudget = botBudget(cfg.BotTimeout)
+	}
+	return s
 }
 
 func (s *Server) Routes() http.Handler {
@@ -43,6 +67,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/me", s.handleMe)
 	mux.HandleFunc("GET /v1/users", s.handleUsers)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	// OpenIM appends the command name to the configured URL.
+	mux.HandleFunc("POST /callback/", s.handleCallback)
 	return s.withLogging(mux)
 }
 

@@ -33,7 +33,23 @@ type Config struct {
 	InviteTTL time.Duration
 	// PlatformID sent to OpenIM when minting a user token.
 	PlatformID int
+
+	// BotUserID is the agent account. Messages from it are ignored, and
+	// messages mentioning it are answered.
+	BotUserID   string
+	BotNickname string
+	// BotOpencodeURL is empty when no agent runtime is configured, which
+	// disables the whole feature.
+	BotOpencodeURL      string
+	BotOpencodeUser     string
+	BotOpencodePassword string
+	BotModel            string
+	BotTimeout          time.Duration
+	BotMaxConcurrent    int
 }
+
+// BotEnabled reports whether an agent runtime was configured.
+func (c Config) BotEnabled() bool { return c.BotOpencodeURL != "" }
 
 func Load() (Config, error) {
 	c := Config{
@@ -45,6 +61,23 @@ func Load() (Config, error) {
 		OpenIMAdminUserID: env("YPTD_OPENIM_ADMIN", "imAdmin"),
 		InviteTTL:         24 * time.Hour,
 		PlatformID:        7, // Linux; the TUI overrides per OS at login.
+
+		BotUserID:           env("YPTD_BOT_USER", "agentbot"),
+		BotNickname:         env("YPTD_BOT_NICKNAME", "助手"),
+		BotOpencodeURL:      strings.TrimRight(os.Getenv("YPTD_BOT_OPENCODE_URL"), "/"),
+		BotOpencodeUser:     env("YPTD_BOT_OPENCODE_USER", "yptd"),
+		BotOpencodePassword: os.Getenv("YPTD_BOT_OPENCODE_PASSWORD"),
+		BotModel:            env("YPTD_BOT_MODEL", "zhipuai/glm-5.3"),
+		BotTimeout:          5 * time.Minute,
+		BotMaxConcurrent:    2,
+	}
+
+	if raw := os.Getenv("YPTD_BOT_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: YPTD_BOT_TIMEOUT: %w", err)
+		}
+		c.BotTimeout = d
 	}
 
 	if raw := os.Getenv("YPTD_INVITE_TTL"); raw != "" {
