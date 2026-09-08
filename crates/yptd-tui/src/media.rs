@@ -9,12 +9,13 @@
 
 use std::collections::HashMap;
 
+use image::imageops::FilterType;
 use image::DynamicImage;
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
-use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{CropOptions, Resize, StatefulImage};
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 /// Rows an inline preview is allowed to occupy. Tall enough to be worth
 /// showing, short enough that one screenshot cannot bury the conversation.
@@ -28,7 +29,15 @@ const MAX_PREVIEW_COLS: u16 = 48;
 /// the frame that measured it and the frame that paints it.
 pub struct Media {
     picker: Option<Picker>,
-    protocols: HashMap<String, StatefulProtocol>,
+    /// Decoded pictures, already shrunk to something a terminal can use.
+    images: HashMap<String, DynamicImage>,
+    /// One encoded protocol per picture *per size it is drawn at*.
+    ///
+    /// Built here rather than left to the widget: handing the library a big
+    /// picture and an area makes it resize on every draw with a filter this
+    /// code does not choose. Sizing the canvas first means the filter is ours
+    /// and the work happens once.
+    protocols: HashMap<(String, u16, u16, bool), Protocol>,
     sizes: HashMap<String, (u32, u32)>,
     failed: HashMap<String, String>,
     /// Bumped when a picture arrives or fails, both of which change how many
@@ -45,6 +54,7 @@ impl Media {
     pub fn detect() -> Self {
         Self {
             picker: Picker::from_query_stdio().ok(),
+            images: HashMap::new(),
             protocols: HashMap::new(),
             sizes: HashMap::new(),
             failed: HashMap::new(),
@@ -56,6 +66,7 @@ impl Media {
     pub fn disabled() -> Self {
         Self {
             picker: None,
+            images: HashMap::new(),
             protocols: HashMap::new(),
             sizes: HashMap::new(),
             failed: HashMap::new(),
@@ -84,14 +95,12 @@ impl Media {
     /// `natural` is the picture's size before [`decode`] shrank it, because
     /// that is the size worth telling the reader about.
     pub fn insert(&mut self, key: &str, image: DynamicImage, natural: (u32, u32)) -> u16 {
-        let Some(picker) = self.picker.as_mut() else {
+        if self.picker.is_none() {
             return 0;
-        };
-        let (w, h) = natural;
+        }
         self.revision = self.revision.wrapping_add(1);
-        self.sizes.insert(key.to_owned(), (w, h));
-        self.protocols
-            .insert(key.to_owned(), picker.new_resize_protocol(image));
+        self.sizes.insert(key.to_owned(), natural);
+        self.images.insert(key.to_owned(), image);
         self.rows_for(key)
     }
 
@@ -182,26 +191,90 @@ impl Media {
     /// Draws a registered image into `area`.
     /// Draws a picture into `area`.
     ///
-    /// `fill` crops to cover the whole area instead of fitting inside it,
-    /// which is what makes a row of pictures read as one block: fitted tiles
-    /// of different proportions leave different gaps and look misaligned.
+    /// `fill` covers the whole area, cropping what does not fit, which is what
+    /// makes a row of pictures read as one block; otherwise the picture is
+    /// fitted whole inside it.
     pub fn render(&mut self, frame: &mut Frame, area: Rect, key: &str, fill: bool) {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let Some(protocol) = self.protocols.get_mut(key) else {
-            return;
-        };
-        // Lanczos, not the library's default nearest-neighbour. Shrinking a
-        // photo from a couple of thousand pixels to a few hundred by dropping
-        // three pixels in four is exactly what "blurry" looks like.
-        let resize = if fill {
-            Resize::Crop(Some(CropOptions { clip_top: false, clip_left: false }))
-        } else {
-            Resize::Fit(Some(image::imageops::FilterType::Lanczos3))
-        };
-        frame.render_stateful_widget(StatefulImage::new().resize(resize), area, protocol);
+        if self.ensure_protocol(key, area.width, area.height, fill) {
+            let cached = (key.to_owned(), area.width, area.height, fill);
+            if let Some(protocol) = self.protocols.get(&cached) {
+                frame.render_widget(Image::new(protocol), area);
+            }
+        }
     }
+
+    /// Encodes this picture at this exact size, unless that was already done.
+    fn ensure_protocol(&mut self, key: &str, cols: u16, rows: u16, fill: bool) -> bool {
+        let cached = (key.to_owned(), cols, rows, fill);
+        if self.protocols.contains_key(&cached) {
+            return true;
+        }
+        let Some(picker) = self.picker.as_mut() else {
+            return false;
+        };
+        let Some(source) = self.images.get(key) else {
+            return false;
+        };
+        let cell = picker.font_size();
+        let (Some(canvas_w), Some(canvas_h)) = (
+            u32::from(cols).checked_mul(u32::from(cell.width)),
+            u32::from(rows).checked_mul(u32::from(cell.height)),
+        ) else {
+            return false;
+        };
+        if canvas_w == 0 || canvas_h == 0 {
+            return false;
+        }
+
+        // Lanczos, and only here: this is the one resize that decides how the
+        // picture looks, and it starts from an image already close to its
+        // final size, so the good filter costs little.
+        let canvas = if fill {
+            cover(source, canvas_w, canvas_h)
+        } else {
+            source.resize(canvas_w, canvas_h, FilterType::Lanczos3)
+        };
+        // The canvas already matches the area, so the library has nothing left
+        // to resize and its own filter never comes into it.
+        let Ok(protocol) = picker.new_protocol(canvas, Size::new(cols, rows), Resize::Fit(None))
+        else {
+            return false;
+        };
+        self.evict_if_crowded();
+        self.protocols.insert(cached, protocol);
+        true
+    }
+
+    /// Keeps the encoded set bounded. Pictures are cheap to re-encode and a
+    /// long conversation would otherwise hold every one it ever drew.
+    fn evict_if_crowded(&mut self) {
+        const MAX_ENCODED: usize = 48;
+        if self.protocols.len() < MAX_ENCODED {
+            return;
+        }
+        let victims: Vec<_> = self
+            .protocols
+            .keys()
+            .take(self.protocols.len() - MAX_ENCODED / 2)
+            .cloned()
+            .collect();
+        for victim in victims {
+            self.protocols.remove(&victim);
+        }
+    }
+}
+
+/// Scales to cover the canvas and trims the overflow from the centre, so a
+/// tile is filled edge to edge whatever shape the picture is.
+fn cover(source: &DynamicImage, width: u32, height: u32) -> DynamicImage {
+    let scaled = source.resize_to_fill(width, height, FilterType::Lanczos3);
+    if scaled.width() == width && scaled.height() == height {
+        return scaled;
+    }
+    scaled.crop_imm(0, 0, width, height)
 }
 
 impl Default for Media {
@@ -305,6 +378,24 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
             .expect("encode");
         out
+    }
+
+    #[test]
+    fn covering_fills_the_canvas_whatever_shape_the_picture_is() {
+        for (w, h) in [(4000u32, 1000u32), (1000, 4000), (900, 900)] {
+            let filled = super::cover(&gradient(w, h), 240, 120);
+            assert_eq!(
+                (filled.width(), filled.height()),
+                (240, 120),
+                "{w}x{h} must cover the tile exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn fitting_never_exceeds_the_canvas() {
+        let fitted = gradient(4000, 1000).resize(240, 120, image::imageops::FilterType::Triangle);
+        assert!(fitted.width() <= 240 && fitted.height() <= 120);
     }
 
     #[test]
