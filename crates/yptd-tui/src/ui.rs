@@ -1037,6 +1037,27 @@ fn truncate(value: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use im_model::AttachmentKind;
+
+    #[test]
+    fn every_attachment_glyph_measures_two_cells() {
+        // A glyph the width table calls narrow and the terminal draws wide
+        // shifts the whole line, and the border with it.
+        for kind in [
+            AttachmentKind::Image,
+            AttachmentKind::File,
+            AttachmentKind::Video,
+            AttachmentKind::Audio,
+        ] {
+            let glyph = kind.glyph();
+            assert_eq!(
+                super::UnicodeWidthStr::width(glyph),
+                2,
+                "{kind:?} renders as {glyph:?}"
+            );
+        }
+    }
+
     use super::*;
     use im_model::mock;
 

@@ -181,9 +181,16 @@ pub enum AttachmentKind {
 }
 
 impl AttachmentKind {
+    /// A two-cell glyph for the attachment line.
+    ///
+    /// The picture frame carries a variation selector on purpose: without it
+    /// the code point defaults to text presentation, which `unicode-width`
+    /// measures as one cell while terminals draw the emoji in two. Every
+    /// picture line would then sit one column off. The other three default to
+    /// emoji presentation and need nothing.
     pub fn glyph(self) -> &'static str {
         match self {
-            Self::Image => "🖼",
+            Self::Image => "🖼\u{FE0F}",
             Self::File => "📄",
             Self::Video => "🎬",
             Self::Audio => "🔊",
