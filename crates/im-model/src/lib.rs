@@ -299,6 +299,13 @@ pub struct Snapshot {
     pub connected: bool,
     /// `None` once the initial sync has finished.
     pub sync_percent: Option<u8>,
+    /// Bumped whenever the message list changes.
+    ///
+    /// Laying messages out means parsing markdown, highlighting code and
+    /// wrapping every line; doing that on each frame is what makes scrolling
+    /// feel heavy. A counter lets the renderer keep its work and know exactly
+    /// when it is stale.
+    revision: u64,
 }
 
 impl Snapshot {
@@ -347,6 +354,12 @@ impl Snapshot {
             Some(i) => self.messages[i] = message,
             None => self.messages.push(message),
         }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// A number that changes whenever the messages do.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Removes a message. Returns whether one was there.
@@ -354,6 +367,7 @@ impl Snapshot {
         match self.messages.iter().position(|m| m.id == id) {
             Some(i) => {
                 self.messages.remove(i);
+                self.revision = self.revision.wrapping_add(1);
                 true
             }
             None => false,

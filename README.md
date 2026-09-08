@@ -248,7 +248,7 @@ crates/
 
 ## 群里的 agent
 
-`agentbot`（昵称「助手」）是一个普通账号，把它拉进群，@ 它提问，或者直接私聊它。
+`agentbot`（昵称 HALX）是一个普通账号，把它拉进群，@ 它提问，或者直接私聊它。
 背后是 [opencode](https://opencode.ai) 驱动的 GLM-5.3。
 
 它**不跑 IM 客户端**：没有长连接、没有 token、不需要边车。OpenIM 在有人说话时

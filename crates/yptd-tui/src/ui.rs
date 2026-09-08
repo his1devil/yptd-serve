@@ -1,7 +1,7 @@
 //! Rendering. Every color comes from a named highlight group -- there is not a
 //! single `Color::` literal below this line.
 
-use im_model::{Body, Message, SendState, Visibility};
+use im_model::{Body, ConversationId, Message, SendState, Visibility};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span as TuiSpan};
@@ -32,14 +32,52 @@ const UNSELECTED_MARK: &str = "  ";
 /// Consecutive messages from one sender inside this window share a header.
 const AUTHOR_GROUP_MS: i64 = 5 * 60_000;
 
-pub fn draw(frame: &mut Frame, app: &mut App, media: &mut Media, theme: &Theme) {
+/// Laid-out message rows, kept between frames.
+///
+/// Building them means parsing markdown, running syntax highlighting and
+/// wrapping every line to the pane width. None of that changes when the
+/// cursor moves or the viewport scrolls, which is most of what a person does,
+/// so doing it per frame is the difference between scrolling that glides and
+/// scrolling that stutters.
+#[derive(Default)]
+pub struct Cache {
+    key: Option<(ConversationId, usize, u64, u64, i64)>,
+    lines: Vec<PaneLine>,
+}
+
+impl Cache {
+    /// Returns the rows for this state, laying them out only when something
+    /// they depend on has changed.
+    fn rows(
+        &mut self,
+        app: &App,
+        theme: &Theme,
+        media: &Media,
+        width: usize,
+    ) -> &[PaneLine] {
+        let key = (
+            app.open.clone(),
+            width,
+            app.snapshot.revision(),
+            media.revision(),
+            app.utc_offset_ms,
+        );
+        if self.key.as_ref() != Some(&key) {
+            self.lines = build_message_lines(app, theme, media, width);
+            self.key = Some(key);
+        }
+        &self.lines
+    }
+}
+
+pub fn draw(frame: &mut Frame, app: &mut App, media: &mut Media, theme: &Theme, cache: &mut Cache) {
     let areas = layout::areas(frame.area(), app, app.composer_rows());
 
     draw_status(frame, areas.status, app, media, theme);
     if areas.nav.width > 0 {
         draw_conversations(frame, areas.nav, app, theme);
     }
-    draw_messages(frame, areas.messages, app, media, theme);
+    draw_messages(frame, areas.messages, app, media, theme, cache);
     if areas.members.width > 0 {
         draw_members(frame, areas.members, app, theme);
     }
@@ -291,7 +329,7 @@ fn draw_browser(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Theme)
 pub fn draw_static(frame: &mut Frame, app: &App, theme: &Theme) {
     let mut clone = app.clone_for_render();
     let mut media = Media::disabled();
-    draw(frame, &mut clone, &mut media, theme);
+    draw(frame, &mut clone, &mut media, theme, &mut Cache::default());
 }
 
 fn pane_block<'a>(app: &App, theme: &Theme, pane: Pane, title: String) -> Block<'a> {
@@ -769,6 +807,11 @@ fn block_height(placement: &Placement) -> u16 {
 /// the scroll arithmetic can both work in line space.
 struct PaneLine {
     message_index: Option<usize>,
+    /// Which run of messages this row belongs to, as (first, length). The
+    /// selection marker is decided from this at draw time rather than baked
+    /// in, so moving the cursor costs nothing and the laid-out lines can be
+    /// kept between frames.
+    run: Option<(usize, usize)>,
     line: TuiLine<'static>,
     /// Set on the first row of a reserved picture block. The rows below it
     /// are blank placeholders, so the height is known during layout and
@@ -784,7 +827,14 @@ struct Placement {
     tiles: Vec<crate::album::Tile>,
 }
 
-fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, media: &mut Media, theme: &Theme) {
+fn draw_messages(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    media: &mut Media,
+    theme: &Theme,
+    cache: &mut Cache,
+) {
     let title = match app.conversation() {
         Some(conversation) => format!(
             "{}{}  ·  {} 人",
@@ -811,13 +861,9 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, media: &mut Media
         return;
     }
 
-    let lines = build_message_lines(app, theme, media, content_width);
-    let top = viewport_top(app, &lines, inner.height as usize);
-    let window: Vec<PaneLine> = lines
-        .into_iter()
-        .skip(top)
-        .take(inner.height as usize)
-        .collect();
+    let lines = cache.rows(app, theme, media, content_width);
+    let top = viewport_top(app, lines, inner.height as usize);
+    let window: Vec<&PaneLine> = lines.iter().skip(top).take(inner.height as usize).collect();
 
     // Record which message each visible row belongs to, so a click resolves
     // against exactly the frame the user saw.
@@ -830,7 +876,12 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, media: &mut Media
         .enumerate()
         .filter_map(|(row, entry)| entry.album.clone().map(|album| (row, album)))
         .collect();
-    let visible: Vec<TuiLine<'static>> = window.into_iter().map(|entry| entry.line).collect();
+    // The gutter is the one part that depends on where the cursor is, so it
+    // goes on here rather than into the kept rows.
+    let visible: Vec<TuiLine<'static>> = window
+        .iter()
+        .map(|entry| with_gutter(entry, row_selected(app, entry), theme))
+        .collect();
     frame.render_widget(Paragraph::new(visible), inner);
 
     let bottom = inner.y.saturating_add(inner.height);
@@ -943,12 +994,7 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
 
         let show_header = starts_author_group(message, previous);
         if show_header && index > 0 {
-            out.push(gutter_line(
-                Vec::new(),
-                selected_run(app, index, run_len),
-                theme,
-                Some(index),
-            ));
+            out.push(content_line(Vec::new(), Some((index, run_len)), Some(index)));
         }
 
         let run = &messages[index..index + run_len];
@@ -970,7 +1016,7 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
                 Some(within) if block_rows > 0 => index + within.min(run_len - 1),
                 _ => index,
             };
-            let mut entry = gutter_line(line, selected_run(app, index, run_len), theme, Some(owner));
+            let mut entry = content_line(line, Some((index, run_len)), Some(owner));
             if offset == first_block_row && block_rows > 0 {
                 entry.album = preview.clone();
             }
@@ -1038,27 +1084,37 @@ fn album_runs(messages: &[&Message]) -> Vec<(usize, usize)> {
     runs
 }
 
-/// Whether the cursor is anywhere inside this block.
-fn selected_run(app: &App, start: usize, len: usize) -> bool {
-    app.pane == Pane::Messages && (start..start + len).contains(&app.message_cursor)
+/// Whether the cursor sits inside the run this row belongs to.
+fn row_selected(app: &App, entry: &PaneLine) -> bool {
+    app.pane == Pane::Messages
+        && entry
+            .run
+            .is_some_and(|(start, len)| (start..start + len).contains(&app.message_cursor))
 }
 
-fn gutter_line(
-    mut spans: Vec<TuiSpan<'static>>,
-    selected: bool,
-    theme: &Theme,
+fn content_line(
+    spans: Vec<TuiSpan<'static>>,
+    run: Option<(usize, usize)>,
     message_index: Option<usize>,
 ) -> PaneLine {
-    let mark = TuiSpan::styled(
-        if selected { SELECTED_MARK } else { UNSELECTED_MARK },
-        theme.style(HG::MessageSelectedBorder),
-    );
-    spans.insert(0, mark);
     PaneLine {
         message_index,
+        run,
         line: TuiLine::from(spans),
         album: None,
     }
+}
+
+/// Prepends the selection gutter. Two columns either way, so the content
+/// width never changes and nothing re-wraps when the cursor moves.
+fn with_gutter(entry: &PaneLine, selected: bool, theme: &Theme) -> TuiLine<'static> {
+    let mut spans = Vec::with_capacity(entry.line.spans.len() + 1);
+    spans.push(TuiSpan::styled(
+        if selected { SELECTED_MARK } else { UNSELECTED_MARK },
+        theme.style(HG::MessageSelectedBorder),
+    ));
+    spans.extend(entry.line.spans.iter().cloned());
+    TuiLine::from(spans)
 }
 
 /// A divider belongs to the message it introduces, not to nothing. Tagging it
@@ -1067,8 +1123,9 @@ fn divider(label: &str, style: Style, width: usize, message_index: usize) -> Pan
     let rule = width.saturating_sub(label.width() + 2);
     PaneLine {
         message_index: Some(message_index),
+        run: None,
         line: TuiLine::from(vec![
-            TuiSpan::styled("  ".to_owned(), style),
+            TuiSpan::styled("".to_owned(), style),
             TuiSpan::styled(format!("──{label}{}", "─".repeat(rule)), style),
         ]),
         album: None,
@@ -1146,8 +1203,18 @@ fn render_message(
         }
     }
 
-    let rich_lines = match &message.body {
-        Body::Markdown(source) => {
+    // Markdown is how people write in a chat window, whatever content type
+    // the message arrived as -- backticks and fences come from bots and from
+    // anyone pasting a snippet. Mentions are the exception: they are byte
+    // ranges into the raw text, and parsing moves the text out from under
+    // them, so a message that names somebody stays literal.
+    let markdown_source = match &message.body {
+        Body::Markdown(source) => Some(source.as_str()),
+        Body::Text(text) if message.mentions.is_empty() && looks_like_markdown(text) => Some(text.as_str()),
+        _ => None,
+    };
+    let rich_lines = match markdown_source {
+        Some(source) => {
             let mut blocks = parse_markdown(source);
             // Syntect needs the whole block in order, so highlighting happens
             // before layout rather than per rendered line.
@@ -1164,7 +1231,7 @@ fn render_message(
             }
             layout_blocks(&blocks, width)
         }
-        _ => {
+        None => {
             let mut rich = RichText::plain(message.text());
             for mention in &message.mentions {
                 rich.push_span(Span::new(
@@ -1417,6 +1484,19 @@ fn truncate_left(value: &str, width: usize) -> String {
 }
 
 /// Truncates to a display width, counting CJK as two cells.
+/// Whether a message is worth handing to the markdown parser.
+///
+/// A cheap check first, because most chat lines contain none of this and
+/// parsing them would only risk turning a stray asterisk into emphasis.
+fn looks_like_markdown(text: &str) -> bool {
+    text.contains('`')
+        || text.contains("**")
+        || text.contains("\n- ")
+        || text.contains("\n# ")
+        || text.starts_with("- ")
+        || text.starts_with("# ")
+}
+
 /// A one-line stand-in for a message, for the reply strip.
 ///
 /// The first non-empty line, not every line run together: a quoted code
@@ -1453,6 +1533,47 @@ fn truncate(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use im_model::AttachmentKind;
+
+    #[test]
+    fn moving_the_cursor_does_not_relay_out_the_messages() {
+        // The whole point of the cache: parsing, highlighting and wrapping
+        // are what make scrolling heavy, and none of them depend on where
+        // the cursor is.
+        use crate::app::App;
+        let mut app = App::new(im_model::mock::snapshot());
+        let theme = super::Theme::default();
+        let media = crate::media::Media::disabled();
+        let mut cache = super::Cache::default();
+
+        let first = cache.rows(&app, &theme, &media, 60).len();
+        let before = cache.lines.as_ptr();
+        app.message_cursor = 0;
+        app.pane = crate::app::Pane::Conversations;
+        let again = cache.rows(&app, &theme, &media, 60).len();
+        assert_eq!(first, again);
+        assert_eq!(before, cache.lines.as_ptr(), "the rows were rebuilt");
+    }
+
+    #[test]
+    fn a_new_message_or_a_new_width_does_relay_them_out() {
+        use crate::app::App;
+        let mut app = App::new(im_model::mock::snapshot());
+        let theme = super::Theme::default();
+        let media = crate::media::Media::disabled();
+        let mut cache = super::Cache::default();
+
+        cache.rows(&app, &theme, &media, 60);
+        let key = cache.key.clone();
+        cache.rows(&app, &theme, &media, 40);
+        assert_ne!(cache.key, key, "a different width needs different wrapping");
+
+        let key = cache.key.clone();
+        let mut extra = app.snapshot.messages[0].clone();
+        extra.id = im_model::MessageId::new(u64::MAX / 2);
+        app.snapshot.upsert_message(extra);
+        cache.rows(&app, &theme, &media, 40);
+        assert_ne!(cache.key, key, "a new message must appear");
+    }
 
     #[test]
     fn every_attachment_glyph_measures_two_cells() {

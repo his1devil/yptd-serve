@@ -239,6 +239,18 @@ impl App {
         added
     }
 
+    /// Whether the reader has scrolled to the oldest message on screen, which
+    /// is when the next page of history is worth fetching.
+    pub fn at_oldest(&self) -> bool {
+        !self.follow_latest
+            && self
+                .message_line_map
+                .iter()
+                .flatten()
+                .min()
+                .is_none_or(|first| *first <= 1)
+    }
+
     /// The message under the message-pane cursor.
     pub fn selected_message(&self) -> Option<&Message> {
         self.messages().get(self.message_cursor).copied()
@@ -631,6 +643,17 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(headings.len(), unique.len(), "repeated headings: {headings:?}");
+    }
+
+    #[test]
+    fn reaching_the_top_is_what_asks_for_older_messages() {
+        let mut app = App::new(im_model::mock::snapshot());
+        assert!(!app.at_oldest(), "following the newest is not the top");
+        app.follow_latest = false;
+        app.message_line_map = vec![Some(4), Some(4), Some(5)];
+        assert!(!app.at_oldest(), "still some way down");
+        app.message_line_map = vec![Some(1), Some(2)];
+        assert!(app.at_oldest(), "the oldest message is on screen");
     }
 
     #[test]

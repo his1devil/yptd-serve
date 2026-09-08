@@ -340,6 +340,7 @@ pub fn snapshot() -> Snapshot {
         members,
         connected: true,
         sync_percent: None,
+        revision: 1,
     }
 }
 

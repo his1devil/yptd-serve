@@ -24,6 +24,10 @@ use crate::config::{Config, Paths};
 /// it is complaining about is the one being asked for.
 const ALREADY_LOGGED_IN: i32 = 10102;
 
+/// Messages per history request. Enough to fill a tall terminal twice over,
+/// small enough that reaching the top does not stall.
+const PAGE: i64 = 60;
+
 /// Who the sidecar is currently logged in as, if anyone.
 fn logged_in_user(sidecar: &Sidecar) -> Option<String> {
     sidecar
@@ -44,6 +48,9 @@ pub struct Session {
     loaded: HashSet<ConversationId>,
     /// Group whose members are currently in the snapshot.
     members_for: Option<String>,
+    /// Conversations whose history has been read back to the beginning, so
+    /// scrolling to the top does not keep asking for a page that is not there.
+    exhausted: HashSet<ConversationId>,
     /// OpenIM's reserved id for "@everyone", read from the SDK rather than
     /// hardcoded, since it travels in `atUserList` like a real user id.
     at_all_tag: String,
@@ -131,6 +138,7 @@ impl Session {
                 resumed,
                 loaded: HashSet::new(),
                 members_for: None,
+                exhausted: HashSet::new(),
                 at_all_tag,
             },
             events,
@@ -249,7 +257,7 @@ impl Session {
             json!({
                 "conversationID": conv.0,
                 "startClientMsgID": "",
-                "count": 60,
+                "count": PAGE,
             }),
         )?;
         let mut added = 0;
@@ -266,6 +274,64 @@ impl Session {
         }
         self.loaded.insert(conv.clone());
         Ok(added > 0)
+    }
+
+    /// Fetches the page of history before what is already loaded.
+    ///
+    /// Called when the reader reaches the top rather than at startup: pulling
+    /// a whole conversation up front costs a long pause on open and most of
+    /// it is never looked at.
+    pub fn load_older(
+        &mut self,
+        conv: &ConversationId,
+        snapshot: &mut Snapshot,
+    ) -> Result<usize, im_sidecar::Error> {
+        if self.exhausted.contains(conv) {
+            return Ok(0);
+        }
+        let Some(oldest) = snapshot
+            .messages_in(conv)
+            .first()
+            .and_then(|m| self.interner.client_msg_id(m.id))
+            .map(str::to_owned)
+        else {
+            return Ok(0);
+        };
+        let reply = self.sidecar.call(
+            "history",
+            json!({
+                "conversationID": conv.0,
+                "startClientMsgID": oldest,
+                "count": PAGE,
+            }),
+        )?;
+        let mut added = 0;
+        for raw in reply
+            .get("messageList")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(m) = translate::message(raw, &self.me, &mut self.interner) {
+                snapshot.upsert_message(m);
+                added += 1;
+            }
+        }
+        // The SDK says so itself; falling back on "fewer than asked for"
+        // would stop early whenever a page happened to be all notifications.
+        let end = reply
+            .get("isEnd")
+            .and_then(Value::as_bool)
+            .unwrap_or(added == 0);
+        if end {
+            self.exhausted.insert(conv.clone());
+        }
+        Ok(added)
+    }
+
+    /// Whether there is any point asking for more of this conversation.
+    pub fn has_older(&self, conv: &ConversationId) -> bool {
+        !self.exhausted.contains(conv)
     }
 
     /// Marks a conversation read.

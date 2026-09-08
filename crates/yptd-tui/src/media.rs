@@ -31,6 +31,9 @@ pub struct Media {
     protocols: HashMap<String, StatefulProtocol>,
     sizes: HashMap<String, (u32, u32)>,
     failed: HashMap<String, String>,
+    /// Bumped when a picture arrives or fails, both of which change how many
+    /// rows its message needs.
+    revision: u64,
 }
 
 impl Media {
@@ -45,6 +48,7 @@ impl Media {
             protocols: HashMap::new(),
             sizes: HashMap::new(),
             failed: HashMap::new(),
+            revision: 0,
         }
     }
 
@@ -55,6 +59,7 @@ impl Media {
             protocols: HashMap::new(),
             sizes: HashMap::new(),
             failed: HashMap::new(),
+            revision: 0,
         }
     }
 
@@ -80,6 +85,7 @@ impl Media {
             return 0;
         };
         let (w, h) = (image.width(), image.height());
+        self.revision = self.revision.wrapping_add(1);
         self.sizes.insert(key.to_owned(), (w, h));
         self.protocols
             .insert(key.to_owned(), picker.new_resize_protocol(image));
@@ -87,7 +93,13 @@ impl Media {
     }
 
     pub fn mark_failed(&mut self, key: &str, reason: impl Into<String>) {
+        self.revision = self.revision.wrapping_add(1);
         self.failed.insert(key.to_owned(), reason.into());
+    }
+
+    /// A number that changes whenever a picture's size or state does.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn failure(&self, key: &str) -> Option<&str> {

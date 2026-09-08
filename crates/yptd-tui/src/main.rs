@@ -372,28 +372,23 @@ fn connect() -> Fallible<Live> {
         return Err("还没登录。先运行 yptd login，或用 yptd --mock 看示例数据。".into());
     };
 
-    eprint!("登录 {}… ", creds.user_id);
+    // One line, not a running commentary: which parts of the machinery are
+    // starting is the client's business, not the reader's.
+    eprint!("连接中…");
     let im_token = auth::login(&config, &creds)
-        .map_err(|e| format!("{e}\n如果凭据已被吊销，运行 yptd logout 后重新 yptd login。"))?;
-    eprint!("启动边车… ");
+        .map_err(|e| format!("\n{e}\n如果凭据已被吊销，运行 yptd logout 后重新 yptd login。"))?;
     let (mut session, events) =
         Session::start(&paths, &config, &creds.user_id, &creds.nickname, &im_token)?;
-    eprint!("同步会话… ");
     let mut snapshot = Snapshot::default();
     // A session taken over from an earlier run has already synced; waiting
     // would only stall the start for a sync that is never going to be
     // announced again.
-    let synced = session.resumed()
-        || session.wait_for_sync(&events, &mut snapshot, Duration::from_secs(20));
+    if !session.resumed() {
+        session.wait_for_sync(&events, &mut snapshot, Duration::from_secs(20));
+    }
     session.bootstrap(&mut snapshot)?;
-    eprintln!(
-        "{}",
-        match (session.resumed(), synced) {
-            (true, _) => "好（沿用上次的会话）。",
-            (_, true) => "好。",
-            _ => "未等到同步完成，先用本地数据。",
-        }
-    );
+    // Erase the line so the terminal is clean when the interface takes over.
+    eprint!("\r          \r");
     Ok(Live {
         backend: Backend { session, config, creds },
         events,
@@ -545,6 +540,7 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
     // character.
     execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let mut clicks = mouse::Clicks::default();
+    let mut layout_cache = ui::Cache::default();
     // Protocol negotiation talks to the terminal, so it happens once at
     // startup rather than on the first message that carries a picture.
     let mut media = media::Media::detect();
@@ -600,11 +596,40 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
         }
 
         if dirty {
-            if let Err(error) = terminal.draw(|frame| ui::draw(frame, &mut app, &mut media, &theme)) {
+            if let Err(error) =
+                terminal.draw(|frame| ui::draw(frame, &mut app, &mut media, &theme, &mut layout_cache))
+            {
                 break Err(error.into());
             }
             dirty = false;
             deadline = None;
+
+            // Reaching the top is the signal to fetch the page before it.
+            // Doing this after the draw means the frame the reader is looking
+            // at went out first.
+            if let Some(b) = backend.as_mut()
+                && app.at_oldest()
+                && b.session.has_older(&app.open)
+            {
+                let open = app.open.clone();
+                let anchor = app.messages().first().map(|m| m.id);
+                match b.session.load_older(&open, &mut app.snapshot) {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        // Keep the reader looking at the same message rather
+                        // than at whatever is now at that scroll position.
+                        if let Some(anchor) = anchor
+                            && let Some(index) =
+                                app.messages().iter().position(|m| m.id == anchor)
+                        {
+                            app.message_scroll = index;
+                            app.message_cursor = app.message_cursor.max(index);
+                        }
+                        dirty = true;
+                    }
+                    Err(e) => app.notice = Some(format!("加载更早的消息失败: {e}")),
+                }
+            }
         }
 
         let area = terminal.size().map(|s| ratatui::layout::Rect {

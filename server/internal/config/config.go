@@ -63,7 +63,7 @@ func Load() (Config, error) {
 		PlatformID:        7, // Linux; the TUI overrides per OS at login.
 
 		BotUserID:           env("YPTD_BOT_USER", "agentbot"),
-		BotNickname:         env("YPTD_BOT_NICKNAME", "助手"),
+		BotNickname:         env("YPTD_BOT_NICKNAME", "HALX"),
 		BotOpencodeURL:      strings.TrimRight(os.Getenv("YPTD_BOT_OPENCODE_URL"), "/"),
 		BotOpencodeUser:     env("YPTD_BOT_OPENCODE_USER", "yptd"),
 		BotOpencodePassword: os.Getenv("YPTD_BOT_OPENCODE_PASSWORD"),
