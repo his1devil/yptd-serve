@@ -315,6 +315,7 @@ pub fn snapshot() -> Snapshot {
 
     Snapshot {
         me: Some(me),
+        my_name: "张伟".to_owned(),
         conversations,
         messages: build.messages,
         members,

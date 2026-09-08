@@ -66,6 +66,10 @@ yptd 同目录或 PATH 查找。
 const HELP_LINE: &str =
     ":new 群名 · :invite [用户…] · :dm [用户] · :img 路径 · :q 退出";
 
+/// Shown wherever an action needs a conversation and there is none. Names the
+/// two commands that create one, because a new account starts here.
+const NO_CONVERSATION: &str = "还没有会话。按 : 然后 :new 群名 建群，或 :dm 找人私聊";
+
 fn main() -> Fallible<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -193,10 +197,12 @@ fn cmd_doctor(text: Option<&str>) -> Fallible<()> {
 fn cmd_doctor_frame(size: &str) -> Fallible<()> {
     let Live { mut backend, snapshot, events: _events } = connect()?;
     let mut app = live_app(snapshot);
-    let open = app.open.clone();
-    backend.session.ensure_history(&open, &mut app.snapshot)?;
-    backend.session.ensure_members(&open, &mut app.snapshot)?;
-    app.jump_to_latest();
+    if app.has_open_conversation() {
+        let open = app.open.clone();
+        backend.session.ensure_history(&open, &mut app.snapshot)?;
+        backend.session.ensure_members(&open, &mut app.snapshot)?;
+        app.jump_to_latest();
+    }
     let (width, height) = parse_size(size);
     print!("{}", render::to_text(&render::capture_app(width, height, &app)?));
     Ok(())
@@ -365,7 +371,8 @@ fn connect() -> Fallible<Live> {
     let im_token = auth::login(&config, &creds)
         .map_err(|e| format!("{e}\n如果凭据已被吊销，运行 yptd logout 后重新 yptd login。"))?;
     eprint!("启动边车… ");
-    let (mut session, events) = Session::start(&paths, &config, &creds.user_id, &im_token)?;
+    let (mut session, events) =
+        Session::start(&paths, &config, &creds.user_id, &creds.nickname, &im_token)?;
     eprint!("同步会话… ");
     let mut snapshot = Snapshot::default();
     let synced = session.wait_for_sync(&events, &mut snapshot, Duration::from_secs(20));
@@ -538,6 +545,9 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
         // Opening a conversation pulls its history and members lazily, once.
         if let Some(b) = backend.as_mut()
             && last_open.as_ref() != Some(&app.open)
+            // A fresh account has no conversation open, and asking the SDK
+            // for the history of nothing only produces an error toast.
+            && app.has_open_conversation()
         {
             let open = app.open.clone();
             if let Err(e) = b.session.ensure_history(&open, &mut app.snapshot) {
@@ -777,6 +787,10 @@ fn send_composer(app: &mut App, session: Option<&mut Session>) {
     if text.trim().is_empty() {
         return;
     }
+    if !app.has_open_conversation() {
+        app.notice = Some(NO_CONVERSATION.into());
+        return;
+    }
     let Some(s) = session else {
         app.notice = Some("示例模式下不能发送".into());
         return;
@@ -909,6 +923,10 @@ fn execute_command(app: &mut App, mut backend: Option<&mut Backend>, line: &str)
 /// Sends a picture from disk, reporting what went wrong in the status line
 /// rather than in a log nobody is reading.
 fn send_image(app: &mut App, backend: Option<&mut Backend>, path: &str) {
+    if !app.has_open_conversation() {
+        app.notice = Some(NO_CONVERSATION.into());
+        return;
+    }
     let path = match resolve_path(path) {
         Ok(path) => path,
         Err(e) => {

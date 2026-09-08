@@ -22,6 +22,7 @@ pub struct Session {
     sidecar: Sidecar,
     interner: Interner,
     me: UserId,
+    my_name: String,
     /// Conversations whose history has been pulled at least once, so opening
     /// one again does not re-fetch what is already on screen.
     loaded: HashSet<ConversationId>,
@@ -55,6 +56,7 @@ impl Session {
         paths: &Paths,
         config: &Config,
         user_id: &str,
+        nickname: &str,
         im_token: &str,
     ) -> Result<(Self, Receiver<Event>), Box<dyn std::error::Error>> {
         let (sidecar, events) = Sidecar::spawn(&im_sidecar::Config {
@@ -86,6 +88,7 @@ impl Session {
                 sidecar,
                 interner: Interner::default(),
                 me: UserId(user_id.to_owned()),
+                my_name: nickname.to_owned(),
                 loaded: HashSet::new(),
                 members_for: None,
                 at_all_tag,
@@ -98,6 +101,7 @@ impl Session {
     /// member counts and names are right.
     pub fn bootstrap(&mut self, snapshot: &mut Snapshot) -> Result<(), im_sidecar::Error> {
         snapshot.me = Some(self.me.clone());
+        snapshot.my_name = self.my_name.clone();
         snapshot.connected = true;
 
         let convs = self.sidecar.call("conversations", json!({}))?;
@@ -327,10 +331,7 @@ impl Session {
         created: Value,
         snapshot: &mut Snapshot,
     ) -> Result<(), im_sidecar::Error> {
-        let (recv_id, group_id) = match conv.0.strip_prefix("sg_") {
-            Some(g) => (String::new(), g.to_owned()),
-            None => (peer_of(conv, &self.me), String::new()),
-        };
+        let (recv_id, group_id) = target_of(conv, &self.me)?;
         let sent = self.sidecar.call(
             "send",
             json!({ "message": created, "recv_id": recv_id, "group_id": group_id }),
@@ -588,6 +589,35 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Splits a conversation id into the pair the SDK's send takes: a recipient
+/// for a direct chat, a group for a group chat, never both and never neither.
+///
+/// The SDK answers an empty pair with nothing but "invalid input arguments",
+/// so this refuses first and says which conversation was wrong.
+fn target_of(
+    conv: &ConversationId,
+    me: &UserId,
+) -> Result<(String, String), im_sidecar::Error> {
+    if let Some(group) = conv.0.strip_prefix("sg_") {
+        if !group.is_empty() {
+            return Ok((String::new(), group.to_owned()));
+        }
+    } else {
+        let peer = peer_of(conv, me);
+        if !peer.is_empty() {
+            return Ok((peer, String::new()));
+        }
+    }
+    Err(im_sidecar::Error::Sdk {
+        code: 0,
+        msg: if conv.0.is_empty() {
+            "没有打开任何会话".into()
+        } else {
+            format!("会话 {} 不是可以发送的对象", conv.0)
+        },
+    })
+}
+
 /// The other party in a direct conversation id `si_<a>_<b>`.
 fn peer_of(conv: &ConversationId, me: &UserId) -> String {
     conv.0
@@ -604,6 +634,32 @@ fn peer_of(conv: &ConversationId, me: &UserId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_send_with_no_conversation_is_refused_before_it_reaches_the_sdk() {
+        // The SDK's own answer here is "invalid input arguments" and nothing
+        // more, which is what a brand-new account used to see on its first
+        // keystroke.
+        let me = UserId("alice".into());
+        let err = target_of(&ConversationId(String::new()), &me).unwrap_err();
+        assert!(err.to_string().contains("没有打开任何会话"), "{err}");
+        assert!(target_of(&ConversationId("sg_".into()), &me).is_err(), "群号为空");
+        assert!(target_of(&ConversationId("垃圾".into()), &me).is_err());
+        assert!(target_of(&ConversationId("si_alice_alice".into()), &me).is_err(), "只有我自己");
+    }
+
+    #[test]
+    fn a_send_target_is_a_group_or_a_person_never_both() {
+        let me = UserId("alice".into());
+        assert_eq!(
+            target_of(&ConversationId("sg_42".into()), &me).unwrap(),
+            (String::new(), "42".to_owned())
+        );
+        assert_eq!(
+            target_of(&ConversationId("si_alice_zed".into()), &me).unwrap(),
+            ("zed".to_owned(), String::new())
+        );
+    }
 
     #[test]
     fn the_peer_of_a_direct_conversation_is_the_one_who_is_not_me() {

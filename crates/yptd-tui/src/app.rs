@@ -183,6 +183,15 @@ impl App {
         self.snapshot.conversation(&self.open)
     }
 
+    /// Whether there is somewhere to send to.
+    ///
+    /// A brand-new account has no conversations at all, and `open` is then
+    /// the empty id. Handing that to the SDK produces "invalid input
+    /// arguments" and nothing else, so every send checks this first.
+    pub fn has_open_conversation(&self) -> bool {
+        !self.open.0.is_empty() && self.conversation().is_some()
+    }
+
     /// How many rows the composer needs: its text, plus one for the strip
     /// naming what the draft is replying to.
     pub fn composer_rows(&self) -> usize {
@@ -548,6 +557,14 @@ mod tests {
 
     fn draft(user_id: &str, nickname: &str) -> DraftMention {
         DraftMention { user_id: user_id.into(), nickname: nickname.into() }
+    }
+
+    #[test]
+    fn a_fresh_account_has_nowhere_to_send() {
+        let app = App::new(Snapshot::default());
+        assert!(app.open.0.is_empty());
+        assert!(!app.has_open_conversation());
+        assert!(App::new(im_model::mock::snapshot()).has_open_conversation());
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub enum Scene {
     Picker,
     /// Composing a reply that mentions somebody: quote strip above the input.
     Reply,
+    /// A brand-new account: no conversations at all.
+    Empty,
 }
 
 impl Scene {
@@ -45,13 +47,15 @@ impl Scene {
             "code" => Self::Code,
             "picker" => Self::Picker,
             "reply" => Self::Reply,
+            "empty" => Self::Empty,
             _ => return None,
         })
     }
 
     fn apply(self, app: &mut App) {
         match self {
-            Self::Live => {}
+            // Handled before the fixture is built: there is nothing to apply.
+            Self::Empty | Self::Live => {}
             Self::Top => {
                 app.jump_to_top();
                 app.message_cursor = 3;
@@ -190,6 +194,9 @@ pub fn capture(
     height: u16,
     scene: Scene,
 ) -> Result<Buffer, Box<dyn std::error::Error>> {
+    if scene == Scene::Empty {
+        return capture_app(width, height, &App::new(im_model::Snapshot::default()));
+    }
     let mut app = App::new(im_model::mock::snapshot());
     scene.apply(&mut app);
     capture_app(width, height, &app)

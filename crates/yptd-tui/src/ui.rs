@@ -195,13 +195,11 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, media: &Media, theme: &
         TuiSpan::styled("  ", theme.style(HG::StatusLabel)),
     ];
     if let Some(me) = app.snapshot.me.as_ref() {
-        let name = app
-            .snapshot
-            .members
-            .iter()
-            .find(|member| &member.id == me)
-            .map(|member| member.name.as_str())
-            .unwrap_or("未知");
+        let name = if app.snapshot.my_name.is_empty() {
+            me.0.as_str()
+        } else {
+            app.snapshot.my_name.as_str()
+        };
         left.push(TuiSpan::styled(name.to_owned(), theme.style(HG::Normal)));
         left.push(TuiSpan::styled("  ", theme.style(HG::StatusLabel)));
     }
@@ -447,6 +445,8 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Paragraph::new(TuiLine::from(TuiSpan::styled(
                 if app.reply_to.is_some() {
                     "按 i 输入回复，Esc 取消引用"
+                } else if app.snapshot.conversations.is_empty() {
+                    "按 : 输入 :new 群名 建群，或 :dm 找人私聊"
                 } else {
                     "按 i 输入消息，r 引用，: 进入命令"
                 },
@@ -472,6 +472,59 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         let y = inner.y.saturating_add(line.min(inner.height.saturating_sub(1) as usize) as u16);
         frame.set_cursor_position((x, y));
     }
+}
+
+/// One command and what it does, padded so that two of these centre to the
+/// same left edge. `Paragraph` centres each line on its own, so equal width
+/// is the only thing that lines them up.
+fn command_row(command: &str, description: &str, theme: &Theme) -> TuiLine<'static> {
+    const COMMAND_CELLS: usize = 12;
+    const DESCRIPTION_CELLS: usize = 22;
+    let pad = |text: &str, cells: usize| {
+        let mut out = text.to_owned();
+        for _ in text.width()..cells {
+            out.push(' ');
+        }
+        out
+    };
+    TuiLine::from(vec![
+        TuiSpan::styled(pad(command, COMMAND_CELLS), theme.style(HG::Shortcut)),
+        TuiSpan::styled(pad(description, DESCRIPTION_CELLS), theme.style(HG::Description)),
+    ])
+    .centered()
+}
+
+/// What to do when there is nothing yet: the two commands that make a
+/// conversation, centred in the empty pane.
+fn draw_empty_state(frame: &mut Frame, inner: Rect, theme: &Theme) {
+    let rows: Vec<TuiLine<'static>> = vec![
+        TuiLine::from(TuiSpan::styled("还没有会话", theme.style(HG::Title))).centered(),
+        TuiLine::from(""),
+        TuiLine::from(vec![
+            TuiSpan::styled("按 ", theme.style(HG::Muted)),
+            TuiSpan::styled(":", theme.style(HG::Shortcut)),
+            TuiSpan::styled(" 进入命令行，然后", theme.style(HG::Muted)),
+        ])
+        .centered(),
+        TuiLine::from(""),
+        command_row(":new 群名", "建一个群，接着挑人进来", theme),
+        command_row(":dm", "找服务器上的人私聊", theme),
+        TuiLine::from(""),
+        TuiLine::from(TuiSpan::styled(
+            "别人把你拉进群，这里也会自己出现",
+            theme.style(HG::Hint),
+        ))
+        .centered(),
+    ];
+    // Sit the block a little above centre; dead centre reads as too low
+    // once the composer is on screen.
+    let top = inner.height.saturating_sub(rows.len() as u16) / 3;
+    let area = Rect {
+        y: inner.y + top,
+        height: inner.height.saturating_sub(top),
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 // -------------------------------------------------------------- messages ---
@@ -504,6 +557,14 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, media: &mut Media
 
     let content_width = inner.width.saturating_sub(GUTTER) as usize;
     if content_width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // A brand-new account lands here with nothing at all. An empty pane
+    // teaches nobody the two commands that fix it.
+    if app.snapshot.conversations.is_empty() {
+        app.message_line_map = Vec::new();
+        draw_empty_state(frame, inner, theme);
         return;
     }
 

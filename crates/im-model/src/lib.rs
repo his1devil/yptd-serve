@@ -282,6 +282,10 @@ impl Message {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub me: Option<UserId>,
+    /// The local user's display name. Kept here rather than looked up in
+    /// `members`, which only ever holds the open group's roster -- in a
+    /// direct chat, or before joining anything, one's own name is not in it.
+    pub my_name: String,
     pub conversations: Vec<Conversation>,
     pub messages: Vec<Message>,
     pub members: Vec<Member>,
