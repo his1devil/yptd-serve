@@ -9,10 +9,13 @@ use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 
 use im_model::translate::{self, Interner};
-use im_model::{ConversationId, ConversationKind, Message, SendState, Snapshot, UserId};
+use im_model::{
+    ConversationId, ConversationKind, Message, MessageId, SendState, Snapshot, UserId,
+};
 use im_sidecar::{Event, Sidecar};
 use serde_json::{json, Value};
 
+use crate::app::DraftMention;
 use crate::config::{Config, Paths};
 
 pub struct Session {
@@ -24,6 +27,9 @@ pub struct Session {
     loaded: HashSet<ConversationId>,
     /// Group whose members are currently in the snapshot.
     members_for: Option<String>,
+    /// OpenIM's reserved id for "@everyone", read from the SDK rather than
+    /// hardcoded, since it travels in `atUserList` like a real user id.
+    at_all_tag: String,
 }
 
 /// What an incoming event changed, so the caller can decide whether a redraw
@@ -68,6 +74,13 @@ impl Session {
         )?;
         sidecar.call("login", json!({ "user_id": user_id, "token": im_token }))?;
 
+        let at_all_tag = sidecar
+            .call("at_all_tag", json!({}))
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| im_model::AT_ALL_TAG.to_owned());
+
         Ok((
             Self {
                 sidecar,
@@ -75,6 +88,7 @@ impl Session {
                 me: UserId(user_id.to_owned()),
                 loaded: HashSet::new(),
                 members_for: None,
+                at_all_tag,
             },
             events,
         ))
@@ -244,15 +258,74 @@ impl Session {
         Ok(true)
     }
 
-    /// Sends a text message. The SDK echoes the message back with its final
-    /// ids, which is what goes into the snapshot -- not a local guess.
+    pub fn at_all_tag(&self) -> &str {
+        &self.at_all_tag
+    }
+
+    /// The SDK's own JSON for a message, which is what its quote primitives
+    /// take -- they want the whole original, not an id. Read from the local
+    /// store, so it works for anything on screen however long ago it loaded.
+    fn raw_message(
+        &self,
+        conv: &ConversationId,
+        id: MessageId,
+    ) -> Result<Option<Value>, im_sidecar::Error> {
+        let Some(client_id) = self.interner.client_msg_id(id) else {
+            return Ok(None);
+        };
+        let reply = self.sidecar.call(
+            "find_message",
+            json!({ "conversation_id": conv.0, "client_msg_ids": [client_id] }),
+        )?;
+        Ok(reply
+            .get("findResultItems")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("messageList"))
+            .and_then(Value::as_array)
+            .and_then(|list| list.first())
+            .cloned())
+    }
+
+    /// Sends a message, optionally quoting one and mentioning people. The SDK
+    /// echoes it back with its final ids, and that echo is what goes into the
+    /// snapshot -- never a local guess.
     pub fn send_text(
         &mut self,
         conv: &ConversationId,
         text: &str,
+        reply_to: Option<MessageId>,
+        mentions: &[DraftMention],
         snapshot: &mut Snapshot,
     ) -> Result<(), im_sidecar::Error> {
-        let created = self.sidecar.call("create_text", json!({ "text": text }))?;
+        let quote = match reply_to {
+            Some(id) => self.raw_message(conv, id)?,
+            None => None,
+        };
+        // The SDK nests a quote inside the at-text element, so a reply that
+        // also mentions somebody is one message, not two.
+        let created = if mentions.is_empty() {
+            match &quote {
+                Some(q) => self.sidecar.call("create_quote", json!({ "text": text, "quote": q }))?,
+                None => self.sidecar.call("create_text", json!({ "text": text }))?,
+            }
+        } else {
+            let ids: Vec<&str> = mentions.iter().map(|m| m.user_id.as_str()).collect();
+            let info: Vec<Value> = mentions
+                .iter()
+                .map(|m| json!({ "atUserID": m.user_id, "groupNickname": m.nickname }))
+                .collect();
+            self.sidecar.call(
+                "create_at_text",
+                json!({
+                    "text": text,
+                    "at_user_ids": ids,
+                    "at_users_info": info,
+                    "quote": quote,
+                }),
+            )?
+        };
+
         let (recv_id, group_id) = match conv.0.strip_prefix("sg_") {
             Some(g) => (String::new(), g.to_owned()),
             None => (peer_of(conv, &self.me), String::new()),

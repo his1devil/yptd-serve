@@ -10,6 +10,11 @@ pub mod translate;
 /// Epoch for synthetic message ids: 2020-01-01T00:00:00Z.
 pub const EPOCH_MS: i64 = 1_577_836_800_000;
 
+/// The reserved user id OpenIM uses for "@everyone" (`constant.AtAllString`).
+/// It travels in `atUserList` like any other id, so it needs no special case
+/// anywhere except when deciding how to draw it.
+pub const AT_ALL_TAG: &str = "AtAllTag";
+
 const TIMESTAMP_SHIFT: u32 = 22;
 const COUNTER_MASK: u64 = (1 << TIMESTAMP_SHIFT) - 1;
 
@@ -218,6 +223,12 @@ pub struct Mention {
     pub notifies_me: bool,
 }
 
+impl Mention {
+    pub fn mentions_everyone(&self) -> bool {
+        self.user.0 == AT_ALL_TAG
+    }
+}
+
 impl Message {
     pub fn sent_at_ms(&self) -> i64 {
         self.id.sent_at_ms()
@@ -261,6 +272,10 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn conversation(&self, id: &ConversationId) -> Option<&Conversation> {
         self.conversations.iter().find(|c| &c.id == id)
+    }
+
+    pub fn message(&self, id: MessageId) -> Option<&Message> {
+        self.messages.iter().find(|m| m.id == id)
     }
 
     pub fn messages_in(&self, id: &ConversationId) -> Vec<&Message> {

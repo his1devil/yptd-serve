@@ -31,7 +31,7 @@ use crossterm::execute;
 use im_model::{Conversation, ConversationId, ConversationKind, Member, Role, Snapshot, UserId};
 use tui_theme::Theme;
 
-use crate::app::{App, Mode, Pane};
+use crate::app::{App, DraftMention, Mode, Pane};
 use crate::config::{Config, Credentials, Paths};
 use crate::picker::{PickItem, Picker, Purpose, Verdict};
 use crate::render::{Palette, Scene};
@@ -47,12 +47,14 @@ const USAGE: &str = "yptd — 终端 IM 客户端
   yptd doctor [文本]       不进界面：登录、起边车、拉会话，可选发一条消息
   yptd doctor --frame WxH  同上，但把真实数据渲染成一帧文本输出
   yptd doctor --new 群名 [用户…]   建群并拉人，打印结果
+  yptd doctor --reply 用户 文本     引用最新一条并 @ 这个人
   yptd --mock              用内置示例数据启动，不连服务器
   yptd --snapshot WxH [scene] [palette]   离屏出帧（文本）
   yptd --ansi     WxH [scene]             离屏出帧（ANSI）
   yptd --html     WxH [scene] [palette]   离屏出帧（HTML）
 
-界面里按 : 输命令：:new 群名 · :invite [用户…] · :dm [用户] · :help · :q
+界面里：r 引用选中的消息，输入时 @ 提及群成员，
+: 输命令：:new 群名 · :invite [用户…] · :dm [用户] · :help · :q
 
 文件都在 ~/.yptd/（或 $YPTD_HOME）。边车二进制通过 $YPTD_SIDECAR、
 yptd 同目录或 PATH 查找。
@@ -69,6 +71,7 @@ fn main() -> Fallible<()> {
         Some("doctor") => match args.get(1).map(String::as_str) {
             Some("--frame") => cmd_doctor_frame(args.get(2).map(String::as_str).unwrap_or("120x32")),
             Some("--new") => cmd_doctor_new(args.get(2).map(String::as_str), args.get(3..).unwrap_or(&[])),
+            Some("--reply") => cmd_doctor_reply(args.get(2).map(String::as_str), args.get(3..).unwrap_or(&[])),
             text => cmd_doctor(text),
         },
         Some("--mock") => run(App::new(im_model::mock::snapshot()), None),
@@ -154,7 +157,7 @@ fn cmd_doctor(text: Option<&str>) -> Fallible<()> {
         println!("  [{}] {}: {}", m.sent_at_ms(), m.sender_name, m.text().lines().next().unwrap_or(""));
     }
     if let Some(text) = text {
-        session.send_text(&first, text, &mut snapshot)?;
+        session.send_text(&first, text, None, &[], &mut snapshot)?;
         println!("已发送: {text}");
     }
     // Keep listening a while so pushes from other people show up too.
@@ -223,6 +226,71 @@ fn cmd_doctor_new(name: Option<&str>, invitees: &[String]) -> Fallible<()> {
     backend.session.ensure_members(&conv, &mut snapshot)?;
     let names: Vec<String> = snapshot.members.iter().map(|m| format!("{}[{}]", m.name, m.role.label())).collect();
     println!("成员 {} 人：{}", names.len(), names.join(" "));
+    Ok(())
+}
+
+/// Quotes the newest message in the newest conversation and mentions
+/// somebody, which is the one path that exercises at-text, the nested quote
+/// and the message lookup all at once.
+fn cmd_doctor_reply(user_id: Option<&str>, words: &[String]) -> Fallible<()> {
+    let Some(user_id) = user_id.filter(|u| !u.is_empty()) else {
+        return Err("用法: yptd doctor --reply 用户 文本".into());
+    };
+    let Live { mut backend, mut snapshot, .. } = connect()?;
+    // Newest first, but a group where nobody has said anything yet has only
+    // system notices, and those cannot be quoted.
+    let ids: Vec<ConversationId> = snapshot.conversations.iter().map(|c| c.id.clone()).collect();
+    let mut found = None;
+    for id in ids {
+        backend.session.ensure_history(&id, &mut snapshot)?;
+        if let Some(m) = snapshot.messages_in(&id).into_iter().rev().find(|m| !m.is_system()) {
+            found = Some((id.clone(), m.id, m.sender_name.clone(), m.text().to_owned()));
+            break;
+        }
+    }
+    let Some((conv, target_id, target_sender, target_text)) = found else {
+        return Err("没有可引用的消息".into());
+    };
+    backend.session.ensure_members(&conv, &mut snapshot)?;
+
+    // Mirror what the `@` list puts in the text, including the reserved
+    // "everyone" id, which has no member row to read a name from.
+    let nickname = if user_id == backend.session.at_all_tag() {
+        "全体成员".to_owned()
+    } else {
+        snapshot
+            .members
+            .iter()
+            .find(|m| m.id.0 == user_id)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| user_id.to_owned())
+    };
+    let body = words.join(" ");
+    let text = format!("@{nickname} {}", if body.is_empty() { "看下这条" } else { &body });
+    let mentions = [DraftMention { user_id: user_id.to_owned(), nickname }];
+
+    println!("在 {} 里引用 {} 的「{}」", conv.0, target_sender, target_text.lines().next().unwrap_or(""));
+    backend
+        .session
+        .send_text(&conv, &text, Some(target_id), &mentions, &mut snapshot)?;
+    println!("已发送: {text}");
+
+    let sent = snapshot
+        .messages_in(&conv)
+        .into_iter()
+        .next_back()
+        .ok_or("发出去的消息没有回到快照里")?;
+    println!("回显: {}", sent.text());
+    match &sent.quote {
+        Some(q) => println!("  引用 → {}: {}", q.sender_name, q.summary),
+        None => println!("  ✗ 回显里没有引用"),
+    }
+    if sent.mentions.is_empty() {
+        println!("  ✗ 回显里没有提及");
+    }
+    for m in &sent.mentions {
+        println!("  提及 → {} [{}..{}] 通知我={}", m.user.0, m.start, m.end, m.notifies_me);
+    }
     Ok(())
 }
 
@@ -468,8 +536,8 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
             Input::Terminal(Event::Mouse(m)) => {
                 // A modal owns the screen; clicks underneath it do nothing.
                 if app.picker.is_none() {
-                    let lines = app.composer.lines().count().max(1);
-                    let out = mouse::handle(&mut app, m, area, lines, &mut clicks);
+                    let rows = app.composer_rows();
+                    let out = mouse::handle(&mut app, m, area, rows, &mut clicks);
                     if out.activate {
                         app.open_selected();
                     }
@@ -571,7 +639,7 @@ enum Flow {
 }
 
 /// One keypress, routed: the modal first if one is open, then the mode map.
-fn on_key(app: &mut App, backend: Option<&mut Backend>, code: KeyCode, modifiers: KeyModifiers) -> Flow {
+fn on_key(app: &mut App, mut backend: Option<&mut Backend>, code: KeyCode, modifiers: KeyModifiers) -> Flow {
     if let Some(picker) = app.picker.as_mut() {
         match picker.handle_key(code, modifiers) {
             Verdict::Continue => {}
@@ -590,6 +658,20 @@ fn on_key(app: &mut App, backend: Option<&mut Backend>, code: KeyCode, modifiers
             Flow::Continue
         }
         KeyAction::Command(line) => execute_command(app, backend, &line),
+        KeyAction::Mention => {
+            let tag = backend
+                .as_deref_mut()
+                .map(|b| b.session.at_all_tag().to_owned())
+                .unwrap_or_else(|| im_model::AT_ALL_TAG.to_owned());
+            open_mention_picker(app, &tag);
+            Flow::Continue
+        }
+        KeyAction::Reply => {
+            if !app.begin_reply() {
+                app.notice = Some("这条消息不能引用".into());
+            }
+            Flow::Continue
+        }
         KeyAction::None => Flow::Continue,
     }
 }
@@ -604,13 +686,60 @@ fn send_composer(app: &mut App, session: Option<&mut Session>) {
         app.notice = Some("示例模式下不能发送".into());
         return;
     };
-    match s.send_text(&app.open, &text, &mut app.snapshot) {
+    let mentions = app::live_mentions(&text, &app.draft_mentions);
+    match s.send_text(&app.open, &text, app.reply_to, &mentions, &mut app.snapshot) {
         Ok(()) => {
             app.composer.clear();
+            app.clear_draft_context();
             app.jump_to_latest();
         }
         Err(e) => app.notice = Some(format!("发送失败: {e}")),
     }
+}
+
+/// Opens the `@` list: the people in this conversation, plus everyone at once
+/// when it is a group. The roster is deliberately not used here -- mentioning
+/// somebody who cannot see the message notifies nobody.
+fn open_mention_picker(app: &mut App, at_all_tag: &str) {
+    let me = me_id(app);
+    let mut items: Vec<PickItem> = Vec::new();
+    if app.conversation().map(|c| c.kind) == Some(ConversationKind::Group)
+        && app.snapshot.members.len() > 1
+    {
+        items.push(PickItem {
+            id: at_all_tag.to_owned(),
+            label: "全体成员".into(),
+            detail: "提醒所有人".into(),
+        });
+    }
+    items.extend(
+        app.snapshot
+            .members
+            .iter()
+            .filter(|m| m.id.0 != me)
+            .map(|m| PickItem {
+                id: m.id.0.clone(),
+                label: m.name.clone(),
+                detail: m.id.0.clone(),
+            }),
+    );
+    if items.is_empty() {
+        app.notice = Some("这个会话里没有别人可以提及".into());
+        return;
+    }
+    // The at-all row is first by intent, not by id, so keep the order given.
+    app.picker = Some(Picker::ordered("提及谁", Purpose::Mention, items, false));
+}
+
+/// Finishes an `@`: the `@` is already in the text, so only the name and a
+/// separating space go in.
+fn insert_mention(app: &mut App, id: &str, nickname: &str) {
+    app.composer.insert_str(nickname);
+    app.composer.insert_char(' ');
+    app.draft_mentions.push(DraftMention {
+        user_id: id.to_owned(),
+        nickname: nickname.to_owned(),
+    });
 }
 
 // ------------------------------------------------------------ commands ---
@@ -757,6 +886,12 @@ fn complete_pick(app: &mut App, backend: Option<&mut Backend>, picker: Picker, i
                 open_direct(app, backend, id, &name);
             }
         }
+        Purpose::Mention => {
+            if let Some(id) = ids.first() {
+                let name = picker.label_of(id);
+                insert_mention(app, id, &name);
+            }
+        }
     }
 }
 
@@ -841,6 +976,10 @@ enum KeyAction {
     Quit,
     /// A `:` line, without the colon.
     Command(String),
+    /// `@` was typed; offer the people in this conversation.
+    Mention,
+    /// Quote the selected message.
+    Reply,
 }
 
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
@@ -851,10 +990,17 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyActio
     match app.mode {
         Mode::Insert | Mode::Command => match code {
             KeyCode::Esc => {
-                if app.mode == Mode::Command {
-                    app.composer.clear();
+                // Escape peels one layer at a time: the reply first, then
+                // insert mode. Dropping both at once loses a quote the person
+                // may have picked several keystrokes ago.
+                if app.mode == Mode::Insert && app.reply_to.is_some() {
+                    app.clear_draft_context();
+                } else {
+                    if app.mode == Mode::Command {
+                        app.composer.clear();
+                    }
+                    app.mode = Mode::Normal;
                 }
-                app.mode = Mode::Normal;
             }
             KeyCode::Enter if app.mode == Mode::Command => {
                 let line = app.composer.text().trim_start_matches(':').trim().to_owned();
@@ -907,6 +1053,10 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyActio
             KeyCode::Char('w') if ctrl => {
                 app.composer.delete_word_before();
             }
+            KeyCode::Char('@') if app.mode == Mode::Insert => {
+                app.composer.insert_char('@');
+                return KeyAction::Mention;
+            }
             KeyCode::Char(value) => app.composer.insert_char(value),
             _ => {}
         },
@@ -933,6 +1083,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyActio
             KeyCode::Char('G') => app.jump_to_latest(),
             KeyCode::Char('g') => app.jump_to_top(),
             KeyCode::Char('z') => app.toggle_collapsed(),
+            KeyCode::Char('r') => return KeyAction::Reply,
             KeyCode::Enter => app.open_selected(),
             _ => {}
         },
@@ -1141,6 +1292,89 @@ mod tests {
         type_command(&mut app, "new");
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("用法")));
         assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn the_reply_scene_shows_what_is_being_answered_above_the_input() {
+        let (width, height) = parse_size("110x30");
+        let out = render::to_text(&render::capture(width, height, Scene::Reply).expect("render"));
+        assert!(out.contains("↩ 陈明:"), "the quote strip names the author: {out}");
+        assert!(out.contains("@李娜 我按这个跑一遍再合"), "the draft is visible");
+        for line in out.lines() {
+            assert!(unicode_width::UnicodeWidthStr::width(line) <= 110, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn r_starts_a_reply_and_escape_drops_it_before_leaving_insert() {
+        let mut app = mock_app();
+        app.focus(Pane::Messages);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.reply_to.is_some(), "r quotes the selected message");
+        assert_eq!(app.mode, Mode::Insert, "and puts the cursor in the composer");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.reply_to.is_none(), "the first escape drops the quote");
+        assert_eq!(app.mode, Mode::Insert, "but stays in insert");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal, "the second escape leaves insert");
+    }
+
+    #[test]
+    fn at_types_the_sign_then_offers_the_people_in_this_conversation() {
+        let mut app = mock_app();
+        app.mode = Mode::Insert;
+        press(&mut app, KeyCode::Char('@'));
+        assert_eq!(app.composer.text(), "@", "the sign is typed either way");
+        let picker = app.picker.as_ref().expect("the list opens");
+        assert!(!picker.multi, "one mention at a time");
+        assert_eq!(
+            picker.items.first().map(|i| i.label.as_str()),
+            Some("全体成员"),
+            "everyone is offered first in a group"
+        );
+        assert!(!picker.items.iter().any(|i| i.id == me_id(&app)), "never offer to @ myself");
+
+        // Cancelling leaves the sign behind as ordinary text.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.composer.text(), "@");
+        assert!(app.draft_mentions.is_empty());
+    }
+
+    #[test]
+    fn picking_a_name_writes_it_into_the_draft_and_records_who_to_notify() {
+        let mut app = mock_app();
+        app.mode = Mode::Insert;
+        press(&mut app, KeyCode::Char('@'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        let recorded = app.draft_mentions.first().expect("one mention recorded");
+        assert_eq!(app.composer.text(), format!("@{} ", recorded.nickname));
+        assert_eq!(
+            app::live_mentions(app.composer.text(), &app.draft_mentions).len(),
+            1,
+            "the name is still in the text, so it still notifies"
+        );
+    }
+
+    #[test]
+    fn a_direct_conversation_offers_no_mention_of_everyone() {
+        let mut app = mock_app();
+        let direct = app
+            .snapshot
+            .conversations
+            .iter()
+            .find(|c| c.kind == ConversationKind::Direct)
+            .map(|c| c.id.clone())
+            .expect("the fixture has a direct conversation");
+        app.open_conversation(direct);
+        app.mode = Mode::Insert;
+        press(&mut app, KeyCode::Char('@'));
+        let offered = app.picker.as_ref().map(|p| {
+            p.items.iter().any(|i| i.id == im_model::AT_ALL_TAG)
+        });
+        assert_eq!(offered, Some(false), "there is no 'everyone' in a two-person chat");
     }
 
     #[test]

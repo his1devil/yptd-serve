@@ -135,13 +135,13 @@ func (h *Handler) Dispatch(op string, raw json.RawMessage) (json.RawMessage, err
 			a.LogLevel = 3
 		}
 		config, _ := json.Marshal(map[string]any{
-			"apiAddr":             a.APIAddr,
-			"wsAddr":              a.WSAddr,
-			"dataDir":             a.DataDir,
-			"platformID":          a.PlatformID,
-			"logLevel":            a.LogLevel,
-			"isLogStandardOutput": false,
-			"logFilePath":         a.DataDir,
+			"apiAddr":              a.APIAddr,
+			"wsAddr":               a.WSAddr,
+			"dataDir":              a.DataDir,
+			"platformID":           a.PlatformID,
+			"logLevel":             a.LogLevel,
+			"isLogStandardOutput":  false,
+			"logFilePath":          a.DataDir,
 			"isExternalExtensions": false,
 		})
 		// InitSDK creates the SDK's user object; every Set*Listener before it
@@ -238,6 +238,59 @@ func (h *Handler) Dispatch(op string, raw json.RawMessage) (json.RawMessage, err
 		}
 		return jsonOrString(open_im_sdk.CreateQuoteMessage(
 			operationID(), a.Text, string(a.Quote))), nil
+
+	// One primitive covers @ alone and @ with a quote: the SDK nests the
+	// quoted message inside the at-text element rather than making them two
+	// different content types.
+	case "create_at_text":
+		var a struct {
+			Text    string          `json:"text"`
+			UserIDs []string        `json:"at_user_ids"`
+			AtInfo  json.RawMessage `json:"at_users_info"`
+			Quote   json.RawMessage `json:"quote"`
+		}
+		if err := args(raw, &a); err != nil {
+			return nil, err
+		}
+		if len(a.UserIDs) == 0 {
+			return nil, errors.New("create_at_text 需要至少一个 at_user_ids")
+		}
+		ids, _ := json.Marshal(a.UserIDs)
+		info := "[]"
+		if len(a.AtInfo) > 0 {
+			info = string(a.AtInfo)
+		}
+		// An empty string becomes a nil *MsgStruct on the SDK side, which is
+		// what "no quote" means there. A literal JSON null means the same.
+		quote := ""
+		if len(a.Quote) > 0 && string(a.Quote) != "null" {
+			quote = string(a.Quote)
+		}
+		return jsonOrString(open_im_sdk.CreateTextAtMessage(
+			operationID(), a.Text, string(ids), info, quote)), nil
+
+	// The quote primitives take the whole original message, not an id, so a
+	// reply first has to fetch what it is replying to out of the local store.
+	case "find_message":
+		var a struct {
+			ConversationID string   `json:"conversation_id"`
+			ClientMsgIDs   []string `json:"client_msg_ids"`
+		}
+		if err := args(raw, &a); err != nil {
+			return nil, err
+		}
+		query, _ := json.Marshal([]map[string]any{{
+			"conversationID":  a.ConversationID,
+			"clientMsgIDList": a.ClientMsgIDs,
+		}})
+		p := newPromise()
+		open_im_sdk.FindMessageList(p, operationID(), string(query))
+		return h.reply(p)
+
+	// "@everyone" is a reserved user id rather than a flag; ask the SDK for
+	// it instead of hardcoding a string that could change under us.
+	case "at_all_tag":
+		return jsonOrString(open_im_sdk.GetAtAllTag(operationID())), nil
 
 	case "create_image":
 		var a struct {

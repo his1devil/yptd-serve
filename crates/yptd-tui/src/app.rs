@@ -1,7 +1,9 @@
 //! Interaction state: which pane has focus, which conversation is open, and
 //! where the two message cursors sit.
 
-use im_model::{Conversation, ConversationId, ConversationKind, Member, Message, Role, Snapshot};
+use im_model::{
+    Conversation, ConversationId, ConversationKind, Member, Message, MessageId, Role, Snapshot,
+};
 use tui_textedit::TextArea;
 
 use crate::picker::Picker;
@@ -50,6 +52,15 @@ impl Mode {
             Self::Command => "COMMAND",
         }
     }
+}
+
+/// Somebody the draft mentions: who to notify, and the text that stands for
+/// them in the message. The SDK wants both -- the id to route the
+/// notification, the nickname to find the mention inside the text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftMention {
+    pub user_id: String,
+    pub nickname: String,
 }
 
 /// A row in the conversation pane: either a collapsible category or a
@@ -102,6 +113,12 @@ pub struct App {
     /// A modal list over everything else. While it is open, keys go to it
     /// and the panes underneath are inert.
     pub picker: Option<Picker>,
+    /// The message the draft is a reply to. Belongs to [`Self::open`], so it
+    /// is dropped whenever the conversation changes.
+    pub reply_to: Option<MessageId>,
+    /// Who the draft mentions so far. Recorded when `@` picks somebody, then
+    /// filtered at send time against what is actually still in the text.
+    pub draft_mentions: Vec<DraftMention>,
 }
 
 impl App {
@@ -129,6 +146,8 @@ impl App {
             notice: None,
             utc_offset_ms: 0,
             picker: None,
+            reply_to: None,
+            draft_mentions: Vec::new(),
         };
         app.jump_to_latest();
         app
@@ -155,11 +174,48 @@ impl App {
             notice: self.notice.clone(),
             utc_offset_ms: self.utc_offset_ms,
             picker: self.picker.clone(),
+            reply_to: self.reply_to,
+            draft_mentions: self.draft_mentions.clone(),
         }
     }
 
     pub fn conversation(&self) -> Option<&Conversation> {
         self.snapshot.conversation(&self.open)
+    }
+
+    /// How many rows the composer needs: its text, plus one for the strip
+    /// naming what the draft is replying to.
+    pub fn composer_rows(&self) -> usize {
+        self.composer.lines().count().max(1) + usize::from(self.reply_to.is_some())
+    }
+
+    /// The message under the message-pane cursor.
+    pub fn selected_message(&self) -> Option<&Message> {
+        self.messages().get(self.message_cursor).copied()
+    }
+
+    /// The message the draft is replying to, if it is still in the snapshot.
+    pub fn reply_target(&self) -> Option<&Message> {
+        self.reply_to.and_then(|id| self.snapshot.message(id))
+    }
+
+    /// Starts a reply to the selected message. Refuses system notices: there
+    /// is no author to reply to and the SDK has nothing to quote.
+    pub fn begin_reply(&mut self) -> bool {
+        match self.selected_message() {
+            Some(message) if !message.is_system() => {
+                self.reply_to = Some(message.id);
+                self.mode = Mode::Insert;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drops the reply and every mention, leaving the typed text alone.
+    pub fn clear_draft_context(&mut self) {
+        self.reply_to = None;
+        self.draft_mentions.clear();
     }
 
     pub fn messages(&self) -> Vec<&Message> {
@@ -410,6 +466,12 @@ impl App {
 
     /// Switches to a conversation and lands at its newest message.
     pub fn open_conversation(&mut self, id: ConversationId) {
+        if self.open != id {
+            // The reply target and the mentioned people belong to the
+            // conversation being left; carrying them over would quote a
+            // message nobody here can see.
+            self.clear_draft_context();
+        }
         self.open = id;
         self.message_scroll = 0;
         self.jump_to_latest();
@@ -462,9 +524,81 @@ fn step(current: usize, delta: isize, count: usize) -> usize {
     current.saturating_add_signed(delta).min(last)
 }
 
+/// The recorded mentions that survive to the text actually being sent.
+///
+/// Somebody can pick a name from the `@` list and then delete it again, or
+/// pick the same person twice. What goes on the wire has to match what is
+/// written, or people get notified for a message that never names them.
+pub fn live_mentions(text: &str, draft: &[DraftMention]) -> Vec<DraftMention> {
+    let mut out: Vec<DraftMention> = Vec::new();
+    for mention in draft {
+        if out.iter().any(|kept| kept.user_id == mention.user_id) {
+            continue;
+        }
+        if text.contains(&format!("@{}", mention.nickname)) {
+            out.push(mention.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draft(user_id: &str, nickname: &str) -> DraftMention {
+        DraftMention { user_id: user_id.into(), nickname: nickname.into() }
+    }
+
+    #[test]
+    fn a_mention_deleted_from_the_draft_does_not_notify() {
+        let draft = [draft("lina", "李娜"), draft("chenming", "陈明")];
+        let kept = live_mentions("@陈明 你看下", &draft);
+        assert_eq!(kept, vec![draft[1].clone()], "李娜 was removed from the text");
+        assert!(live_mentions("什么都没写", &draft).is_empty());
+    }
+
+    #[test]
+    fn picking_the_same_person_twice_notifies_them_once() {
+        let draft = [draft("lina", "李娜"), draft("lina", "李娜")];
+        assert_eq!(live_mentions("@李娜 @李娜 在吗", &draft).len(), 1);
+    }
+
+    #[test]
+    fn a_reply_is_dropped_when_the_conversation_changes() {
+        let mut app = App::new(im_model::mock::snapshot());
+        app.focus(Pane::Messages);
+        assert!(app.begin_reply(), "a normal message can be replied to");
+        assert_eq!(app.mode, Mode::Insert);
+        app.draft_mentions.push(draft("lina", "李娜"));
+
+        let elsewhere = app.snapshot.conversations[1].id.clone();
+        app.open_conversation(elsewhere);
+        assert!(app.reply_to.is_none(), "the quoted message is not in this conversation");
+        assert!(app.draft_mentions.is_empty());
+    }
+
+    #[test]
+    fn a_system_notice_cannot_be_replied_to() {
+        let mut app = App::new(im_model::mock::snapshot());
+        app.jump_to_top();
+        app.message_cursor = app
+            .messages()
+            .iter()
+            .position(|m| m.is_system())
+            .expect("the fixture has a system message");
+        assert!(!app.begin_reply(), "there is nothing to quote");
+        assert!(app.reply_to.is_none());
+    }
+
+    #[test]
+    fn the_composer_grows_by_one_row_while_replying() {
+        let mut app = App::new(im_model::mock::snapshot());
+        let plain = app.composer_rows();
+        app.focus(Pane::Messages);
+        app.begin_reply();
+        assert_eq!(app.composer_rows(), plain + 1);
+    }
 
     fn app() -> App {
         App::new(im_model::mock::snapshot())

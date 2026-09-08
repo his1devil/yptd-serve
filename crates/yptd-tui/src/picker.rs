@@ -24,6 +24,9 @@ pub enum Purpose {
         conversation: ConversationId,
     },
     DirectMessage,
+    /// Insert `@somebody` into the draft. The `@` is already typed, so
+    /// cancelling leaves it behind as ordinary text.
+    Mention,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +53,12 @@ impl Picker {
     /// scatters them in a way nobody can scan.
     pub fn new(title: impl Into<String>, purpose: Purpose, mut items: Vec<PickItem>, multi: bool) -> Self {
         items.sort_by(|a, b| a.id.cmp(&b.id).then(a.label.cmp(&b.label)));
+        Self::ordered(title, purpose, items, multi)
+    }
+
+    /// Keeps the caller's order, for lists where position carries meaning --
+    /// "everyone" belongs at the top, not under the Z's.
+    pub fn ordered(title: impl Into<String>, purpose: Purpose, items: Vec<PickItem>, multi: bool) -> Self {
         Self {
             title: title.into(),
             purpose,

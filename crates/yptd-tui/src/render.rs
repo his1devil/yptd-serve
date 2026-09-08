@@ -31,6 +31,8 @@ pub enum Scene {
     Code,
     /// The invite picker open over the live scene, two names ticked.
     Picker,
+    /// Composing a reply that mentions somebody: quote strip above the input.
+    Reply,
 }
 
 impl Scene {
@@ -42,6 +44,7 @@ impl Scene {
             "insert" => Self::Insert,
             "code" => Self::Code,
             "picker" => Self::Picker,
+            "reply" => Self::Reply,
             _ => return None,
         })
     }
@@ -78,6 +81,22 @@ impl Scene {
                 picker.selected.insert("wuhao".into());
                 picker.cursor = 1;
                 app.picker = Some(picker);
+            }
+            Self::Reply => {
+                app.focus(Pane::Messages);
+                // The message with the fenced code block: a quote strip has
+                // to survive a multi-line, wide original.
+                app.message_cursor = app
+                    .messages()
+                    .iter()
+                    .position(|m| matches!(m.body, im_model::Body::Markdown(_)))
+                    .unwrap_or(0);
+                app.begin_reply();
+                app.composer.set_text("@李娜 我按这个跑一遍再合");
+                app.draft_mentions.push(crate::app::DraftMention {
+                    user_id: "lina".into(),
+                    nickname: "李娜".into(),
+                });
             }
             Self::Insert => {
                 app.mode = Mode::Insert;

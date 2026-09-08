@@ -6,7 +6,8 @@
 但代码从零编写，不含其 GPL 代码。
 
 > **当前状态：已接真实后端。** `yptd login` 用邀请码登录一次，之后 `yptd`
-> 直接进入：会话列表、历史、群成员、发文本、建群拉人、私聊、实时推送都走 OpenIM。
+> 直接进入：会话列表、历史、群成员、发消息、引用回复、@ 提及、建群拉人、私聊、
+> 实时推送都走 OpenIM。
 > 没账号也能跑 `yptd --mock` 看渲染。
 
 ---
@@ -56,6 +57,7 @@ yptd doctor                       # 登录、起边车、拉会话与历史，�
 yptd doctor "hello"               # 同上，并向最近的会话发一条
 yptd doctor --frame 120x32        # 把真实数据渲染成一帧文本，ssh 里也能看
 yptd doctor --new 群名 lina wuhao   # 建群并拉人，读回成员
+yptd doctor --reply lina 文本       # 引用最新一条并 @ 这个人，打印回显
 ```
 
 ---
@@ -79,6 +81,7 @@ cargo run -- --html 112x28 top dark > frame.html
 | `nav` | 焦点在会话栏，一个分类被折叠 |
 | `insert` | 输入模式，composer 激活 |
 | `picker` | 邀请弹层盖在会话上，勾了两个人 |
+| `reply` | 正在写一条带引用和 @ 的回复 |
 
 ---
 
@@ -94,7 +97,9 @@ cargo run -- --html 112x28 top dark > frame.html
 | `g` `G` | 跳到顶部 / 最新（`G` 重新开启自动跟随） |
 | `Enter` | 打开会话；在分类上则折叠 |
 | `z` | 折叠 / 展开分类 |
+| `r` | 引用选中的消息并进入 INSERT |
 | `i` | 进入 INSERT（`Esc` 退出） |
+| `@` | INSERT 里：弹出本会话成员名单，选中即插入 |
 | `Enter` / `S-Enter` | INSERT 里：发送 / 换行 |
 | `C-a` `C-e` `C-u` `C-k` `C-w`、`M-←` `M-→` | INSERT 里的行编辑 |
 | `:` | 进入 COMMAND（`Esc` 退出） |
@@ -111,6 +116,9 @@ cargo run -- --html 112x28 top dark > frame.html
 | `:dm` | 弹出名单选一个人私聊；`:dm lina` 直接开 |
 | `:help` | 命令一览 |
 | `:q` | 退出 |
+
+`Esc` 一次剥一层：先取消引用，再退出 INSERT。切换会话会丢掉引用和已选的提及——
+它们属于刚才那个会话，带过去就会引用别人看不见的消息。
 
 弹出的名单：直接打字过滤（昵称或用户名，不分大小写），`↑` `↓` / `C-n` `C-p` 移动，
 `Space` / `Tab` 勾选，`Enter` 确定（没勾任何人时取光标所在的那个），`Esc` 取消。
@@ -147,6 +155,10 @@ cargo run -- --html 112x28 top dark > frame.html
 - **弹层独占键盘。** 名单打开时所有按键归它，`q` 是过滤字符而不是退出；鼠标点在下面的栏上不生效。
 - **私聊会话本地先建行。** `:dm` 用 SDK 的规则算出 `si_<a>_<b>`（按字典序排的两个 id），
   服务端在第一条消息发出后才有这条会话，之后推来的行会落在同一个 id 上。
+- **引用和 @ 是同一条消息。** SDK 把被引用的原文塞在 at-text 元素里，
+  所以「回复并 @」发出去是一条 contentType 106，而不是两条；读的时候两个位置都要认。
+- **发送前重新核对提及。** 名单里选过的人，如果名字又被删掉了，就不该收到通知；
+  发送时按最终文本里还在不在 `@昵称` 过一遍，并按 id 去重。
 
 ---
 
@@ -168,6 +180,9 @@ make test           # cargo test + go test
 - `sending_in_mock_mode_keeps_the_draft_and_explains` —— 发送失败不能吞掉草稿。
 - `keys_go_to_the_picker_while_it_is_open` —— 弹层开着时 `q` 是过滤，不是退出。
 - `dm_opens_a_direct_conversation_on_the_sdk_derived_id` —— 本地建的私聊行和服务端推的落在同一个 id。
+- `a_mention_deleted_from_the_draft_does_not_notify` —— 删掉名字就不再通知那个人。
+- `a_reply_that_also_mentions_someone_carries_both` —— 引用藏在 at-text 里也要读出来。
+- `r_starts_a_reply_and_escape_drops_it_before_leaving_insert` —— Esc 一次只剥一层。
 
 ---
 
@@ -217,7 +232,7 @@ yptd-server check                   # Mongo 与 OpenIM 连通性
 
 ## 尚未实现
 
-引用与 @ 发送、发图片、reaction、退群 / 踢人、模糊会话切换器、
+发图片、reaction、撤回、重发失败的消息、退群 / 踢人、模糊会话切换器、
 leader 键提示窗、可配置键位。凭据先放 0600 文件，钥匙串以后再说。
 
 ## 许可

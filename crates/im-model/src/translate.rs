@@ -40,6 +40,10 @@ mod content {
 #[derive(Default)]
 pub struct Interner {
     by_client_id: HashMap<String, MessageId>,
+    /// The way back, for the operations the SDK keys by `clientMsgID`:
+    /// quoting a message means handing the SDK the original, and all the UI
+    /// has at that point is the id it is drawing.
+    by_id: HashMap<MessageId, String>,
     /// Per-millisecond counter so two messages in the same instant differ.
     last_ms: i64,
     counter: u64,
@@ -62,11 +66,16 @@ impl Interner {
         }
         let id = MessageId::from_send_time(sent_at_ms, self.counter);
         self.by_client_id.insert(client_msg_id.to_owned(), id);
+        self.by_id.insert(id, client_msg_id.to_owned());
         id
     }
 
     pub fn get(&self, client_msg_id: &str) -> Option<MessageId> {
         self.by_client_id.get(client_msg_id).copied()
+    }
+
+    pub fn client_msg_id(&self, id: MessageId) -> Option<&str> {
+        self.by_id.get(&id).map(String::as_str)
     }
 }
 
@@ -156,7 +165,9 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
                             start,
                             end: start + needle.len(),
                             user: UserId(uid.to_owned()),
-                            notifies_me: is_at_self && uid == me.0,
+                            // A mention of everyone reaches me too, whether or
+                            // not the sender's client set `isAtSelf`.
+                            notifies_me: uid == crate::AT_ALL_TAG || (is_at_self && uid == me.0),
                         });
                     }
                 }
@@ -215,9 +226,17 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
         _ => return None,
     };
 
-    let quote = (content_type == content::QUOTE)
-        .then(|| msg.get("quoteElem").and_then(|q| q.get("quoteMessage")))
-        .flatten()
+    // A quote rides in `quoteElem` on its own, and inside `atTextElem` when
+    // the reply also mentions somebody. Both are replies and both draw the
+    // same strip above the message.
+    let quote = match content_type {
+        content::QUOTE => msg.get("quoteElem").and_then(|q| q.get("quoteMessage")),
+        content::AT_TEXT | content::ADVANCED_TEXT => msg
+            .get("atTextElem")
+            .or_else(|| msg.get("advancedTextElem"))
+            .and_then(|e| e.get("quoteMessage")),
+        _ => None,
+    }
         .and_then(|q| {
             let qid = str_of(q, "clientMsgID");
             (!qid.is_empty()).then(|| Quote {
@@ -341,7 +360,13 @@ pub fn conversation(v: &Value, interner: &Interner) -> Option<Conversation> {
         kind,
         category: Some(category_for(kind).to_owned()),
         unread: i64_of(v, "unreadCount").max(0) as u32,
-        mentions: 0,
+        // The SDK reports whether the unread run mentions me at all, not how
+        // many times. One badge either way is what the sidebar shows.
+        mentions: match i64_of(v, "groupAtType") {
+            1 | 3 => 1, // at me, at everyone and me
+            2 => 1,     // at everyone
+            _ => 0,
+        },
         muted: i64_of(v, "recvMsgOpt") == 2,
         member_count: 0,
         last_activity_ms: i64_of(v, "latestMsgSendTime"),
@@ -396,6 +421,75 @@ mod tests {
         let a = i.intern("c1", 0);
         let b = i.intern("c2", 0);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_reply_that_also_mentions_someone_carries_both() {
+        // The SDK nests the quoted message inside the at-text element rather
+        // than sending contentType 114, so a reply-with-@ has to be read from
+        // there or the quote strip silently disappears.
+        let raw = serde_json::json!({
+            "clientMsgID": "m2", "sendID": "bob", "senderNickname": "Bob",
+            "groupID": "g", "contentType": 106, "sendTime": 1_788_861_400_000i64,
+            "atTextElem": {
+                "text": "@李娜 看下这个", "isAtSelf": false,
+                "atUsersInfo": [{"atUserID": "lina", "groupNickname": "李娜"}],
+                "quoteMessage": {
+                    "clientMsgID": "orig", "sendTime": 1_788_861_300_000i64,
+                    "senderNickname": "陈明", "contentType": 101,
+                    "textElem": {"content": "灰度那一周 buffer 太少"}
+                }
+            }
+        });
+        let mut i = Interner::default();
+        let m = message(&raw, &me(), &mut i).expect("translates");
+        assert_eq!(m.mentions.len(), 1);
+        let quote = m.quote.expect("the nested quote is read");
+        assert_eq!(quote.sender_name, "陈明");
+        assert_eq!(quote.summary, "灰度那一周 buffer 太少");
+        assert!(quote.message_id < m.id, "the quoted message is older");
+    }
+
+    #[test]
+    fn a_mention_of_everyone_notifies_me_without_is_at_self() {
+        let raw = serde_json::json!({
+            "clientMsgID": "m3", "sendID": "bob", "groupID": "g",
+            "contentType": 106, "sendTime": 1_788_861_500_000i64,
+            "atTextElem": {
+                "text": "@全体成员 发版了", "isAtSelf": false,
+                "atUsersInfo": [{"atUserID": crate::AT_ALL_TAG, "groupNickname": "全体成员"}]
+            }
+        });
+        let mut i = Interner::default();
+        let m = message(&raw, &me(), &mut i).expect("translates");
+        let mention = &m.mentions[0];
+        assert!(mention.mentions_everyone());
+        assert!(mention.notifies_me);
+    }
+
+    #[test]
+    fn a_conversation_that_mentions_me_gets_a_badge() {
+        let i = Interner::default();
+        let row = |at: i64| {
+            serde_json::json!({
+                "conversationID": "sg_1", "conversationType": 3, "showName": "群",
+                "unreadCount": 4, "groupAtType": at
+            })
+        };
+        assert_eq!(conversation(&row(0), &i).unwrap().mentions, 0);
+        assert_eq!(conversation(&row(1), &i).unwrap().mentions, 1, "at me");
+        assert_eq!(conversation(&row(2), &i).unwrap().mentions, 1, "at everyone");
+        assert_eq!(conversation(&row(3), &i).unwrap().mentions, 1, "both");
+        assert_eq!(conversation(&row(4), &i).unwrap().mentions, 0, "group notice");
+    }
+
+    #[test]
+    fn interning_maps_both_ways() {
+        let mut i = Interner::default();
+        let id = i.intern("abc", crate::EPOCH_MS + 1);
+        assert_eq!(i.client_msg_id(id), Some("abc"));
+        assert_eq!(i.get("abc"), Some(id));
+        assert_eq!(i.client_msg_id(MessageId::new(999)), None);
     }
 
     #[test]

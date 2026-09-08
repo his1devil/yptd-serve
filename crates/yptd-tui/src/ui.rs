@@ -32,8 +32,7 @@ const UNSELECTED_MARK: &str = "  ";
 const AUTHOR_GROUP_MS: i64 = 5 * 60_000;
 
 pub fn draw(frame: &mut Frame, app: &mut App, media: &mut Media, theme: &Theme) {
-    let composer_lines = app.composer.lines().count().max(1);
-    let areas = layout::areas(frame.area(), app, composer_lines);
+    let areas = layout::areas(frame.area(), app, app.composer_rows());
 
     draw_status(frame, areas.status, app, media, theme);
     if areas.nav.width > 0 {
@@ -415,16 +414,42 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ))
             .right_aligned(),
         );
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
+    // The reply strip sits inside the composer frame, above the text: what is
+    // being answered belongs with the answer, not with the message list.
+    if let Some(target) = app.reply_target() {
+        let summary = format!("{}: {}", target.sender_name, one_line(target.text()));
+        let room = inner.width.saturating_sub(2) as usize;
+        frame.render_widget(
+            Paragraph::new(TuiLine::from(vec![
+                TuiSpan::styled("↩ ", theme.style(HG::MarkdownQuote)),
+                TuiSpan::styled(truncate(&summary, room), theme.style(HG::QuotePreview)),
+            ])),
+            Rect { height: 1, ..inner },
+        );
+        inner = Rect {
+            y: inner.y + 1,
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        if inner.height == 0 {
+            return;
+        }
+    }
+
     if app.composer.is_empty() && !active {
         frame.render_widget(
             Paragraph::new(TuiLine::from(TuiSpan::styled(
-                "按 i 输入消息，: 进入命令，Space 打开快捷键",
+                if app.reply_to.is_some() {
+                    "按 i 输入回复，Esc 取消引用"
+                } else {
+                    "按 i 输入消息，r 引用，: 进入命令"
+                },
                 theme.style(HG::Placeholder),
             ))),
             inner,
@@ -683,7 +708,7 @@ fn render_message(
                 header.push(TuiSpan::styled(" 发送中…", theme.style(HG::SendPending)));
             }
             SendState::Failed => {
-                header.push(TuiSpan::styled(" 发送失败 · r 重试", theme.style(HG::SendFailed)));
+                header.push(TuiSpan::styled(" 发送失败", theme.style(HG::SendFailed)));
             }
             SendState::Sent => {}
         }
@@ -733,7 +758,9 @@ fn render_message(
                 rich.push_span(Span::new(
                     mention.start,
                     mention.end,
-                    if mention.notifies_me {
+                    if mention.mentions_everyone() {
+                        SpanKind::MentionAll
+                    } else if mention.notifies_me {
                         SpanKind::MentionSelf
                     } else {
                         SpanKind::MentionOther
@@ -970,6 +997,21 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 /// Truncates to a display width, counting CJK as two cells.
+/// A one-line stand-in for a message, for the reply strip.
+///
+/// The first non-empty line, not every line run together: a quoted code
+/// block joined end to end is a wall of backticks that nobody recognises,
+/// whereas its opening sentence is exactly what the reader remembers.
+fn one_line(value: &str) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .filter(|line| !line.is_empty())
+        .unwrap_or("（无文字内容）")
+        .to_owned()
+}
+
 fn truncate(value: &str, width: usize) -> String {
     if value.width() <= width {
         return value.to_owned();

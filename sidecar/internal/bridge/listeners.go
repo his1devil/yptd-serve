@@ -33,9 +33,9 @@ func raw(e Emitter, name, payload string) {
 // Conn reports connection lifecycle.
 type Conn struct{ Out Emitter }
 
-func (c Conn) OnConnecting()      { _ = c.Out.Emit("OnConnecting", nil) }
-func (c Conn) OnConnectSuccess()  { _ = c.Out.Emit("OnConnectSuccess", nil) }
-func (c Conn) OnKickedOffline()   { _ = c.Out.Emit("OnKickedOffline", nil) }
+func (c Conn) OnConnecting()       { _ = c.Out.Emit("OnConnecting", nil) }
+func (c Conn) OnConnectSuccess()   { _ = c.Out.Emit("OnConnectSuccess", nil) }
+func (c Conn) OnKickedOffline()    { _ = c.Out.Emit("OnKickedOffline", nil) }
 func (c Conn) OnUserTokenExpired() { _ = c.Out.Emit("OnUserTokenExpired", nil) }
 
 func (c Conn) OnConnectFailed(code int32, msg string) {
@@ -91,17 +91,17 @@ func (b Batch) OnRecvOfflineNewMessages(list string) { raw(b.Out, "OnRecvOffline
 // Group reports membership and group metadata.
 type Group struct{ Out Emitter }
 
-func (g Group) OnJoinedGroupAdded(info string)          { raw(g.Out, "OnJoinedGroupAdded", info) }
-func (g Group) OnJoinedGroupDeleted(info string)        { raw(g.Out, "OnJoinedGroupDeleted", info) }
-func (g Group) OnGroupMemberAdded(info string)          { raw(g.Out, "OnGroupMemberAdded", info) }
-func (g Group) OnGroupMemberDeleted(info string)        { raw(g.Out, "OnGroupMemberDeleted", info) }
-func (g Group) OnGroupInfoChanged(info string)          { raw(g.Out, "OnGroupInfoChanged", info) }
-func (g Group) OnGroupDismissed(info string)            { raw(g.Out, "OnGroupDismissed", info) }
-func (g Group) OnGroupMemberInfoChanged(info string)    { raw(g.Out, "OnGroupMemberInfoChanged", info) }
-func (g Group) OnGroupApplicationAdded(a string)        { raw(g.Out, "OnGroupApplicationAdded", a) }
-func (g Group) OnGroupApplicationDeleted(a string)      { raw(g.Out, "OnGroupApplicationDeleted", a) }
-func (g Group) OnGroupApplicationAccepted(a string)     { raw(g.Out, "OnGroupApplicationAccepted", a) }
-func (g Group) OnGroupApplicationRejected(a string)     { raw(g.Out, "OnGroupApplicationRejected", a) }
+func (g Group) OnJoinedGroupAdded(info string)       { raw(g.Out, "OnJoinedGroupAdded", info) }
+func (g Group) OnJoinedGroupDeleted(info string)     { raw(g.Out, "OnJoinedGroupDeleted", info) }
+func (g Group) OnGroupMemberAdded(info string)       { raw(g.Out, "OnGroupMemberAdded", info) }
+func (g Group) OnGroupMemberDeleted(info string)     { raw(g.Out, "OnGroupMemberDeleted", info) }
+func (g Group) OnGroupInfoChanged(info string)       { raw(g.Out, "OnGroupInfoChanged", info) }
+func (g Group) OnGroupDismissed(info string)         { raw(g.Out, "OnGroupDismissed", info) }
+func (g Group) OnGroupMemberInfoChanged(info string) { raw(g.Out, "OnGroupMemberInfoChanged", info) }
+func (g Group) OnGroupApplicationAdded(a string)     { raw(g.Out, "OnGroupApplicationAdded", a) }
+func (g Group) OnGroupApplicationDeleted(a string)   { raw(g.Out, "OnGroupApplicationDeleted", a) }
+func (g Group) OnGroupApplicationAccepted(a string)  { raw(g.Out, "OnGroupApplicationAccepted", a) }
+func (g Group) OnGroupApplicationRejected(a string)  { raw(g.Out, "OnGroupApplicationRejected", a) }
 
 // User reports profile and presence.
 type User struct{ Out Emitter }
