@@ -221,13 +221,29 @@ impl Session {
             }
         }
         self.loaded.insert(conv.clone());
-        // Opening a conversation reads it; tell the server so other devices
-        // and the unread badge agree.
-        if let Some(c) = snapshot.conversation_mut(conv) {
-            c.unread = 0;
-        }
-        let _ = self.sidecar.call("mark_read", json!({ "conversation_id": conv.0 }));
         Ok(added > 0)
+    }
+
+    /// Marks a conversation read.
+    ///
+    /// Separate from [`Self::ensure_history`] on purpose: history is fetched
+    /// once, but reading happens every time somebody opens the conversation.
+    /// Folding the two together left the badge lit on the second visit.
+    pub fn mark_read(&mut self, conv: &ConversationId, snapshot: &mut Snapshot) -> bool {
+        let had_unread = snapshot
+            .conversation_mut(conv)
+            .map(|c| {
+                let was = c.unread > 0 || c.mentions > 0;
+                c.unread = 0;
+                c.mentions = 0;
+                was
+            })
+            .unwrap_or(false);
+        // Best effort: a failure here costs a badge, not a message.
+        let _ = self
+            .sidecar
+            .call("mark_read", json!({ "conversation_id": conv.0 }));
+        had_unread
     }
 
     /// Loads the member list for the group behind `conv`, if it is a group.

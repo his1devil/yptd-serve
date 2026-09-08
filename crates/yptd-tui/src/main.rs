@@ -156,6 +156,7 @@ fn cmd_doctor(text: Option<&str>) -> Fallible<()> {
     };
     session.ensure_history(&first, &mut snapshot)?;
     session.ensure_members(&first, &mut snapshot)?;
+    session.mark_read(&first, &mut snapshot);
     let msgs = snapshot.messages_in(&first);
     println!("{} 最近 {} 条，成员 {} 人", first.0, msgs.len(), snapshot.members.len());
     for m in msgs.iter().rev().take(5).rev() {
@@ -543,6 +544,7 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
                 app.notice = Some(format!("加载历史失败: {e}"));
             }
             let _ = b.session.ensure_members(&open, &mut app.snapshot);
+            b.session.mark_read(&open, &mut app.snapshot);
             app.jump_to_latest();
             last_open = Some(open);
             dirty = true;
