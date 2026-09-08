@@ -89,12 +89,12 @@ pub fn fit(source: Source, max_cols: u16, max_rows: u16, cell: CellSize) -> (u16
     )
 }
 
-/// Arranges up to [`MAX_TILES`] pictures inside `columns`.
+/// Arranges pictures as one row of identical tiles.
 ///
-/// One fills the width; two sit side by side; three put the first beside a
-/// stack of two; four make a square. The shapes are fixed rather than
-/// computed from the pictures' proportions, because a layout that reshuffles
-/// itself when one picture is a little taller reads as a glitch.
+/// Identical, not proportional: tiles sized to each picture's own shape leave
+/// different gaps and read as a ragged pile rather than one block. A single
+/// picture is the exception -- there is nothing to line it up with, so it
+/// keeps its own proportions and is shown whole.
 pub fn layout(sources: &[Source], columns: u16, cell: CellSize) -> Album {
     if sources.is_empty() || columns == 0 || cell.width == 0 || cell.height == 0 {
         return Album::default();
@@ -103,8 +103,7 @@ pub fn layout(sources: &[Source], columns: u16, cell: CellSize) -> Album {
     let shown = sources.len().min(MAX_TILES);
 
     if shown == 1 {
-        let width = columns.min(SINGLE_MAX_COLS);
-        let (w, h) = fit(sources[0], width, MAX_ROWS, cell);
+        let (w, h) = fit(sources[0], columns.min(SINGLE_MAX_COLS), MAX_ROWS, cell);
         if w == 0 || h == 0 {
             return Album::default();
         }
@@ -116,59 +115,28 @@ pub fn layout(sources: &[Source], columns: u16, cell: CellSize) -> Album {
     }
 
     let total = columns.min(MAX_COLS);
-    let (left, right) = split(total);
-    // Two rows of tiles have to share the block's height budget.
-    let (top_rows, bottom_rows) = split(MAX_ROWS);
-
-    let tiles = match shown {
-        2 => {
-            let a = fit(sources[0], left, MAX_ROWS, cell);
-            let b = fit(sources[1], right, MAX_ROWS, cell);
-            vec![
-                Tile { index: 0, x: 0, y: 0, width: a.0, height: a.1 },
-                Tile { index: 1, x: left, y: 0, width: b.0, height: b.1 },
-            ]
-        }
-        3 => {
-            let a = fit(sources[0], left, MAX_ROWS, cell);
-            let b = fit(sources[1], right, top_rows, cell);
-            let c = fit(sources[2], right, bottom_rows, cell);
-            vec![
-                Tile { index: 0, x: 0, y: 0, width: a.0, height: a.1 },
-                Tile { index: 1, x: left, y: 0, width: b.0, height: b.1 },
-                Tile { index: 2, x: left, y: top_rows, width: c.0, height: c.1 },
-            ]
-        }
-        _ => {
-            let a = fit(sources[0], left, top_rows, cell);
-            let b = fit(sources[1], right, top_rows, cell);
-            let c = fit(sources[2], left, bottom_rows, cell);
-            let d = fit(sources[3], right, bottom_rows, cell);
-            vec![
-                Tile { index: 0, x: 0, y: 0, width: a.0, height: a.1 },
-                Tile { index: 1, x: left, y: 0, width: b.0, height: b.1 },
-                Tile { index: 2, x: 0, y: top_rows, width: c.0, height: c.1 },
-                Tile { index: 3, x: left, y: top_rows, width: d.0, height: d.1 },
-            ]
-        }
-    };
-
-    let height = tiles
-        .iter()
-        .map(|tile| tile.y.saturating_add(tile.height))
-        .max()
-        .unwrap_or(0)
-        .min(MAX_ROWS);
-    if height == 0 {
+    // One gap column between tiles, so two pictures do not touch.
+    let gaps = (shown as u16).saturating_sub(1);
+    let usable = total.saturating_sub(gaps);
+    let each = usable / shown as u16;
+    if each == 0 {
         return Album::default();
     }
-    Album { tiles, height, overflow }
-}
+    // Square on screen, which is why the cell's own proportions come into it:
+    // a cell is about twice as tall as it is wide.
+    let rows = (u32::from(each) * u32::from(cell.width) / u32::from(cell.height).max(1)) as u16;
+    let rows = rows.clamp(1, MAX_ROWS);
 
-/// Halves a span, giving the odd cell to the left or top half.
-fn split(total: u16) -> (u16, u16) {
-    let first = total.div_ceil(2);
-    (first, total.saturating_sub(first))
+    let tiles = (0..shown)
+        .map(|index| Tile {
+            index,
+            x: index as u16 * (each + 1),
+            y: 0,
+            width: each,
+            height: rows,
+        })
+        .collect();
+    Album { tiles, height: rows, overflow }
 }
 
 #[cfg(test)]
@@ -183,48 +151,40 @@ mod tests {
     }
 
     #[test]
-    fn one_picture_keeps_the_single_width_budget() {
+    fn one_picture_keeps_its_own_proportions_and_the_single_width_budget() {
         let album = layout(&square(1), 100, CELL);
         assert_eq!(album.tiles.len(), 1);
-        assert_eq!(album.overflow, 0);
-        assert!(
-            album.tiles[0].width <= SINGLE_MAX_COLS,
-            "a lone picture must not use the wider album budget"
-        );
+        assert!(album.tiles[0].width <= SINGLE_MAX_COLS);
     }
 
     #[test]
-    fn two_pictures_sit_side_by_side_and_never_overlap() {
-        let album = layout(&square(2), 64, CELL);
-        assert_eq!(album.tiles.len(), 2);
-        let (a, b) = (album.tiles[0], album.tiles[1]);
-        assert_eq!(a.y, b.y, "same row");
-        assert!(a.x + a.width <= b.x, "the first must end before the second starts");
-        assert!(b.x + b.width <= 64, "the block stays inside its columns");
+    fn several_pictures_get_tiles_of_identical_size() {
+        // The point of the row: nothing about one picture's proportions may
+        // make its tile bigger or smaller than its neighbour's.
+        for count in 2..=MAX_TILES {
+            let mixed: Vec<Source> = (0..count)
+                .map(|i| Source { width: 400 + 900 * i as u32, height: 1600 - 300 * i as u32 })
+                .collect();
+            let album = layout(&mixed, 64, CELL);
+            assert_eq!(album.tiles.len(), count);
+            let first = album.tiles[0];
+            for tile in &album.tiles {
+                assert_eq!(tile.width, first.width, "{count} pictures");
+                assert_eq!(tile.height, first.height, "{count} pictures");
+                assert_eq!(tile.y, 0, "one row");
+            }
+        }
     }
 
     #[test]
-    fn three_pictures_put_one_beside_a_stack_of_two() {
-        let album = layout(&square(3), 64, CELL);
-        assert_eq!(album.tiles.len(), 3);
-        let (big, top, bottom) = (album.tiles[0], album.tiles[1], album.tiles[2]);
-        assert_eq!(big.x, 0);
-        assert_eq!(top.y, 0);
-        assert!(bottom.y >= top.y + top.height, "the stack must not overlap itself");
-        assert_eq!(top.x, bottom.x, "the stack shares a left edge");
-        assert!(big.x + big.width <= top.x);
-    }
-
-    #[test]
-    fn four_pictures_make_a_square() {
+    fn tiles_sit_in_order_left_to_right_without_touching() {
         let album = layout(&square(4), 64, CELL);
-        assert_eq!(album.tiles.len(), 4);
-        let rows: Vec<u16> = album.tiles.iter().map(|t| t.y).collect();
-        assert_eq!(rows[0], rows[1], "top row");
-        assert_eq!(rows[2], rows[3], "bottom row");
-        assert!(rows[2] > rows[0]);
-        assert_eq!(album.tiles[0].x, album.tiles[2].x, "left column");
-        assert_eq!(album.tiles[1].x, album.tiles[3].x, "right column");
+        for pair in album.tiles.windows(2) {
+            assert!(
+                pair[0].x + pair[0].width < pair[1].x,
+                "tiles must not touch: {pair:?}"
+            );
+        }
     }
 
     #[test]
@@ -235,20 +195,13 @@ mod tests {
     }
 
     #[test]
-    fn no_album_is_taller_than_the_row_budget() {
+    fn no_album_is_taller_or_wider_than_its_budget() {
         for count in 1..=8 {
             for columns in [20u16, 40, 64, 120] {
                 let album = layout(&square(count), columns, CELL);
-                assert!(
-                    album.height <= MAX_ROWS,
-                    "{count} pictures at {columns} columns: {} rows",
-                    album.height
-                );
+                assert!(album.height <= MAX_ROWS, "{count} at {columns}");
                 for tile in &album.tiles {
-                    assert!(
-                        tile.y + tile.height <= album.height,
-                        "a tile fell outside the reserved rows"
-                    );
+                    assert!(tile.y + tile.height <= album.height);
                     assert!(tile.x + tile.width <= columns.min(MAX_COLS).max(1));
                 }
             }
@@ -256,16 +209,9 @@ mod tests {
     }
 
     #[test]
-    fn a_tall_picture_and_a_wide_one_both_stay_inside_their_tile() {
-        let sources = [
-            Source { width: 100, height: 4000 },
-            Source { width: 4000, height: 100 },
-        ];
-        let album = layout(&sources, 64, CELL);
-        for tile in &album.tiles {
-            assert!(tile.width >= 1 && tile.height >= 1, "nothing rounds away to nothing");
-        }
-        assert!(album.height <= MAX_ROWS);
+    fn a_row_too_narrow_for_a_tile_each_draws_nothing() {
+        // Better an attachment line on its own than four one-column smears.
+        assert!(layout(&square(4), 4, CELL).is_empty());
     }
 
     #[test]

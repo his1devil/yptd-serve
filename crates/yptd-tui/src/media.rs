@@ -14,7 +14,7 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::{CropOptions, Resize, StatefulImage};
 
 /// Rows an inline preview is allowed to occupy. Tall enough to be worth
 /// showing, short enough that one screenshot cannot bury the conversation.
@@ -135,14 +135,27 @@ impl Media {
     }
 
     /// Draws a registered image into `area`.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, key: &str) {
+    /// Draws a picture into `area`.
+    ///
+    /// `fill` crops to cover the whole area instead of fitting inside it,
+    /// which is what makes a row of pictures read as one block: fitted tiles
+    /// of different proportions leave different gaps and look misaligned.
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, key: &str, fill: bool) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let Some(protocol) = self.protocols.get_mut(key) else {
             return;
         };
-        frame.render_stateful_widget(StatefulImage::new().resize(Resize::Fit(None)), area, protocol);
+        // Lanczos, not the library's default nearest-neighbour. Shrinking a
+        // photo from a couple of thousand pixels to a few hundred by dropping
+        // three pixels in four is exactly what "blurry" looks like.
+        let resize = if fill {
+            Resize::Crop(Some(CropOptions { clip_top: false, clip_left: false }))
+        } else {
+            Resize::Fit(Some(image::imageops::FilterType::Lanczos3))
+        };
+        frame.render_stateful_widget(StatefulImage::new().resize(resize), area, protocol);
     }
 }
 

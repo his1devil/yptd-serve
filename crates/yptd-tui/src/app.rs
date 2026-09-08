@@ -304,28 +304,34 @@ impl App {
     }
 
     /// Conversation rows in display order, with collapsed categories folded.
+    ///
+    /// Grouped by category, then by activity inside each one. The snapshot is
+    /// sorted by activity alone, so walking it straight through emits a
+    /// heading every time the category changes -- and a group, a direct chat
+    /// and another group produce "群聊 / 私聊 / 群聊", three headings for two
+    /// categories.
     pub fn nav_rows(&self) -> Vec<NavRow> {
-        let mut rows = Vec::new();
-        let mut current: Option<String> = None;
-
+        let mut order: Vec<String> = Vec::new();
         for index in 0..self.snapshot.conversations.len() {
             let category = self.category_of(index);
-            if current.as_deref() != Some(category.as_str()) {
-                rows.push(NavRow::Category {
-                    collapsed: self.is_collapsed(&category),
-                    count: self
-                        .snapshot
-                        .conversations
-                        .iter()
-                        .enumerate()
-                        .filter(|(other, _)| self.category_of(*other) == category)
-                        .count(),
-                    name: category.clone(),
-                });
-                current = Some(category.clone());
+            if !order.contains(&category) {
+                order.push(category);
             }
-            if !self.is_collapsed(&category) {
-                rows.push(NavRow::Conversation { index });
+        }
+
+        let mut rows = Vec::new();
+        for category in order {
+            let members: Vec<usize> = (0..self.snapshot.conversations.len())
+                .filter(|index| self.category_of(*index) == category)
+                .collect();
+            let collapsed = self.is_collapsed(&category);
+            rows.push(NavRow::Category {
+                collapsed,
+                count: members.len(),
+                name: category,
+            });
+            if !collapsed {
+                rows.extend(members.into_iter().map(|index| NavRow::Conversation { index }));
             }
         }
         rows
@@ -605,6 +611,26 @@ mod tests {
 
     fn draft(user_id: &str, nickname: &str) -> DraftMention {
         DraftMention { user_id: user_id.into(), nickname: nickname.into() }
+    }
+
+    #[test]
+    fn each_category_gets_exactly_one_heading() {
+        // Conversations arrive sorted by activity, so a group, a direct chat
+        // and another group would otherwise print three headings.
+        let mut app = App::new(im_model::mock::snapshot());
+        app.snapshot.conversations.sort_by(|a, b| a.name.cmp(&b.name));
+        let headings: Vec<String> = app
+            .nav_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                NavRow::Category { name, .. } => Some(name),
+                NavRow::Conversation { .. } => None,
+            })
+            .collect();
+        let mut unique = headings.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(headings.len(), unique.len(), "repeated headings: {headings:?}");
     }
 
     #[test]

@@ -855,7 +855,10 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, media: &mut Media
             if width == 0 {
                 continue;
             }
-            media.render(frame, Rect { x, y, width, height }, key);
+            // One picture keeps its own shape; a row of them fills identical
+            // tiles, or the row looks ragged.
+            let fill = placement.tiles.len() > 1;
+            media.render(frame, Rect { x, y, width, height }, key, fill);
         }
     }
 }
