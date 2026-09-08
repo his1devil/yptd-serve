@@ -36,6 +36,14 @@ cd yptd-tui
 make install            # 构建 release 并装到 ~/.cargo/bin：yptd + yptd-sidecar
 ```
 
+构建边车时如果报 `writing go.mod cache: ... permission denied`，是 Go 模块缓存的属主
+不对——某次 `sudo go ...` 会把整个缓存写成 root 的，之后任何新模块都下不下来：
+
+```sh
+ls -ld $(go env GOMODCACHE)/cache/download/github.com/*   # 看有没有 root
+sudo chown -R "$(id -un):$(id -gn)" "$(go env GOMODCACHE)"
+```
+
 找管理员要一个邀请码（形如 `YPTD-XXXX-XXXX`，24 小时内有效，只能用一次）：
 
 ```sh
