@@ -166,10 +166,13 @@ func (c *Client) UserExists(ctx context.Context, userID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// `usersInfo`, not `usersStatus`: the latter is what the online-status
+	// endpoint returns, and decoding into it silently yielded an empty list,
+	// so every existing account looked missing.
 	var out struct {
-		UsersStatus []struct {
+		UsersInfo []struct {
 			UserID string `json:"userID"`
-		} `json:"usersStatus"`
+		} `json:"usersInfo"`
 	}
 	body := map[string]any{"userIDs": []string{userID}}
 	if err := c.post(ctx, "/user/get_users_info", body, admin, &out); err != nil {
@@ -180,7 +183,12 @@ func (c *Client) UserExists(ctx context.Context, userID string) (bool, error) {
 		}
 		return false, err
 	}
-	return len(out.UsersStatus) > 0, nil
+	for _, user := range out.UsersInfo {
+		if user.UserID == userID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func asError(err error, target **Error) bool {
