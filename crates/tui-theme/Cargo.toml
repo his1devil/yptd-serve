@@ -1,0 +1,12 @@
+[package]
+name = "tui-theme"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Named highlight groups with link inheritance for ratatui terminal UIs"
+
+[dependencies]
+ratatui = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

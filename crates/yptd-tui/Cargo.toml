@@ -1,0 +1,19 @@
+[package]
+name = "yptd-tui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal client for yptd IM"
+
+[[bin]]
+name = "yptd"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+unicode-width = { workspace = true }
+im-model = { workspace = true }
+tui-richtext = { workspace = true }
+tui-theme = { workspace = true }

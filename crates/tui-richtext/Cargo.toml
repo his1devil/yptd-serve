@@ -1,0 +1,11 @@
+[package]
+name = "tui-richtext"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Plain text plus byte-range annotations, wrapped for terminal width"
+
+[dependencies]
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }

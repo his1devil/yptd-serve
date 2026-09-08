@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/his1devil/yptd-tui"
+
+[workspace.dependencies]
+crossterm = "0.29"
+ratatui = "0.30.0"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+im-model = { path = "crates/im-model" }
+tui-richtext = { path = "crates/tui-richtext" }
+tui-theme = { path = "crates/tui-theme" }
