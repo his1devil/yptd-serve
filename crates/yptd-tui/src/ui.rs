@@ -5,7 +5,7 @@ use im_model::{Body, Message, SendState, Visibility};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span as TuiSpan};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use tui_richtext::{
     Line as RichLine, LineStyle, PrefixKind, RichText, Span, SpanKind, layout_blocks,
@@ -15,6 +15,7 @@ use tui_theme::{BorderSurface, HighlightGroup as HG, Theme};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, NavRow, Pane};
+use crate::picker::Picker;
 use crate::layout;
 use crate::media::Media;
 use crate::syntax;
@@ -43,6 +44,127 @@ pub fn draw(frame: &mut Frame, app: &mut App, media: &mut Media, theme: &Theme) 
         draw_members(frame, areas.members, app, theme);
     }
     draw_composer(frame, areas.composer, app, theme);
+    if let Some(picker) = &app.picker {
+        draw_picker(frame, frame.area(), picker, theme);
+    }
+}
+
+// ---------------------------------------------------------------- picker ---
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// The modal list. Drawn last so it sits over every pane, and cleared
+/// underneath so the panes do not bleed through the gaps between spans.
+fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, theme: &Theme) {
+    let visible = picker.visible();
+    let width = area.width.saturating_sub(4).clamp(24, 60);
+    let rows = visible.len().clamp(1, 12) as u16;
+    // Border 2 + filter line 1 + hint line 1.
+    let height = (rows + 4).min(area.height.saturating_sub(2)).max(5);
+    let rect = centered(area, width, height);
+    frame.render_widget(Clear, rect);
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(theme.border_type(BorderSurface::Picker))
+        .border_style(theme.style(HG::PickerBorder))
+        .title(TuiLine::from(TuiSpan::styled(
+            format!(" {} ", picker.title),
+            theme.style(HG::ModalTitle),
+        )));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height < 3 || inner.width < 6 {
+        return;
+    }
+
+    let prompt = TuiSpan::styled("› ", theme.style(HG::Muted));
+    let filter_line = if picker.filter.is_empty() {
+        TuiLine::from(vec![
+            prompt,
+            TuiSpan::styled("输入过滤", theme.style(HG::Placeholder)),
+        ])
+    } else {
+        TuiLine::from(vec![
+            prompt,
+            TuiSpan::styled(picker.filter.clone(), theme.style(HG::Normal)),
+        ])
+    };
+    frame.render_widget(
+        Paragraph::new(filter_line),
+        Rect { height: 1, ..inner },
+    );
+
+    let list_height = inner.height.saturating_sub(2) as usize;
+    let start = picker.cursor.saturating_sub(list_height.saturating_sub(1));
+    let mut lines: Vec<TuiLine<'static>> = Vec::new();
+    if visible.is_empty() {
+        lines.push(TuiLine::from(TuiSpan::styled(
+            "  没有匹配的人",
+            theme.style(HG::Muted),
+        )));
+    }
+    for (row, &index) in visible.iter().enumerate().skip(start).take(list_height) {
+        let item = &picker.items[index];
+        let at_cursor = row == picker.cursor;
+        let ticked = picker.selected.contains(&item.id);
+        let mut spans = vec![TuiSpan::styled(
+            if at_cursor { SELECTED_MARK } else { UNSELECTED_MARK },
+            theme.style(HG::SelectionMarker),
+        )];
+        if picker.multi {
+            spans.push(TuiSpan::styled(
+                if ticked { "[x] " } else { "[ ] " },
+                theme.style(if ticked { HG::Selection } else { HG::Muted }),
+            ));
+        }
+        spans.push(TuiSpan::styled(
+            item.label.clone(),
+            theme.style(if at_cursor { HG::SelectedRow } else { HG::Normal }),
+        ));
+        if !item.detail.is_empty() && item.detail != item.label {
+            spans.push(TuiSpan::styled(
+                format!("  {}", item.detail),
+                theme.style(HG::Description),
+            ));
+        }
+        lines.push(TuiLine::from(spans));
+    }
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            y: inner.y + 1,
+            height: list_height as u16,
+            ..inner
+        },
+    );
+
+    let hint = if picker.multi {
+        format!("已选 {}   ↑↓ 移动  Space 勾选  Enter 确定  Esc 取消", picker.selected.len())
+    } else {
+        "↑↓ 移动  Enter 选定  Esc 取消".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(TuiLine::from(TuiSpan::styled(hint, theme.style(HG::Hint)))),
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+    );
+
+    // The caret lives in the filter: typing is the primary gesture here.
+    let column = 2 + picker.filter.width() as u16;
+    frame.set_cursor_position((inner.x + column.min(inner.width - 1), inner.y));
 }
 
 /// Renders one frame without a live cursor, for the off-screen capture paths.

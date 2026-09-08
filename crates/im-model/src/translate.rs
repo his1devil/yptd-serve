@@ -97,7 +97,14 @@ pub fn conversation_id_of(msg: &Value, me: &UserId) -> ConversationId {
     let send = str_of(msg, "sendID");
     let recv = str_of(msg, "recvID");
     let other = if send == me.0 { recv } else { send };
-    let mut pair = [me.0.as_str(), other];
+    direct_conversation_id(&me.0, other)
+}
+
+/// `si_<a>_<b>` with the pair sorted, exactly as the SDK derives it, so a
+/// conversation opened locally before any message exists lands on the same
+/// id the server will later push.
+pub fn direct_conversation_id(a: &str, b: &str) -> ConversationId {
+    let mut pair = [a, b];
     pair.sort_unstable();
     ConversationId(format!("si_{}_{}", pair[0], pair[1]))
 }

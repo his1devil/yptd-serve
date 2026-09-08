@@ -12,11 +12,13 @@ mod config;
 mod layout;
 mod media;
 mod mouse;
+mod picker;
 mod render;
 mod session;
 mod syntax;
 mod ui;
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::io::Write;
 use std::sync::mpsc;
@@ -26,11 +28,12 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
-use im_model::{ConversationId, Snapshot};
+use im_model::{Conversation, ConversationId, ConversationKind, Member, Role, Snapshot, UserId};
 use tui_theme::Theme;
 
 use crate::app::{App, Mode, Pane};
-use crate::config::Paths;
+use crate::config::{Config, Credentials, Paths};
+use crate::picker::{PickItem, Picker, Purpose, Verdict};
 use crate::render::{Palette, Scene};
 use crate::session::Session;
 
@@ -43,14 +46,19 @@ const USAGE: &str = "yptd — 终端 IM 客户端
   yptd logout              清除本机凭据
   yptd doctor [文本]       不进界面：登录、起边车、拉会话，可选发一条消息
   yptd doctor --frame WxH  同上，但把真实数据渲染成一帧文本输出
+  yptd doctor --new 群名 [用户…]   建群并拉人，打印结果
   yptd --mock              用内置示例数据启动，不连服务器
   yptd --snapshot WxH [scene] [palette]   离屏出帧（文本）
   yptd --ansi     WxH [scene]             离屏出帧（ANSI）
   yptd --html     WxH [scene] [palette]   离屏出帧（HTML）
 
+界面里按 : 输命令：:new 群名 · :invite [用户…] · :dm [用户] · :help · :q
+
 文件都在 ~/.yptd/（或 $YPTD_HOME）。边车二进制通过 $YPTD_SIDECAR、
 yptd 同目录或 PATH 查找。
 ";
+
+const HELP_LINE: &str = ":new 群名 建群并拉人 · :invite [用户…] 拉人进当前群 · :dm [用户] 私聊 · :q 退出";
 
 fn main() -> Fallible<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -60,6 +68,7 @@ fn main() -> Fallible<()> {
         Some("logout") => cmd_logout(),
         Some("doctor") => match args.get(1).map(String::as_str) {
             Some("--frame") => cmd_doctor_frame(args.get(2).map(String::as_str).unwrap_or("120x32")),
+            Some("--new") => cmd_doctor_new(args.get(2).map(String::as_str), args.get(3..).unwrap_or(&[])),
             text => cmd_doctor(text),
         },
         Some("--mock") => run(App::new(im_model::mock::snapshot()), None),
@@ -119,47 +128,16 @@ fn cmd_logout() -> Fallible<()> {
 }
 
 fn cmd_start() -> Fallible<()> {
-    let (session, events, snapshot) = connect()?;
-    run(live_app(snapshot), Some((session, events)))
-}
-
-/// An `App` over real data: the same as `App::new`, plus the machine's time
-/// zone so timestamps read as the clock on the wall.
-fn live_app(snapshot: Snapshot) -> App {
-    let mut app = App::new(snapshot);
-    app.utc_offset_ms = local_utc_offset_ms();
-    app
-}
-
-/// Seconds east of UTC for the current moment, via `localtime_r`, which
-/// honours `TZ` and daylight saving. Zero where the platform has no
-/// `tm_gmtoff`.
-fn local_utc_offset_ms() -> i64 {
-    #[cfg(unix)]
-    {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as libc::time_t)
-            .unwrap_or(0);
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        // SAFETY: both pointers are valid for the call; localtime_r writes
-        // only into `tm`.
-        if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
-            return 0;
-        }
-        tm.tm_gmtoff as i64 * 1000
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    }
+    let live = connect()?;
+    run(live_app(live.snapshot), Some((live.backend, live.events)))
 }
 
 /// The same path as a normal start, minus the terminal UI, so a broken
 /// setup can be diagnosed over ssh or in a script. With a text argument it
 /// also sends one message to the most recent conversation.
 fn cmd_doctor(text: Option<&str>) -> Fallible<()> {
-    let (mut session, events, mut snapshot) = connect()?;
+    let Live { mut backend, events, mut snapshot } = connect()?;
+    let session = &mut backend.session;
     println!("会话 {} 个", snapshot.conversations.len());
     for c in snapshot.conversations.iter().take(10) {
         println!("  {:<28} {:<6} 未读 {:>3}  成员 {:>3}", c.id.0, c.name, c.unread, c.member_count);
@@ -204,19 +182,66 @@ fn cmd_doctor(text: Option<&str>) -> Fallible<()> {
 /// A live frame as text: the real renderer over the real snapshot, without a
 /// terminal. Handy for "what does it actually look like" over ssh.
 fn cmd_doctor_frame(size: &str) -> Fallible<()> {
-    let (mut session, _events, snapshot) = connect()?;
+    let Live { mut backend, snapshot, events: _events } = connect()?;
     let mut app = live_app(snapshot);
     let open = app.open.clone();
-    session.ensure_history(&open, &mut app.snapshot)?;
-    session.ensure_members(&open, &mut app.snapshot)?;
+    backend.session.ensure_history(&open, &mut app.snapshot)?;
+    backend.session.ensure_members(&open, &mut app.snapshot)?;
     app.jump_to_latest();
     let (width, height) = parse_size(size);
     print!("{}", render::to_text(&render::capture_app(width, height, &app)?));
     Ok(())
 }
 
+/// Creates a group and invites people to it, the way `:new` does in the UI,
+/// then reads the membership back so the round trip is visible.
+fn cmd_doctor_new(name: Option<&str>, invitees: &[String]) -> Fallible<()> {
+    let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
+        return Err("用法: yptd doctor --new 群名 [用户…]".into());
+    };
+    let Live { mut backend, mut snapshot, events } = connect()?;
+    let conv = backend.session.create_group(name, &mut snapshot)?;
+    println!("已建群 {name} → {}", conv.0);
+    let group_id = conv.0.trim_start_matches("sg_").to_owned();
+    if !invitees.is_empty() {
+        backend.session.invite(&group_id, invitees)?;
+        println!("已邀请 {}", invitees.join("、"));
+    }
+    let roster = auth::users(&backend.config, &backend.creds)?;
+    let listed: Vec<String> = roster.iter().map(|u| format!("{}({})", u.nickname, u.user_id)).collect();
+    println!("花名册 {} 人：{}", roster.len(), listed.join(" "));
+    // Membership lands as SDK events after the call returns; show them, then
+    // read the list back.
+    let started = Instant::now();
+    while let Ok(ev) = events.recv_timeout(Duration::from_millis(1200)) {
+        println!("  事件 {}", ev.name);
+        backend.session.apply(&ev, &mut snapshot);
+        if started.elapsed() > Duration::from_secs(4) {
+            break;
+        }
+    }
+    backend.session.ensure_members(&conv, &mut snapshot)?;
+    let names: Vec<String> = snapshot.members.iter().map(|m| format!("{}[{}]", m.name, m.role.label())).collect();
+    println!("成员 {} 人：{}", names.len(), names.join(" "));
+    Ok(())
+}
+
+/// The SDK session plus the server credentials, which the roster endpoint
+/// wants. Everything the live loop needs besides the UI.
+struct Backend {
+    session: Session,
+    config: Config,
+    creds: Credentials,
+}
+
+struct Live {
+    backend: Backend,
+    events: mpsc::Receiver<im_sidecar::Event>,
+    snapshot: Snapshot,
+}
+
 /// Credential → token → sidecar → first snapshot.
-fn connect() -> Fallible<(Session, mpsc::Receiver<im_sidecar::Event>, Snapshot)> {
+fn connect() -> Fallible<Live> {
     let paths = Paths::discover();
     let config = paths.load_config();
     let Some(creds) = paths.load_credentials() else {
@@ -233,7 +258,43 @@ fn connect() -> Fallible<(Session, mpsc::Receiver<im_sidecar::Event>, Snapshot)>
     let synced = session.wait_for_sync(&events, &mut snapshot, Duration::from_secs(20));
     session.bootstrap(&mut snapshot)?;
     eprintln!("{}", if synced { "好。" } else { "未等到同步完成，先用本地数据。" });
-    Ok((session, events, snapshot))
+    Ok(Live {
+        backend: Backend { session, config, creds },
+        events,
+        snapshot,
+    })
+}
+
+/// An `App` over real data: the same as `App::new`, plus the machine's time
+/// zone so timestamps read as the clock on the wall.
+fn live_app(snapshot: Snapshot) -> App {
+    let mut app = App::new(snapshot);
+    app.utc_offset_ms = local_utc_offset_ms();
+    app
+}
+
+/// Seconds east of UTC for the current moment, via `localtime_r`, which
+/// honours `TZ` and daylight saving. Zero where the platform has no
+/// `tm_gmtoff`.
+fn local_utc_offset_ms() -> i64 {
+    #[cfg(unix)]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as libc::time_t)
+            .unwrap_or(0);
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: both pointers are valid for the call; localtime_r writes
+        // only into `tm`.
+        if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64 * 1000
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 fn prompt(label: &str) -> Fallible<String> {
@@ -292,7 +353,7 @@ enum Input {
 /// paints once rather than once per event.
 const COALESCE: Duration = Duration::from_millis(40);
 
-fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>) -> Fallible<()> {
+fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>) -> Fallible<()> {
     let theme = Theme::default();
     let (tx, rx) = mpsc::channel::<Input>();
 
@@ -317,8 +378,8 @@ fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>)
             })?;
     }
 
-    let mut session = match live {
-        Some((session, events)) => {
+    let mut backend = match live {
+        Some((backend, events)) => {
             let tx = tx.clone();
             std::thread::Builder::new()
                 .name("sidecar-events".into())
@@ -330,7 +391,7 @@ fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>)
                     }
                     let _ = tx.send(Input::Closed("sidecar"));
                 })?;
-            Some(session)
+            Some(backend)
         }
         None => None,
     };
@@ -341,7 +402,7 @@ fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>)
     // Protocol negotiation talks to the terminal, so it happens once at
     // startup rather than on the first message that carries a picture.
     let mut media = media::Media::detect();
-    if session.is_none() {
+    if backend.is_none() {
         load_fixture_images(&mut media, &app);
     }
 
@@ -351,14 +412,14 @@ fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>)
 
     let result = loop {
         // Opening a conversation pulls its history and members lazily, once.
-        if let Some(s) = session.as_mut()
+        if let Some(b) = backend.as_mut()
             && last_open.as_ref() != Some(&app.open)
         {
             let open = app.open.clone();
-            if let Err(e) = s.ensure_history(&open, &mut app.snapshot) {
+            if let Err(e) = b.session.ensure_history(&open, &mut app.snapshot) {
                 app.notice = Some(format!("加载历史失败: {e}"));
             }
-            let _ = s.ensure_members(&open, &mut app.snapshot);
+            let _ = b.session.ensure_members(&open, &mut app.snapshot);
             app.jump_to_latest();
             last_open = Some(open);
             dirty = true;
@@ -397,30 +458,31 @@ fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>)
 
         match input {
             Input::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                match handle_key(&mut app, key.code, key.modifiers) {
-                    KeyAction::Quit => break Ok(()),
-                    KeyAction::Send => send_composer(&mut app, session.as_mut()),
-                    KeyAction::None => {}
+                if let Flow::Quit = on_key(&mut app, backend.as_mut(), key.code, key.modifiers) {
+                    break Ok(());
                 }
                 // Foreground input always paints at once; latency here is
                 // what a person feels as "sluggish".
                 dirty = true;
             }
             Input::Terminal(Event::Mouse(m)) => {
-                let lines = app.composer.lines().count().max(1);
-                let out = mouse::handle(&mut app, m, area, lines, &mut clicks);
-                if out.activate {
-                    app.open_selected();
+                // A modal owns the screen; clicks underneath it do nothing.
+                if app.picker.is_none() {
+                    let lines = app.composer.lines().count().max(1);
+                    let out = mouse::handle(&mut app, m, area, lines, &mut clicks);
+                    if out.activate {
+                        app.open_selected();
+                    }
+                    dirty = out.redraw;
                 }
-                dirty = out.redraw;
             }
             Input::Terminal(Event::Resize(_, _)) => dirty = true,
             Input::Terminal(_) => {}
             Input::Sidecar(ev) => {
-                if let Some(s) = session.as_mut() {
-                    let mut changed = s.apply(&ev, &mut app.snapshot);
+                if let Some(b) = backend.as_mut() {
+                    let mut changed = b.session.apply(&ev, &mut app.snapshot);
                     if changed.resync {
-                        match s.resync(&mut app.snapshot) {
+                        match b.session.resync(&mut app.snapshot) {
                             Ok(()) => {
                                 // Force the open conversation to refetch.
                                 last_open = None;
@@ -428,6 +490,10 @@ fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>)
                             }
                             Err(e) => app.notice = Some(format!("同步失败: {e}")),
                         }
+                    }
+                    if changed.members {
+                        let _ = b.session.ensure_members(&app.open, &mut app.snapshot);
+                        changed.conversations = true;
                     }
                     if changed.messages && app.follow_latest {
                         app.jump_to_latest();
@@ -446,7 +512,7 @@ fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>)
             Input::Closed("sidecar") => {
                 app.notice = Some("边车已退出，重启 yptd 重连".into());
                 app.snapshot.connected = false;
-                session = None;
+                backend = None;
                 dirty = true;
             }
             Input::Closed(_) => break Ok(()),
@@ -456,25 +522,6 @@ fn run(mut app: App, live: Option<(Session, mpsc::Receiver<im_sidecar::Event>)>)
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
-}
-
-/// Sends what is in the composer, or explains why it cannot.
-fn send_composer(app: &mut App, session: Option<&mut Session>) {
-    let text = app.composer.text().to_owned();
-    if text.trim().is_empty() {
-        return;
-    }
-    let Some(s) = session else {
-        app.notice = Some("示例模式下不能发送".into());
-        return;
-    };
-    match s.send_text(&app.open, &text, &mut app.snapshot) {
-        Ok(()) => {
-            app.composer.clear();
-            app.jump_to_latest();
-        }
-        Err(e) => app.notice = Some(format!("发送失败: {e}")),
-    }
 }
 
 /// Whether an incoming-message event is for the conversation on screen. Off-
@@ -515,11 +562,285 @@ fn load_fixture_images(media: &mut media::Media, app: &App) {
     }
 }
 
+// ---------------------------------------------------------------- keys ---
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Flow {
+    Continue,
+    Quit,
+}
+
+/// One keypress, routed: the modal first if one is open, then the mode map.
+fn on_key(app: &mut App, backend: Option<&mut Backend>, code: KeyCode, modifiers: KeyModifiers) -> Flow {
+    if let Some(picker) = app.picker.as_mut() {
+        match picker.handle_key(code, modifiers) {
+            Verdict::Continue => {}
+            Verdict::Cancel => app.picker = None,
+            Verdict::Confirm(ids) => {
+                let picker = app.picker.take().expect("picker is open");
+                complete_pick(app, backend, picker, ids);
+            }
+        }
+        return Flow::Continue;
+    }
+    match handle_key(app, code, modifiers) {
+        KeyAction::Quit => Flow::Quit,
+        KeyAction::Send => {
+            send_composer(app, backend.map(|b| &mut b.session));
+            Flow::Continue
+        }
+        KeyAction::Command(line) => execute_command(app, backend, &line),
+        KeyAction::None => Flow::Continue,
+    }
+}
+
+/// Sends what is in the composer, or explains why it cannot.
+fn send_composer(app: &mut App, session: Option<&mut Session>) {
+    let text = app.composer.text().to_owned();
+    if text.trim().is_empty() {
+        return;
+    }
+    let Some(s) = session else {
+        app.notice = Some("示例模式下不能发送".into());
+        return;
+    };
+    match s.send_text(&app.open, &text, &mut app.snapshot) {
+        Ok(()) => {
+            app.composer.clear();
+            app.jump_to_latest();
+        }
+        Err(e) => app.notice = Some(format!("发送失败: {e}")),
+    }
+}
+
+// ------------------------------------------------------------ commands ---
+
+/// Runs one `:` command line. Verbs are short and few on purpose: a person
+/// types these while talking, not while configuring.
+fn execute_command(app: &mut App, mut backend: Option<&mut Backend>, line: &str) -> Flow {
+    let mut words = line.split_whitespace();
+    let Some(verb) = words.next() else {
+        return Flow::Continue;
+    };
+    let rest: Vec<String> = words.map(str::to_owned).collect();
+    match verb {
+        "q" | "quit" => return Flow::Quit,
+        "new" | "group" => {
+            let name = rest.join(" ");
+            if name.is_empty() {
+                app.notice = Some("用法: :new 群名".into());
+                return Flow::Continue;
+            }
+            match backend {
+                Some(b) => match b.session.create_group(&name, &mut app.snapshot) {
+                    Ok(conv) => {
+                        app.open_conversation(conv);
+                        open_invite_picker(app, Some(b));
+                    }
+                    Err(e) => app.notice = Some(format!("建群失败: {e}")),
+                },
+                None => {
+                    let conv = mock_group(app, &name);
+                    app.open_conversation(conv);
+                    open_invite_picker(app, None);
+                }
+            }
+        }
+        "invite" => {
+            if rest.is_empty() {
+                open_invite_picker(app, backend);
+            } else {
+                let Some(group_id) = group_of(&app.open) else {
+                    app.notice = Some("当前不是群聊，先 :new 建一个".into());
+                    return Flow::Continue;
+                };
+                let names = rest.clone();
+                invite_users(app, backend, &group_id, rest, names);
+            }
+        }
+        "dm" => match rest.first() {
+            None => open_dm_picker(app, backend),
+            Some(user_id) => {
+                let nickname = roster(backend.as_deref_mut())
+                    .ok()
+                    .and_then(|r| r.into_iter().find(|i| &i.id == user_id).map(|i| i.label))
+                    .unwrap_or_default();
+                open_direct(app, backend, user_id, &nickname);
+            }
+        },
+        "help" | "h" => app.notice = Some(HELP_LINE.into()),
+        other => app.notice = Some(format!("未知命令 :{other}，:help 看列表")),
+    }
+    Flow::Continue
+}
+
+fn group_of(conv: &ConversationId) -> Option<String> {
+    conv.0.strip_prefix("sg_").map(str::to_owned)
+}
+
+/// The server's roster as picker rows, or the mock's when offline.
+fn roster(backend: Option<&mut Backend>) -> Result<Vec<PickItem>, String> {
+    let Some(b) = backend else {
+        return Ok(picker::mock_roster());
+    };
+    let users = auth::users(&b.config, &b.creds).map_err(|e| format!("取名单失败: {e}"))?;
+    Ok(users
+        .into_iter()
+        .map(|u| {
+            let label = if u.nickname.is_empty() { u.user_id.clone() } else { u.nickname };
+            PickItem { id: u.user_id.clone(), label, detail: u.user_id }
+        })
+        .collect())
+}
+
+fn me_id(app: &App) -> String {
+    app.snapshot.me.as_ref().map(|m| m.0.clone()).unwrap_or_default()
+}
+
+fn open_invite_picker(app: &mut App, backend: Option<&mut Backend>) {
+    let Some(group_id) = group_of(&app.open) else {
+        app.notice = Some("当前不是群聊，先 :new 建一个".into());
+        return;
+    };
+    let items = match roster(backend) {
+        Ok(items) => items,
+        Err(e) => {
+            app.notice = Some(e);
+            return;
+        }
+    };
+    let me = me_id(app);
+    let present: HashSet<String> = app.snapshot.members.iter().map(|m| m.id.0.clone()).collect();
+    let items: Vec<PickItem> = items
+        .into_iter()
+        .filter(|i| i.id != me && !present.contains(&i.id))
+        .collect();
+    if items.is_empty() {
+        app.notice = Some("没有可邀请的人：大家都在群里了".into());
+        return;
+    }
+    let title = format!("邀请到 #{}", app.conversation().map(|c| c.name.clone()).unwrap_or_default());
+    app.picker = Some(Picker::new(
+        title,
+        Purpose::Invite { group_id, conversation: app.open.clone() },
+        items,
+        true,
+    ));
+}
+
+fn open_dm_picker(app: &mut App, backend: Option<&mut Backend>) {
+    let items = match roster(backend) {
+        Ok(items) => items,
+        Err(e) => {
+            app.notice = Some(e);
+            return;
+        }
+    };
+    let me = me_id(app);
+    let items: Vec<PickItem> = items.into_iter().filter(|i| i.id != me).collect();
+    if items.is_empty() {
+        app.notice = Some("服务器上还没有别人".into());
+        return;
+    }
+    app.picker = Some(Picker::new("私聊谁", Purpose::DirectMessage, items, false));
+}
+
+fn complete_pick(app: &mut App, backend: Option<&mut Backend>, picker: Picker, ids: Vec<String>) {
+    match picker.purpose.clone() {
+        Purpose::Invite { group_id, .. } => {
+            let names: Vec<String> = ids.iter().map(|id| picker.label_of(id)).collect();
+            invite_users(app, backend, &group_id, ids, names);
+        }
+        Purpose::DirectMessage => {
+            if let Some(id) = ids.first() {
+                let name = picker.label_of(id);
+                open_direct(app, backend, id, &name);
+            }
+        }
+    }
+}
+
+fn invite_users(app: &mut App, backend: Option<&mut Backend>, group_id: &str, ids: Vec<String>, names: Vec<String>) {
+    match backend {
+        Some(b) => match b.session.invite(group_id, &ids) {
+            Ok(()) => app.notice = Some(format!("已邀请 {}", names.join("、"))),
+            Err(e) => app.notice = Some(format!("邀请失败: {e}")),
+        },
+        None => {
+            // Mock: put them straight into the member list so the pane reacts.
+            for (id, name) in ids.iter().zip(&names) {
+                if !app.snapshot.members.iter().any(|m| m.id.0 == *id) {
+                    app.snapshot.members.push(Member {
+                        id: UserId(id.clone()),
+                        name: name.clone(),
+                        role: Role::Member,
+                        online: false,
+                        is_bot: false,
+                    });
+                }
+            }
+            let open = app.open.clone();
+            let count = app.snapshot.members.len().max(1) as u32;
+            if let Some(c) = app.snapshot.conversation_mut(&open) {
+                c.member_count = count;
+            }
+            app.notice = Some(format!("示例模式：已邀请 {}", names.join("、")));
+        }
+    }
+}
+
+fn open_direct(app: &mut App, backend: Option<&mut Backend>, user_id: &str, nickname: &str) {
+    let conv = match backend {
+        Some(b) => b.session.open_direct(user_id, nickname, &mut app.snapshot),
+        None => {
+            let me = me_id(app);
+            session::local_direct(&mut app.snapshot, &me, user_id, nickname)
+        }
+    };
+    app.open_conversation(conv);
+}
+
+/// A group that exists only in this process, for `--mock`.
+fn mock_group(app: &mut App, name: &str) -> ConversationId {
+    let id = ConversationId(format!("sg_local_{}", app.snapshot.conversations.len() + 1));
+    let newest = app.snapshot.conversations.iter().map(|c| c.last_activity_ms).max().unwrap_or(0);
+    app.snapshot.upsert_conversation(Conversation {
+        id: id.clone(),
+        name: name.to_owned(),
+        kind: ConversationKind::Group,
+        category: Some(im_model::translate::category_for(ConversationKind::Group).to_owned()),
+        unread: 0,
+        mentions: 0,
+        muted: false,
+        member_count: 1,
+        last_activity_ms: newest + 60_000,
+        read_up_to: None,
+    });
+    let me = me_id(app);
+    let my_name = app
+        .snapshot
+        .members
+        .iter()
+        .find(|m| m.id.0 == me)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| "我".to_owned());
+    app.snapshot.set_members(vec![Member {
+        id: UserId(me),
+        name: my_name,
+        role: Role::Owner,
+        online: true,
+        is_bot: false,
+    }]);
+    id
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum KeyAction {
     None,
     Send,
     Quit,
+    /// A `:` line, without the colon.
+    Command(String),
 }
 
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
@@ -536,8 +857,10 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyActio
                 app.mode = Mode::Normal;
             }
             KeyCode::Enter if app.mode == Mode::Command => {
+                let line = app.composer.text().trim_start_matches(':').trim().to_owned();
                 app.composer.clear();
                 app.mode = Mode::Normal;
+                return KeyAction::Command(line);
             }
             // Shift+Enter inserts a newline; plain Enter sends.
             KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => app.composer.newline(),
@@ -546,7 +869,14 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyActio
                 app.composer.delete_word_before();
             }
             KeyCode::Backspace => {
-                app.composer.backspace();
+                // Deleting the colon leaves the command line; there is nothing
+                // to type into any more.
+                if app.mode == Mode::Command && app.composer.text().len() <= 1 {
+                    app.composer.clear();
+                    app.mode = Mode::Normal;
+                } else {
+                    app.composer.backspace();
+                }
             }
             KeyCode::Delete if ctrl || alt => {
                 app.composer.delete_word_after();
@@ -619,6 +949,22 @@ mod tests {
         Ok(render::to_text(&render::capture(width, height, Scene::Live)?))
     }
 
+    fn mock_app() -> App {
+        App::new(im_model::mock::snapshot())
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Flow {
+        on_key(app, None, code, KeyModifiers::NONE)
+    }
+
+    fn type_command(app: &mut App, line: &str) -> Flow {
+        press(app, KeyCode::Char(':'));
+        for c in line.chars() {
+            press(app, KeyCode::Char(c));
+        }
+        press(app, KeyCode::Enter)
+    }
+
     #[test]
     fn a_snapshot_renders_at_the_requested_size() {
         let out = frame("100x24").expect("render");
@@ -658,8 +1004,20 @@ mod tests {
     }
 
     #[test]
+    fn the_picker_scene_draws_the_modal_over_the_panes() {
+        let (width, height) = parse_size("110x30");
+        let out = render::to_text(&render::capture(width, height, Scene::Picker).expect("render"));
+        assert!(out.contains("邀请到 #排期讨论"), "modal title");
+        assert!(out.contains("[x] 孙丽"), "a ticked row");
+        assert!(out.contains("Enter 确定"), "the hint line");
+        for line in out.lines() {
+            assert!(unicode_width::UnicodeWidthStr::width(line) <= 110, "{line:?}");
+        }
+    }
+
+    #[test]
     fn insert_mode_takes_letters_as_text_not_as_commands() {
-        let mut app = App::new(im_model::mock::snapshot());
+        let mut app = mock_app();
         handle_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         assert_eq!(app.mode, Mode::Insert);
         let action = handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
@@ -671,7 +1029,7 @@ mod tests {
 
     #[test]
     fn enter_in_insert_mode_asks_to_send_and_shift_enter_does_not() {
-        let mut app = App::new(im_model::mock::snapshot());
+        let mut app = mock_app();
         app.mode = Mode::Insert;
         app.composer.insert_str("hi");
         assert_eq!(
@@ -686,23 +1044,103 @@ mod tests {
     }
 
     #[test]
-    fn colon_opens_the_command_line_separately_from_the_composer() {
-        let mut app = App::new(im_model::mock::snapshot());
+    fn colon_enter_runs_the_line_and_returns_to_normal() {
+        let mut app = mock_app();
         handle_key(&mut app, KeyCode::Char(':'), KeyModifiers::NONE);
         assert_eq!(app.mode, Mode::Command);
-        assert_eq!(app.composer.text(), ":");
-        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        for c in "help".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            KeyAction::Command("help".into())
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn backspacing_the_colon_leaves_command_mode() {
+        let mut app = mock_app();
+        handle_key(&mut app, KeyCode::Char(':'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.composer.is_empty());
     }
 
     #[test]
     fn sending_in_mock_mode_keeps_the_draft_and_explains() {
-        let mut app = App::new(im_model::mock::snapshot());
+        let mut app = mock_app();
         app.composer.insert_str("hello");
         send_composer(&mut app, None);
         assert_eq!(app.composer.text(), "hello", "draft must survive a failed send");
         assert!(app.notice.is_some());
+    }
+
+    #[test]
+    fn new_creates_a_group_opens_it_and_offers_the_invite_picker() {
+        let mut app = mock_app();
+        assert_eq!(type_command(&mut app, "new 周末爬山"), Flow::Continue);
+        assert!(app.open.0.starts_with("sg_local_"), "the new group is open: {}", app.open.0);
+        assert_eq!(app.conversation().map(|c| c.name.as_str()), Some("周末爬山"));
+        assert_eq!(app.snapshot.conversations.first().map(|c| c.name.as_str()), Some("周末爬山"), "newest first");
+        let picker = app.picker.as_ref().expect("invite picker opens");
+        assert!(picker.multi);
+        assert!(picker.title.contains("周末爬山"));
+        assert!(!picker.items.iter().any(|i| i.id == me_id(&app)), "never offer to invite myself");
+    }
+
+    #[test]
+    fn keys_go_to_the_picker_while_it_is_open() {
+        let mut app = mock_app();
+        type_command(&mut app, "new 周末爬山");
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Flow::Continue, "q filters, it does not quit");
+        assert_eq!(app.picker.as_ref().map(|p| p.filter.as_str()), Some("q"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none(), "escape closes the modal");
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn confirming_the_invite_picker_in_mock_mode_adds_the_members() {
+        let mut app = mock_app();
+        type_command(&mut app, "new 周末爬山");
+        let before = app.snapshot.members.len();
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        assert_eq!(app.snapshot.members.len(), before + 2);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("已邀请")), "{:?}", app.notice);
+        assert_eq!(app.conversation().map(|c| c.member_count), Some(before as u32 + 2));
+    }
+
+    #[test]
+    fn dm_opens_a_direct_conversation_on_the_sdk_derived_id() {
+        let mut app = mock_app();
+        let me = me_id(&app);
+        assert!(!me.is_empty(), "the mock knows who I am");
+        type_command(&mut app, "dm lina");
+        let expected = im_model::translate::direct_conversation_id(&me, "lina");
+        assert_eq!(app.open, expected);
+        assert_eq!(app.conversation().map(|c| c.kind), Some(ConversationKind::Direct));
+        assert_eq!(app.conversation().map(|c| c.name.as_str()), Some("李娜"), "named from the roster");
+        // Opening it twice must not duplicate the row.
+        let count = app.snapshot.conversations.len();
+        type_command(&mut app, "dm lina");
+        assert_eq!(app.snapshot.conversations.len(), count);
+    }
+
+    #[test]
+    fn q_quits_and_unknown_verbs_explain_themselves() {
+        let mut app = mock_app();
+        assert_eq!(type_command(&mut app, "q"), Flow::Quit);
+        assert_eq!(type_command(&mut app, "frobnicate"), Flow::Continue);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("frobnicate")));
+        type_command(&mut app, "new");
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("用法")));
+        assert!(app.picker.is_none());
     }
 
     #[test]

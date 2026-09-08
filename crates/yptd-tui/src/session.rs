@@ -37,6 +37,9 @@ pub struct Changed {
     /// conversations and messages it never pushed as events, so the caller
     /// should [`Session::resync`].
     pub resync: bool,
+    /// Membership of the open group changed; the caller should
+    /// [`Session::ensure_members`] again.
+    pub members: bool,
 }
 
 impl Session {
@@ -265,6 +268,72 @@ impl Session {
         Ok(())
     }
 
+    /// Creates a group with the local user as owner and puts it in the
+    /// sidebar at once, so the person can start inviting before the SDK's
+    /// own conversation row arrives.
+    pub fn create_group(
+        &mut self,
+        name: &str,
+        snapshot: &mut Snapshot,
+    ) -> Result<ConversationId, im_sidecar::Error> {
+        let reply = self.sidecar.call(
+            "create_group",
+            json!({
+                "memberUserIDs": [],
+                "adminUserIDs": [],
+                "ownerUserID": "",
+                "groupInfo": { "groupName": name, "groupType": 2 },
+            }),
+        )?;
+        let info = reply.get("groupInfo").unwrap_or(&reply);
+        let group_id = info.get("groupID").and_then(Value::as_str).unwrap_or("");
+        if group_id.is_empty() {
+            return Err(im_sidecar::Error::Sdk {
+                code: 0,
+                msg: "服务端没有返回 groupID".into(),
+            });
+        }
+        let conv = ConversationId(format!("sg_{group_id}"));
+        snapshot.upsert_conversation(im_model::Conversation {
+            id: conv.clone(),
+            name: info
+                .get("groupName")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(name)
+                .to_owned(),
+            kind: ConversationKind::Group,
+            category: Some(translate::category_for(ConversationKind::Group).to_owned()),
+            unread: 0,
+            mentions: 0,
+            muted: false,
+            member_count: info.get("memberCount").and_then(Value::as_u64).unwrap_or(1) as u32,
+            last_activity_ms: info
+                .get("createTime")
+                .and_then(Value::as_i64)
+                .filter(|t| *t > 0)
+                .unwrap_or_else(now_ms),
+            read_up_to: None,
+        });
+        Ok(conv)
+    }
+
+    /// Invites people into a group. The member list is forgotten so the next
+    /// frame refetches it rather than waiting on the SDK's callback.
+    pub fn invite(&mut self, group_id: &str, user_ids: &[String]) -> Result<(), im_sidecar::Error> {
+        self.sidecar.call(
+            "invite",
+            json!({ "group_id": group_id, "reason": "", "user_ids": user_ids }),
+        )?;
+        self.members_for = None;
+        Ok(())
+    }
+
+    /// Opens a direct conversation; see [`local_direct`].
+    pub fn open_direct(&mut self, user_id: &str, nickname: &str, snapshot: &mut Snapshot) -> ConversationId {
+        local_direct(snapshot, &self.me.0, user_id, nickname)
+    }
+
     /// Folds one SDK event into the snapshot.
     pub fn apply(&mut self, event: &Event, snapshot: &mut Snapshot) -> Changed {
         let mut changed = Changed::default();
@@ -338,6 +407,13 @@ impl Session {
             "OnJoinedGroupAdded" | "OnJoinedGroupDeleted" | "OnGroupInfoChanged" => {
                 changed.resync = true;
             }
+            "OnGroupMemberAdded" | "OnGroupMemberDeleted" | "OnGroupMemberInfoChanged" => {
+                let group = event.data.get("groupID").and_then(Value::as_str).unwrap_or("");
+                if self.members_for.as_deref() == Some(group) {
+                    self.members_for = None;
+                    changed.members = true;
+                }
+            }
             _ => {}
         }
         changed
@@ -353,6 +429,35 @@ impl Session {
             c.last_activity_ms = m.sent_at_ms().max(c.last_activity_ms);
         }
     }
+}
+
+/// Puts a direct conversation in the sidebar if the two have never talked.
+/// The server-side row appears with the first message; until then history is
+/// simply empty. Returns the id either way.
+pub fn local_direct(snapshot: &mut Snapshot, me: &str, user_id: &str, nickname: &str) -> ConversationId {
+    let id = translate::direct_conversation_id(me, user_id);
+    if snapshot.conversation(&id).is_none() {
+        snapshot.upsert_conversation(im_model::Conversation {
+            id: id.clone(),
+            name: if nickname.is_empty() { user_id } else { nickname }.to_owned(),
+            kind: ConversationKind::Direct,
+            category: Some(translate::category_for(ConversationKind::Direct).to_owned()),
+            unread: 0,
+            mentions: 0,
+            muted: false,
+            member_count: 2,
+            last_activity_ms: now_ms(),
+            read_up_to: None,
+        });
+    }
+    id
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The other party in a direct conversation id `si_<a>_<b>`.

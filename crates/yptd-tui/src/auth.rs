@@ -1,6 +1,7 @@
 //! Talking to yptd-server: register with an invitation, exchange a device
 //! credential for an OpenIM session.
 
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::config::{Config, Credentials};
@@ -38,23 +39,22 @@ pub struct Login {
     pub credentials: Credentials,
 }
 
-/// Reads the server's error body when a request is rejected, so the person
-/// sees "邀请码已被使用" rather than "HTTP 400".
-fn post(url: &str, body: serde_json::Value) -> Result<Session, Error> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(20)))
+fn agent(seconds: u64) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(seconds)))
         .http_status_as_error(false)
         .build()
-        .new_agent();
-    let mut response = agent
-        .post(url)
-        .send_json(&body)
-        .map_err(|e| Error(format!("连不上服务端 {url}: {e}")))?;
+        .new_agent()
+}
+
+/// Reads the server's error body when a request is rejected, so the person
+/// sees "邀请码已被使用" rather than "HTTP 400".
+fn decode<T: DeserializeOwned>(mut response: ureq::http::Response<ureq::Body>) -> Result<T, Error> {
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
         return response
             .body_mut()
-            .read_json::<Session>()
+            .read_json::<T>()
             .map_err(|e| Error(format!("服务端返回了无法解析的内容: {e}")));
     }
     let detail = response
@@ -67,6 +67,38 @@ fn post(url: &str, body: serde_json::Value) -> Result<Session, Error> {
     } else {
         Err(Error(detail))
     }
+}
+
+fn post(url: &str, body: serde_json::Value) -> Result<Session, Error> {
+    let response = agent(20)
+        .post(url)
+        .send_json(&body)
+        .map_err(|e| Error(format!("连不上服务端 {url}: {e}")))?;
+    decode(response)
+}
+
+/// One row of the server's roster.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct UserSummary {
+    pub user_id: String,
+    pub nickname: String,
+}
+
+#[derive(Deserialize)]
+struct UsersResponse {
+    #[serde(default)]
+    users: Vec<UserSummary>,
+}
+
+/// Everyone on the server, for the invite and direct-message pickers.
+pub fn users(config: &Config, creds: &Credentials) -> Result<Vec<UserSummary>, Error> {
+    let url = format!("{}/v1/users", config.server);
+    let response = agent(10)
+        .get(&url)
+        .header("Authorization", &format!("Bearer {}", creds.device_token))
+        .call()
+        .map_err(|e| Error(format!("连不上服务端 {url}: {e}")))?;
+    decode::<UsersResponse>(response).map(|r| r.users)
 }
 
 /// First-time registration with an invitation code.

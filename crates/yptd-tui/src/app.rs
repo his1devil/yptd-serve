@@ -4,6 +4,8 @@
 use im_model::{Conversation, ConversationId, ConversationKind, Member, Message, Role, Snapshot};
 use tui_textedit::TextArea;
 
+use crate::picker::Picker;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Pane {
     Conversations,
@@ -97,6 +99,9 @@ pub struct App {
     /// off-screen captures so a test renders the same in every time zone;
     /// the live client sets it from the machine's zone at startup.
     pub utc_offset_ms: i64,
+    /// A modal list over everything else. While it is open, keys go to it
+    /// and the panes underneath are inert.
+    pub picker: Option<Picker>,
 }
 
 impl App {
@@ -123,6 +128,7 @@ impl App {
             show_conversations: true,
             notice: None,
             utc_offset_ms: 0,
+            picker: None,
         };
         app.jump_to_latest();
         app
@@ -148,6 +154,7 @@ impl App {
             show_conversations: self.show_conversations,
             notice: self.notice.clone(),
             utc_offset_ms: self.utc_offset_ms,
+            picker: self.picker.clone(),
         }
     }
 
@@ -401,6 +408,19 @@ impl App {
         self.follow_latest = false;
     }
 
+    /// Switches to a conversation and lands at its newest message.
+    pub fn open_conversation(&mut self, id: ConversationId) {
+        self.open = id;
+        self.message_scroll = 0;
+        self.jump_to_latest();
+        self.pane = Pane::Messages;
+        if let Some(index) = self.nav_rows().iter().position(
+            |row| matches!(row, NavRow::Conversation { index } if self.snapshot.conversations.get(*index).is_some_and(|c| c.id == self.open)),
+        ) {
+            self.nav_cursor = index;
+        }
+    }
+
     pub fn open_selected(&mut self) {
         if self.pane != Pane::Conversations {
             return;
@@ -408,11 +428,8 @@ impl App {
         let rows = self.nav_rows();
         match rows.get(self.nav_cursor) {
             Some(NavRow::Conversation { index }) => {
-                if let Some(conversation) = self.snapshot.conversations.get(*index) {
-                    self.open = conversation.id.clone();
-                    self.message_scroll = 0;
-                    self.jump_to_latest();
-                    self.pane = Pane::Messages;
+                if let Some(id) = self.snapshot.conversations.get(*index).map(|c| c.id.clone()) {
+                    self.open_conversation(id);
                 }
             }
             Some(NavRow::Category { .. }) => self.toggle_collapsed(),

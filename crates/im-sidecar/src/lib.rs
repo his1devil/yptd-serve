@@ -227,15 +227,13 @@ fn read_loop(
                 }
             }
             (None, Some(name)) => {
-                if events
-                    .send(Event {
-                        name,
-                        data: frame.data.unwrap_or(Value::Null),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                // A dropped receiver means this caller does not care about
+                // events -- a one-shot CLI, say -- not that the link is dead.
+                // Replies must keep flowing regardless.
+                let _ = events.send(Event {
+                    name,
+                    data: frame.data.unwrap_or(Value::Null),
+                });
             }
             (None, None) => {}
         }
@@ -292,6 +290,31 @@ fn locate(explicit: Option<&Path>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn replies_still_arrive_after_the_event_receiver_is_dropped() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let pending: Arc<Mutex<HashMap<u64, Sender<Frame>>>> = Arc::default();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        pending.lock().unwrap().insert(7, reply_tx);
+        let (event_tx, event_rx) = mpsc::channel();
+        drop(event_rx);
+        let reader = std::thread::spawn({
+            let pending = pending.clone();
+            move || read_loop(BufReader::new(theirs), pending, event_tx)
+        });
+
+        let mut w = ours;
+        w.write_all(b"{\"ev\":\"OnJoinedGroupAdded\",\"data\":{}}\n").unwrap();
+        w.write_all(b"{\"id\":7,\"ok\":true,\"data\":{\"fine\":1}}\n").unwrap();
+        let reply = reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the reply must not be lost to an earlier unwanted event");
+        assert_eq!(reply.ok, Some(true));
+        drop(w);
+        reader.join().unwrap();
+    }
 
     #[test]
     fn frames_split_into_replies_and_events_by_the_id_rule() {

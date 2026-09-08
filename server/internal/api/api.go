@@ -1,9 +1,10 @@
 // Package api is the HTTP surface the TUI talks to.
 //
-// Four endpoints, in the order a client meets them: register with an
+// Five endpoints, in the order a client meets them: register with an
 // invitation, exchange a device token for an OpenIM session, the password
-// fallback, and a whoami. Everything else the TUI needs it gets from OpenIM
-// directly with the token this service hands out.
+// fallback, a whoami, and the roster the invite picker lists. Everything
+// else the TUI needs it gets from OpenIM directly with the token this
+// service hands out.
 package api
 
 import (
@@ -40,6 +41,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/login", s.handleLogin)
 	mux.HandleFunc("POST /v1/login/password", s.handleLoginPassword)
 	mux.HandleFunc("GET /v1/me", s.handleMe)
+	mux.HandleFunc("GET /v1/users", s.handleUsers)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	return s.withLogging(mux)
 }
@@ -264,6 +266,34 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"nickname": user.Nickname,
 		"disabled": user.Disabled,
 	})
+}
+
+// handleUsers lists everyone on this server, for the invite picker. yptd is
+// a small private server where everybody may see everybody; the roster is
+// the right unit, and it needs a valid device credential like /v1/me.
+func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
+	token := bearer(r)
+	if token == "" {
+		fail(w, http.StatusUnauthorized, "missing_token", "缺少设备凭据")
+		return
+	}
+	if _, err := s.store.LookupCredential(r.Context(), token); err != nil {
+		fail(w, http.StatusUnauthorized, "bad_token", "凭据无效")
+		return
+	}
+	users, err := s.store.ListUsers(r.Context())
+	if err != nil {
+		s.fail500(w, "list users", err)
+		return
+	}
+	out := make([]map[string]any, 0, len(users))
+	for _, u := range users {
+		if u.Disabled {
+			continue
+		}
+		out = append(out, map[string]any{"user_id": u.UserID, "nickname": u.Nickname})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": out})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

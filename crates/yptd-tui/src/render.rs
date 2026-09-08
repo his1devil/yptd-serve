@@ -29,6 +29,8 @@ pub enum Scene {
     Insert,
     /// Cursor on the markdown message, so the fenced code block is in view.
     Code,
+    /// The invite picker open over the live scene, two names ticked.
+    Picker,
 }
 
 impl Scene {
@@ -39,6 +41,7 @@ impl Scene {
             "nav" => Self::Nav,
             "insert" => Self::Insert,
             "code" => Self::Code,
+            "picker" => Self::Picker,
             _ => return None,
         })
     }
@@ -54,6 +57,27 @@ impl Scene {
                 app.focus(Pane::Conversations);
                 app.nav_cursor = 4;
                 app.collapsed.push("研发".to_owned());
+            }
+            Self::Picker => {
+                use crate::picker::{Picker, Purpose};
+                // The same exclusion the real command applies: nobody who is
+                // already in the group, and never oneself.
+                let present: Vec<String> = app.snapshot.members.iter().map(|m| m.id.0.clone()).collect();
+                let me = app.snapshot.me.clone().map(|m| m.0).unwrap_or_default();
+                let items = crate::picker::mock_roster()
+                    .into_iter()
+                    .filter(|i| i.id != me && !present.contains(&i.id))
+                    .collect();
+                let mut picker = Picker::new(
+                    "邀请到 #排期讨论",
+                    Purpose::Invite { group_id: "193332560".into(), conversation: app.open.clone() },
+                    items,
+                    true,
+                );
+                picker.selected.insert("sunli".into());
+                picker.selected.insert("wuhao".into());
+                picker.cursor = 1;
+                app.picker = Some(picker);
             }
             Self::Insert => {
                 app.mode = Mode::Insert;
