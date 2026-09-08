@@ -19,6 +19,10 @@ pub enum Block {
     Code {
         language: Option<String>,
         lines: Vec<String>,
+        /// Per-source-line syntax spans, filled in by the renderer before
+        /// layout. Empty means "draw it plain", which is what an unknown
+        /// language gets.
+        highlights: Vec<Vec<Span>>,
     },
 }
 
@@ -49,7 +53,11 @@ pub fn parse_markdown(input: &str) -> Vec<Block> {
                 }
                 code.push(body.to_owned());
             }
-            blocks.push(Block::Code { language, lines: code });
+            blocks.push(Block::Code {
+                language,
+                lines: code,
+                highlights: Vec::new(),
+            });
             continue;
         }
 
@@ -299,7 +307,7 @@ mod tests {
     #[test]
     fn a_fence_keeps_its_language_and_body_verbatim() {
         let blocks = parse_markdown("```bash\n./scripts/rollback.sh --dry-run\n```");
-        let Block::Code { language, lines } = &blocks[0] else {
+        let Block::Code { language, lines, .. } = &blocks[0] else {
             panic!("expected a code block, got {:?}", blocks[0]);
         };
         assert_eq!(language.as_deref(), Some("bash"));

@@ -2,6 +2,7 @@
 //! where the two message cursors sit.
 
 use im_model::{Conversation, ConversationId, ConversationKind, Member, Message, Role, Snapshot};
+use tui_textedit::TextArea;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Pane {
@@ -82,7 +83,11 @@ pub struct App {
     pub nav_cursor: usize,
     pub member_cursor: usize,
     pub collapsed: Vec<String>,
-    pub composer: String,
+    pub composer: TextArea,
+    /// Which message each visible row of the message pane belongs to, written
+    /// by the renderer each frame. Mouse events are handled against the frame
+    /// the user actually clicked on, so last frame's map is the right one.
+    pub message_line_map: Vec<Option<usize>>,
     pub show_members: bool,
     pub show_conversations: bool,
 }
@@ -105,12 +110,34 @@ impl App {
             nav_cursor: 0,
             member_cursor: 0,
             collapsed: Vec::new(),
-            composer: String::new(),
+            composer: TextArea::new(),
+            message_line_map: Vec::new(),
             show_members: true,
             show_conversations: true,
         };
         app.jump_to_latest();
         app
+    }
+
+    /// A shallow copy for off-screen rendering, where the caller only has a
+    /// shared reference but `draw` needs to record its line map somewhere.
+    pub fn clone_for_render(&self) -> App {
+        App {
+            snapshot: self.snapshot.clone(),
+            pane: self.pane,
+            mode: self.mode,
+            open: self.open.clone(),
+            message_cursor: self.message_cursor,
+            message_scroll: self.message_scroll,
+            follow_latest: self.follow_latest,
+            nav_cursor: self.nav_cursor,
+            member_cursor: self.member_cursor,
+            collapsed: self.collapsed.clone(),
+            composer: self.composer.clone(),
+            message_line_map: Vec::new(),
+            show_members: self.show_members,
+            show_conversations: self.show_conversations,
+        }
     }
 
     pub fn conversation(&self) -> Option<&Conversation> {
@@ -226,6 +253,82 @@ impl App {
         }
     }
 
+    /// Selects the entry drawn at row `index` of `pane`'s interior.
+    ///
+    /// Returns whether a real entry was hit: clicking past the end of a short
+    /// list should leave the selection alone rather than clamping onto the
+    /// last row, which would silently open the wrong conversation.
+    pub fn select_row(&mut self, pane: Pane, index: usize) -> bool {
+        match pane {
+            Pane::Conversations => {
+                if index >= self.nav_rows().len() {
+                    return false;
+                }
+                self.nav_cursor = index;
+                true
+            }
+            Pane::Members => {
+                if index >= self.members().len() + self.members_by_role().len() {
+                    return false;
+                }
+                // Role headings occupy rows too; walk the rendered order to map
+                // a screen row back to a member.
+                let mut row = 0usize;
+                let mut member_index = 0usize;
+                for (_, bucket) in self.members_by_role() {
+                    if row == index {
+                        return false; // a heading, not a member
+                    }
+                    row += 1;
+                    for _ in bucket {
+                        if row == index {
+                            self.member_cursor = member_index;
+                            return true;
+                        }
+                        row += 1;
+                        member_index += 1;
+                    }
+                }
+                false
+            }
+            Pane::Messages => {
+                match self.message_line_map.get(index).copied().flatten() {
+                    Some(message) => {
+                        self.message_cursor = message;
+                        self.follow_latest = message + 1 >= self.messages().len();
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// Scrolls one pane without changing focus.
+    pub fn scroll_pane(&mut self, pane: Pane, delta: isize) {
+        match pane {
+            Pane::Messages => {
+                self.leave_follow();
+                let count = self.messages().len();
+                self.message_scroll = step(self.message_scroll, delta, count);
+            }
+            Pane::Conversations => {
+                let rows = self.nav_rows().len();
+                self.nav_cursor = step(self.nav_cursor, delta, rows);
+            }
+            Pane::Members => {
+                let count = self.members().len();
+                self.member_cursor = step(self.member_cursor, delta, count);
+            }
+        }
+    }
+
+    /// Test helper: a single number that moves whenever the message pane does.
+    #[cfg(test)]
+    pub fn message_scroll_or_cursor(&self) -> usize {
+        self.message_scroll * 1000 + self.message_cursor
+    }
+
     /// `j` / `k`: move the selection, letting the viewport follow.
     pub fn select(&mut self, delta: isize) {
         match self.pane {
@@ -251,9 +354,28 @@ impl App {
             self.select(delta);
             return;
         }
-        let count = self.messages().len();
-        self.message_scroll = step(self.message_scroll, delta, count);
+        self.scroll_pane(Pane::Messages, delta);
+    }
+
+    /// Switches from bottom-anchored following to manual scrolling.
+    ///
+    /// While following, `message_scroll` is meaningless -- the viewport is
+    /// pinned to the newest message and the top is derived from the height.
+    /// Handing that stale zero to the scroll arithmetic is what made one wheel
+    /// click jump to the very start of the conversation. Anchor it to what is
+    /// actually on screen first.
+    fn leave_follow(&mut self) {
+        if !self.follow_latest {
+            return;
+        }
         self.follow_latest = false;
+        self.message_scroll = self
+            .message_line_map
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+            .unwrap_or(self.message_cursor);
     }
 
     pub fn jump_to_latest(&mut self) {
@@ -343,6 +465,31 @@ mod tests {
         app.scroll(-1);
         assert_eq!(app.message_cursor, cursor, "J/K must not move the selection");
         assert!(!app.follow_latest);
+    }
+
+    #[test]
+    fn scrolling_up_from_the_live_edge_does_not_jump_to_the_beginning() {
+        let mut app = app();
+        assert!(app.follow_latest, "fixture opens at the live edge");
+        // Pretend a frame was drawn showing the last four messages.
+        let last = app.messages().len() - 1;
+        app.message_line_map = (last - 3..=last).map(Some).collect();
+
+        app.scroll_pane(Pane::Messages, -3);
+        assert!(!app.follow_latest);
+        assert!(
+            app.message_scroll >= last - 6,
+            "scroll landed at {}, expected near the live edge ({last})",
+            app.message_scroll
+        );
+    }
+
+    #[test]
+    fn leaving_follow_without_a_rendered_frame_anchors_to_the_cursor() {
+        let mut app = app();
+        let cursor = app.message_cursor;
+        app.scroll_pane(Pane::Messages, -1);
+        assert!(app.message_scroll <= cursor && app.message_scroll + 2 >= cursor);
     }
 
     #[test]

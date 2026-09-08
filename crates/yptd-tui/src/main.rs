@@ -5,12 +5,17 @@
 //! awkward cases than against whatever happens to be in a dev server.
 
 mod app;
+mod layout;
+mod media;
+mod mouse;
 mod render;
+mod syntax;
 mod ui;
 
 use std::error::Error;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::execute;
 use tui_theme::Theme;
 
 use crate::app::{App, Mode, Pane};
@@ -63,15 +68,36 @@ fn run() -> Fallible<()> {
     let theme = Theme::default();
     let mut app = App::new(im_model::mock::snapshot());
     let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableMouseCapture)?;
+    let mut clicks = mouse::Clicks::default();
+
+    // Protocol negotiation talks to the terminal, so it happens once at
+    // startup rather than on the first message that carries a picture.
+    let mut media = media::Media::detect();
+    load_fixture_images(&mut media, &app);
 
     let result = loop {
-        if let Err(error) = terminal.draw(|frame| ui::draw(frame, &app, &theme)) {
+        if let Err(error) = terminal.draw(|frame| ui::draw(frame, &mut app, &mut media, &theme)) {
             break Err(error);
         }
+        let area = terminal.size().map(|s| ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: s.width,
+            height: s.height,
+        })?;
+
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 if handle_key(&mut app, key.code, key.modifiers) {
                     break Ok(());
+                }
+            }
+            Ok(Event::Mouse(m)) => {
+                let lines = app.composer.lines().count().max(1);
+                let out = mouse::handle(&mut app, m, area, lines, &mut clicks);
+                if out.activate {
+                    app.open_selected();
                 }
             }
             Ok(_) => {}
@@ -79,37 +105,101 @@ fn run() -> Fallible<()> {
         }
     };
 
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result.map_err(Into::into)
 }
 
+/// Registers the mock's image attachments.
+///
+/// The fixture ships no binary assets: the picture is generated so the repo
+/// stays text-only and the rendering path still gets exercised end to end.
+fn load_fixture_images(media: &mut media::Media, app: &App) {
+    if !media.enabled() {
+        return;
+    }
+    for message in &app.snapshot.messages {
+        let Some(attachment) = message.attachment() else {
+            continue;
+        };
+        if attachment.kind != im_model::AttachmentKind::Image {
+            continue;
+        }
+        // Encode then decode, so the fixture exercises the same path a real
+        // attachment will take rather than a shortcut around it.
+        let decoded = media::demo_image_png(&attachment.name).and_then(|b| media::decode(&b));
+        match decoded {
+            Ok(image) => {
+                media.insert(&attachment.name, image);
+            }
+            Err(reason) => media.mark_failed(&attachment.name, reason),
+        }
+    }
+}
+
 /// Returns true when the app should quit.
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+
     match app.mode {
-        Mode::Insert => match code {
-            KeyCode::Esc => app.mode = Mode::Normal,
-            KeyCode::Backspace => {
-                app.composer.pop();
+        Mode::Insert | Mode::Command => match code {
+            KeyCode::Esc => {
+                if app.mode == Mode::Command {
+                    app.composer.clear();
+                }
+                app.mode = Mode::Normal;
             }
-            KeyCode::Char(value) => app.composer.push(value),
-            _ => {}
-        },
-        Mode::Command => match code {
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Enter if app.mode == Mode::Command => {
                 app.composer.clear();
                 app.mode = Mode::Normal;
             }
-            KeyCode::Backspace => {
-                app.composer.pop();
+            // Shift+Enter inserts a newline; plain Enter is reserved for send.
+            KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => app.composer.newline(),
+            KeyCode::Enter => { /* send: wired up with the backend */ }
+            KeyCode::Backspace if ctrl || alt => {
+                app.composer.delete_word_before();
             }
-            KeyCode::Char(value) => app.composer.push(value),
+            KeyCode::Backspace => {
+                app.composer.backspace();
+            }
+            KeyCode::Delete if ctrl || alt => {
+                app.composer.delete_word_after();
+            }
+            KeyCode::Delete => {
+                app.composer.delete();
+            }
+            KeyCode::Left if ctrl || alt => app.composer.move_word_left(),
+            KeyCode::Right if ctrl || alt => app.composer.move_word_right(),
+            KeyCode::Left => app.composer.move_left(),
+            KeyCode::Right => app.composer.move_right(),
+            KeyCode::Up => {
+                app.composer.move_vertical(-1);
+            }
+            KeyCode::Down => {
+                app.composer.move_vertical(1);
+            }
+            KeyCode::Home => app.composer.move_line_start(),
+            KeyCode::End => app.composer.move_line_end(),
+            KeyCode::Char('a') if ctrl => app.composer.move_line_start(),
+            KeyCode::Char('e') if ctrl => app.composer.move_line_end(),
+            KeyCode::Char('u') if ctrl => {
+                app.composer.delete_to_line_start();
+            }
+            KeyCode::Char('k') if ctrl => {
+                app.composer.delete_to_line_end();
+            }
+            KeyCode::Char('w') if ctrl => {
+                app.composer.delete_word_before();
+            }
+            KeyCode::Char(value) => app.composer.insert_char(value),
             _ => {}
         },
         Mode::Normal => match code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('i') => app.mode = Mode::Insert,
             KeyCode::Char(':') => {
-                app.composer = ":".to_owned();
+                app.composer.set_text(":");
                 app.mode = Mode::Command;
             }
             KeyCode::Char('1') => app.focus(Pane::Conversations),
@@ -119,12 +209,12 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
             KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.cycle_focus(false),
             KeyCode::Char('j') | KeyCode::Down => app.select(1),
             KeyCode::Char('k') | KeyCode::Up => app.select(-1),
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => app.select(1),
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => app.select(-1),
+            KeyCode::Char('n') if ctrl => app.select(1),
+            KeyCode::Char('p') if ctrl => app.select(-1),
             KeyCode::Char('J') => app.scroll(1),
             KeyCode::Char('K') => app.scroll(-1),
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll(5),
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll(-5),
+            KeyCode::Char('d') if ctrl => app.scroll(5),
+            KeyCode::Char('u') if ctrl => app.scroll(-5),
             KeyCode::Char('G') => app.jump_to_latest(),
             KeyCode::Char('g') => app.jump_to_top(),
             KeyCode::Char('z') => app.toggle_collapsed(),
@@ -189,7 +279,7 @@ mod tests {
         assert_eq!(app.mode, Mode::Insert);
         let quit = handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(!quit, "q must not quit while typing");
-        assert_eq!(app.composer, "q");
+        assert_eq!(app.composer.text(), "q");
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(app.mode, Mode::Normal);
     }
@@ -199,7 +289,7 @@ mod tests {
         let mut app = App::new(im_model::mock::snapshot());
         handle_key(&mut app, KeyCode::Char(':'), KeyModifiers::NONE);
         assert_eq!(app.mode, Mode::Command);
-        assert_eq!(app.composer, ":");
+        assert_eq!(app.composer.text(), ":");
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.composer.is_empty());

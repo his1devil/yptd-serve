@@ -57,7 +57,7 @@ impl Scene {
             }
             Self::Insert => {
                 app.mode = Mode::Insert;
-                app.composer = "好的，我把回滚脚本先合了 @陈明".to_owned();
+                app.composer.set_text("好的，我把回滚脚本先合了 @陈明");
             }
             Self::Code => {
                 app.jump_to_top();
@@ -152,7 +152,7 @@ pub fn capture(
     scene.apply(&mut app);
 
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
-    terminal.draw(|frame| ui::draw(frame, &app, &theme))?;
+    terminal.draw(|frame| ui::draw_static(frame, &app, &theme))?;
     Ok(terminal.backend().buffer().clone())
 }
 

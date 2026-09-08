@@ -1,0 +1,11 @@
+[package]
+name = "tui-textedit"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Grapheme-aware text editing primitives for terminal composers"
+
+[dependencies]
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }

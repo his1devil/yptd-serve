@@ -1,0 +1,198 @@
+// Package openim wraps the few OpenIM admin endpoints yptd-server needs.
+//
+// Only this package holds the OpenIM secret. Everything above it deals in
+// yptd's own identities and asks here when an OpenIM token is required.
+package openim
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+)
+
+type Client struct {
+	base       string
+	secret     string
+	adminID    string
+	http       *http.Client
+
+	// The admin token is valid for 90 days but costs a round trip, so it is
+	// cached and refreshed well before OpenIM would expire it.
+	mu         sync.Mutex
+	adminToken string
+	adminUntil time.Time
+}
+
+func New(base, secret, adminUserID string) *Client {
+	return &Client{
+		base:    base,
+		secret:  secret,
+		adminID: adminUserID,
+		http:    &http.Client{Timeout: 20 * time.Second},
+	}
+}
+
+// Error is a non-zero errCode from OpenIM, kept structured so callers can
+// distinguish "already registered" from "server is down".
+type Error struct {
+	Code   int
+	Msg    string
+	Detail string
+	Path   string
+}
+
+func (e *Error) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("openim %s: %d %s (%s)", e.Path, e.Code, e.Msg, e.Detail)
+	}
+	return fmt.Sprintf("openim %s: %d %s", e.Path, e.Code, e.Msg)
+}
+
+type envelope struct {
+	ErrCode int             `json:"errCode"`
+	ErrMsg  string          `json:"errMsg"`
+	ErrDlt  string          `json:"errDlt"`
+	Data    json.RawMessage `json:"data"`
+}
+
+func (c *Client) post(ctx context.Context, path string, body any, token string, out any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("openim %s: encode: %w", path, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("openim %s: request: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("operationID", operationID())
+	if token != "" {
+		req.Header.Set("token", token)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("openim %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	var env envelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return fmt.Errorf("openim %s: decode (http %d): %w", path, resp.StatusCode, err)
+	}
+	if env.ErrCode != 0 {
+		return &Error{Code: env.ErrCode, Msg: env.ErrMsg, Detail: env.ErrDlt, Path: path}
+	}
+	if out != nil && len(env.Data) > 0 {
+		if err := json.Unmarshal(env.Data, out); err != nil {
+			return fmt.Errorf("openim %s: decode data: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func operationID() string {
+	return "yptd-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+// AdminToken returns a cached admin token, minting a new one when needed.
+func (c *Client) AdminToken(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.adminToken != "" && time.Now().Before(c.adminUntil) {
+		return c.adminToken, nil
+	}
+
+	var out struct {
+		Token string `json:"token"`
+	}
+	body := map[string]any{"secret": c.secret, "userID": c.adminID}
+	if err := c.post(ctx, "/auth/get_admin_token", body, "", &out); err != nil {
+		return "", err
+	}
+	if out.Token == "" {
+		return "", fmt.Errorf("openim /auth/get_admin_token: empty token")
+	}
+	c.adminToken = out.Token
+	// OpenIM's tokenPolicy.expire defaults to 90 days; refresh after one hour
+	// so a policy change on the server cannot leave us holding a dead token.
+	c.adminUntil = time.Now().Add(time.Hour)
+	return out.Token, nil
+}
+
+// UserToken mints an OpenIM token for userID on the given platform.
+func (c *Client) UserToken(ctx context.Context, userID string, platformID int) (string, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Token string `json:"token"`
+	}
+	body := map[string]any{"secret": c.secret, "userID": userID, "platformID": platformID}
+	if err := c.post(ctx, "/auth/get_user_token", body, admin, &out); err != nil {
+		return "", err
+	}
+	if out.Token == "" {
+		return "", fmt.Errorf("openim /auth/get_user_token: empty token")
+	}
+	return out.Token, nil
+}
+
+// RegisterUser creates the OpenIM-side identity. Registering a userID that
+// already exists is reported by OpenIM as an error; callers decide whether
+// that is fatal.
+func (c *Client) RegisterUser(ctx context.Context, userID, nickname, faceURL string) error {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{
+		"users": []map[string]string{
+			{"userID": userID, "nickname": nickname, "faceURL": faceURL},
+		},
+	}
+	return c.post(ctx, "/user/user_register", body, admin, nil)
+}
+
+// UserExists reports whether OpenIM already knows this userID.
+func (c *Client) UserExists(ctx context.Context, userID string) (bool, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return false, err
+	}
+	var out struct {
+		UsersStatus []struct {
+			UserID string `json:"userID"`
+		} `json:"usersStatus"`
+	}
+	body := map[string]any{"userIDs": []string{userID}}
+	if err := c.post(ctx, "/user/get_users_info", body, admin, &out); err != nil {
+		// A lookup miss is not an error worth propagating as "unknown".
+		var apiErr *Error
+		if ok := asError(err, &apiErr); ok && apiErr.Code == 1004 {
+			return false, nil
+		}
+		return false, err
+	}
+	return len(out.UsersStatus) > 0, nil
+}
+
+func asError(err error, target **Error) bool {
+	e, ok := err.(*Error)
+	if ok {
+		*target = e
+	}
+	return ok
+}
+
+// Ping checks that OpenIM is reachable and the secret is accepted.
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.AdminToken(ctx)
+	return err
+}

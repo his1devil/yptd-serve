@@ -34,6 +34,11 @@ pub enum SpanKind {
     Strikethrough,
     /// Text produced from a timestamp token.
     Timestamp,
+    /// A literal 0xRRGGBB foreground. The single exception to "spans carry
+    /// meaning, not appearance": syntect owns code coloring, and its themes
+    /// express relationships between token classes that a fixed set of
+    /// highlight groups cannot. Everything else still names a group.
+    Syntax(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

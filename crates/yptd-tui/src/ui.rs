@@ -2,7 +2,7 @@
 //! single `Color::` literal below this line.
 
 use im_model::{Body, Message, SendState, Visibility};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span as TuiSpan};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -15,6 +15,9 @@ use tui_theme::{BorderSurface, HighlightGroup as HG, Theme};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, NavRow, Pane};
+use crate::layout;
+use crate::media::Media;
+use crate::syntax;
 
 /// Columns reserved on the left of every message for the selection marker.
 /// Always reserved, never conditional: if selecting a message changed the
@@ -27,32 +30,26 @@ const UNSELECTED_MARK: &str = "  ";
 /// Consecutive messages from one sender inside this window share a header.
 const AUTHOR_GROUP_MS: i64 = 5 * 60_000;
 
-pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
-    let [status, body, composer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(3),
-    ])
-    .areas(frame.area());
+pub fn draw(frame: &mut Frame, app: &mut App, media: &mut Media, theme: &Theme) {
+    let composer_lines = app.composer.lines().count().max(1);
+    let areas = layout::areas(frame.area(), app, composer_lines);
 
-    let nav_width = if app.show_conversations && body.width >= 72 { 24 } else { 0 };
-    let member_width = if app.show_members && body.width >= 100 { 18 } else { 0 };
-    let [nav, messages, members] = Layout::horizontal([
-        Constraint::Length(nav_width),
-        Constraint::Min(40),
-        Constraint::Length(member_width),
-    ])
-    .areas(body);
+    draw_status(frame, areas.status, app, media, theme);
+    if areas.nav.width > 0 {
+        draw_conversations(frame, areas.nav, app, theme);
+    }
+    draw_messages(frame, areas.messages, app, media, theme);
+    if areas.members.width > 0 {
+        draw_members(frame, areas.members, app, theme);
+    }
+    draw_composer(frame, areas.composer, app, theme);
+}
 
-    draw_status(frame, status, app, theme);
-    if nav_width > 0 {
-        draw_conversations(frame, nav, app, theme);
-    }
-    draw_messages(frame, messages, app, theme);
-    if member_width > 0 {
-        draw_members(frame, members, app, theme);
-    }
-    draw_composer(frame, composer, app, theme);
+/// Renders one frame without a live cursor, for the off-screen capture paths.
+pub fn draw_static(frame: &mut Frame, app: &App, theme: &Theme) {
+    let mut clone = app.clone_for_render();
+    let mut media = Media::disabled();
+    draw(frame, &mut clone, &mut media, theme);
 }
 
 fn pane_block<'a>(app: &App, theme: &Theme, pane: Pane, title: String) -> Block<'a> {
@@ -71,7 +68,7 @@ fn pane_block<'a>(app: &App, theme: &Theme, pane: Pane, title: String) -> Block<
 
 // ---------------------------------------------------------------- status ---
 
-fn draw_status(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn draw_status(frame: &mut Frame, area: Rect, app: &App, media: &Media, theme: &Theme) {
     let mut left = vec![
         TuiSpan::styled("yptd", theme.style(HG::StatusTitle)),
         TuiSpan::styled("  ", theme.style(HG::StatusLabel)),
@@ -101,13 +98,23 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let unread = app.snapshot.total_unread();
     let mentions = app.snapshot.total_mentions();
-    let right = TuiLine::from(vec![
+    let mut right_spans = Vec::new();
+    if media.enabled() {
+        right_spans.push(TuiSpan::styled(
+            format!("图 {}  ", media.protocol_name()),
+            theme.style(HG::StatusLabel),
+        ));
+    }
+    let right = TuiLine::from({
+        right_spans.extend([
         TuiSpan::styled("未读 ", theme.style(HG::StatusLabel)),
         TuiSpan::styled(unread.to_string(), theme.style(HG::UnreadBadge)),
         TuiSpan::styled("  提及 ", theme.style(HG::StatusLabel)),
         TuiSpan::styled(mentions.to_string(), theme.style(HG::MentionBadge)),
         TuiSpan::styled(" ", theme.style(HG::StatusLabel)),
-    ])
+        ]);
+        right_spans
+    })
     .right_aligned();
 
     frame.render_widget(Paragraph::new(TuiLine::from(left)), area);
@@ -262,6 +269,8 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let active = app.mode == crate::app::Mode::Insert;
+    let title = format!(" {} ", app.mode.label());
+    let count = app.composer.char_count();
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(theme.border_type(BorderSurface::Composer))
@@ -271,28 +280,48 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             HG::ComposerBorder
         }))
         .title(TuiLine::from(TuiSpan::styled(
-            format!(" {} ", app.mode.label()),
+            title,
             theme.style(HG::ComposerTitle),
         )))
         .title(
             TuiLine::from(TuiSpan::styled(
-                format!(" {}/2000 ", app.composer.chars().count()),
-                theme.style(HG::MessageSecondary),
+                format!(" {count}/2000 "),
+                theme.style(if count > 2000 { HG::Error } else { HG::MessageSecondary }),
             ))
             .right_aligned(),
         );
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    let body = if app.composer.is_empty() && !active {
-        TuiLine::from(TuiSpan::styled(
-            "按 i 输入消息，: 进入命令，Space 打开快捷键",
-            theme.style(HG::Placeholder),
-        ))
-    } else {
-        TuiLine::from(TuiSpan::styled(app.composer.clone(), theme.style(HG::Normal)))
-    };
-    frame.render_widget(Paragraph::new(body), inner);
+    if app.composer.is_empty() && !active {
+        frame.render_widget(
+            Paragraph::new(TuiLine::from(TuiSpan::styled(
+                "按 i 输入消息，: 进入命令，Space 打开快捷键",
+                theme.style(HG::Placeholder),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let lines: Vec<TuiLine<'static>> = app
+        .composer
+        .lines()
+        .map(|line| TuiLine::from(TuiSpan::styled(line.to_owned(), theme.style(HG::Normal))))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if active {
+        // The terminal caret is the only cursor a person trusts; drawing a
+        // fake block would double up with the real one on most terminals.
+        let (line, column) = app.composer.cursor_position();
+        let x = inner.x.saturating_add(column.min(inner.width.saturating_sub(1) as usize) as u16);
+        let y = inner.y.saturating_add(line.min(inner.height.saturating_sub(1) as usize) as u16);
+        frame.set_cursor_position((x, y));
+    }
 }
 
 // -------------------------------------------------------------- messages ---
@@ -302,9 +331,14 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 struct PaneLine {
     message_index: Option<usize>,
     line: TuiLine<'static>,
+    /// Set on the first row of a reserved image block: the cache key and how
+    /// many rows it spans. The remaining rows are blank placeholders, so the
+    /// height is known during layout and cannot shift when the picture is
+    /// finally painted.
+    image: Option<(String, u16)>,
 }
 
-fn draw_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, media: &mut Media, theme: &Theme) {
     let title = match app.conversation() {
         Some(conversation) => format!(
             "{}{}  ·  {} 人",
@@ -323,16 +357,47 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
-    let lines = build_message_lines(app, theme, content_width);
+    let lines = build_message_lines(app, theme, media, content_width);
     let top = viewport_top(app, &lines, inner.height as usize);
-    let visible: Vec<TuiLine<'static>> = lines
+    let window: Vec<PaneLine> = lines
         .into_iter()
         .skip(top)
         .take(inner.height as usize)
-        .map(|entry| entry.line)
         .collect();
 
+    // Record which message each visible row belongs to, so a click resolves
+    // against exactly the frame the user saw.
+    app.message_line_map = window.iter().map(|entry| entry.message_index).collect();
+
+    // Paint the text first so the reserved rows are cleared, then the
+    // pictures on top of them.
+    let images: Vec<(usize, String, u16)> = window
+        .iter()
+        .enumerate()
+        .filter_map(|(row, entry)| {
+            entry.image.as_ref().map(|(key, rows)| (row, key.clone(), *rows))
+        })
+        .collect();
+    let visible: Vec<TuiLine<'static>> = window.into_iter().map(|entry| entry.line).collect();
     frame.render_widget(Paragraph::new(visible), inner);
+
+    for (row, key, rows) in images {
+        let y = inner.y.saturating_add(row as u16);
+        let height = rows.min(inner.y + inner.height - y);
+        if height == 0 {
+            continue;
+        }
+        media.render(
+            frame,
+            Rect {
+                x: inner.x.saturating_add(GUTTER),
+                y,
+                width: inner.width.saturating_sub(GUTTER),
+                height,
+            },
+            &key,
+        );
+    }
 }
 
 /// Chooses the first visible line.
@@ -370,7 +435,8 @@ fn viewport_top(app: &App, lines: &[PaneLine], height: usize) -> usize {
     top.min(total.saturating_sub(height.min(total)))
 }
 
-fn build_message_lines(app: &App, theme: &Theme, width: usize) -> Vec<PaneLine> {
+fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) -> Vec<PaneLine> {
+    let palette = syntax_palette(theme);
     let messages = app.messages();
     let unread_at = app.unread_boundary();
     let mut out: Vec<PaneLine> = Vec::new();
@@ -401,8 +467,16 @@ fn build_message_lines(app: &App, theme: &Theme, width: usize) -> Vec<PaneLine> 
             out.push(gutter_line(Vec::new(), selected, theme, Some(index)));
         }
 
-        for line in render_message(message, theme, width, show_header) {
-            out.push(gutter_line(line, selected, theme, Some(index)));
+        let (lines, preview) = render_message(message, theme, width, show_header, palette, media);
+        let image_row = preview
+            .as_ref()
+            .map(|(_, rows)| lines.len() - *rows as usize);
+        for (offset, line) in lines.into_iter().enumerate() {
+            let mut entry = gutter_line(line, selected, theme, Some(index));
+            if Some(offset) == image_row {
+                entry.image = preview.clone();
+            }
+            out.push(entry);
         }
     }
     out
@@ -422,6 +496,7 @@ fn gutter_line(
     PaneLine {
         message_index,
         line: TuiLine::from(spans),
+        image: None,
     }
 }
 
@@ -435,6 +510,7 @@ fn divider(label: &str, style: Style, width: usize, message_index: usize) -> Pan
             TuiSpan::styled("  ".to_owned(), style),
             TuiSpan::styled(format!("──{label}{}", "─".repeat(rule)), style),
         ]),
+        image: None,
     }
 }
 
@@ -444,15 +520,18 @@ fn render_message(
     theme: &Theme,
     width: usize,
     show_header: bool,
-) -> Vec<Vec<TuiSpan<'static>>> {
+    palette: syntax::Palette,
+    media: &Media,
+) -> (Vec<Vec<TuiSpan<'static>>>, Option<(String, u16)>) {
     let mut out = Vec::new();
+    let mut preview: Option<(String, u16)> = None;
 
     if message.is_system() {
         out.push(vec![TuiSpan::styled(
             format!("— {} —", message.text()),
             theme.style(HG::MessageSecondary),
         )]);
-        return out;
+        return (out, None);
     }
 
     let ghost = message.visibility == Visibility::Ghost;
@@ -505,7 +584,23 @@ fn render_message(
     }
 
     let rich_lines = match &message.body {
-        Body::Markdown(source) => layout_blocks(&parse_markdown(source), width),
+        Body::Markdown(source) => {
+            let mut blocks = parse_markdown(source);
+            // Syntect needs the whole block in order, so highlighting happens
+            // before layout rather than per rendered line.
+            for block in &mut blocks {
+                if let tui_richtext::Block::Code {
+                    language,
+                    lines,
+                    highlights,
+                } = block
+                    && syntax::supported(language.as_deref())
+                {
+                    *highlights = syntax::highlight(language.as_deref(), lines, palette);
+                }
+            }
+            layout_blocks(&blocks, width)
+        }
         _ => {
             let mut rich = RichText::plain(message.text());
             for mention in &message.mentions {
@@ -528,15 +623,27 @@ fn render_message(
     }
 
     if let Some(attachment) = message.attachment() {
-        out.push(vec![TuiSpan::styled(
-            format!(
-                "{} {}  {}",
-                attachment.kind.glyph(),
-                attachment.name,
-                format_bytes(attachment.bytes)
-            ),
-            theme.style(HG::MessageAttachment),
-        )]);
+        let mut label = format!(
+            "{} {}  {}",
+            attachment.kind.glyph(),
+            attachment.name,
+            format_bytes(attachment.bytes)
+        );
+        if let Some(reason) = media.failure(&attachment.name) {
+            label.push_str("  (");
+            label.push_str(reason);
+            label.push(')');
+        }
+        out.push(vec![TuiSpan::styled(label, theme.style(HG::MessageAttachment))]);
+
+        // Reserve the rows now; the picture is painted after the text.
+        let rows = media.rows_for(&attachment.name);
+        if rows > 0 {
+            preview = Some((attachment.name.clone(), rows));
+            for _ in 0..rows {
+                out.push(Vec::new());
+            }
+        }
     }
 
     if !message.reactions.is_empty() {
@@ -554,7 +661,7 @@ fn render_message(
         out.push(spans);
     }
 
-    out
+    (out, preview)
 }
 
 /// Splits a wrapped line into styled runs: one base style per line, inline
@@ -639,6 +746,29 @@ fn span_style(kind: SpanKind, theme: &Theme) -> Style {
         SpanKind::Italic => theme.style(HG::Emphasis),
         SpanKind::Strikethrough => Style::new().add_modifier(Modifier::CROSSED_OUT),
         SpanKind::Timestamp => theme.style(HG::MessageTimestamp),
+        SpanKind::Syntax(rgb) => Style::new().fg(ratatui::style::Color::Rgb(
+            (rgb >> 16) as u8,
+            (rgb >> 8) as u8,
+            rgb as u8,
+        )),
+    }
+}
+
+/// Picks the syntect palette from the terminal's own background, so code does
+/// not come out dark-on-dark or light-on-light.
+fn syntax_palette(theme: &Theme) -> syntax::Palette {
+    match theme.style(HG::Normal).bg {
+        Some(ratatui::style::Color::Rgb(r, g, b)) => {
+            // Rec. 601 luma is close enough to decide light from dark.
+            if (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 > 128 {
+                syntax::Palette::Light
+            } else {
+                syntax::Palette::Dark
+            }
+        }
+        // A terminal-default background is unknown to us; dark is the common
+        // case for terminals and the safer guess for a light-on-dark theme.
+        _ => syntax::Palette::Dark,
     }
 }
 
@@ -782,11 +912,11 @@ mod tests {
         let mut app = app();
         let theme = Theme::default();
         let width = 44;
-        let baseline = build_message_lines(&app, &theme, width).len();
+        let baseline = build_message_lines(&app, &theme, &Media::disabled(), width).len();
         for cursor in 0..app.messages().len() {
             app.message_cursor = cursor;
             assert_eq!(
-                build_message_lines(&app, &theme, width).len(),
+                build_message_lines(&app, &theme, &Media::disabled(), width).len(),
                 baseline,
                 "cursor {cursor} changed the rendered height"
             );
@@ -798,7 +928,7 @@ mod tests {
         let app = app();
         let theme = Theme::default();
         for width in [30usize, 44, 60, 100] {
-            for entry in build_message_lines(&app, &theme, width) {
+            for entry in build_message_lines(&app, &theme, &Media::disabled(), width) {
                 let rendered: String = entry
                     .line
                     .spans
@@ -819,7 +949,7 @@ mod tests {
     fn both_dividers_are_emitted_once() {
         let app = app();
         let theme = Theme::default();
-        let lines = build_message_lines(&app, &theme, 60);
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60);
         let text = |entry: &PaneLine| {
             entry
                 .line
@@ -846,7 +976,7 @@ mod tests {
         app.message_scroll = 0;
         app.message_cursor = 0;
         let theme = Theme::default();
-        let lines = build_message_lines(&app, &theme, 60);
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60);
         let top = viewport_top(&app, &lines, 12);
         let first = lines[top]
             .line
@@ -864,7 +994,7 @@ mod tests {
     fn following_the_live_edge_anchors_the_viewport_to_the_bottom() {
         let app = app();
         let theme = Theme::default();
-        let lines = build_message_lines(&app, &theme, 60);
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60);
         let height = 10;
         assert_eq!(viewport_top(&app, &lines, height), lines.len() - height);
     }
@@ -876,7 +1006,7 @@ mod tests {
         app.message_scroll = 0;
         app.message_cursor = app.messages().len() - 1;
         let theme = Theme::default();
-        let lines = build_message_lines(&app, &theme, 60);
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60);
         let height = 6;
         let top = viewport_top(&app, &lines, height);
         let cursor_line = lines

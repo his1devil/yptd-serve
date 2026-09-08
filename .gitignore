@@ -1,3 +1,10 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Go 构建产物与 SDK 运行时文件
+/server/yptd-server
+/sidecar/yptd-sidecar
+/sidecar/logs/
+/sidecar/OpenIM.log*
+**/*.log

@@ -242,15 +242,24 @@ pub fn layout_blocks(blocks: &[Block], width: usize) -> Vec<Line> {
                     }),
                 ));
             }
-            Block::Code { language, lines: code } => {
-                lines.extend(code_block(language.as_deref(), code, width));
+            Block::Code {
+                language,
+                lines: code,
+                highlights,
+            } => {
+                lines.extend(code_block(language.as_deref(), code, highlights, width));
             }
         }
     }
     lines
 }
 
-fn code_block(language: Option<&str>, code: &[String], width: usize) -> Vec<Line> {
+fn code_block(
+    language: Option<&str>,
+    code: &[String],
+    highlights: &[Vec<Span>],
+    width: usize,
+) -> Vec<Line> {
     // Two side bars and a space of padding on each side.
     let inner = width.saturating_sub(4).max(1);
     let bar = |text: &str| Prefix {
@@ -278,7 +287,8 @@ fn code_block(language: Option<&str>, code: &[String], width: usize) -> Vec<Line
         source_end: 0,
     });
 
-    for source_line in code {
+    for (index, source_line) in code.iter().enumerate() {
+        let line_spans: &[Span] = highlights.get(index).map(Vec::as_slice).unwrap_or(&[]);
         // Code is never word-wrapped: a break inside an identifier is worse
         // than a hard cut at the edge, which at least stays column-aligned.
         let pieces = break_points(source_line, inner);
@@ -290,7 +300,7 @@ fn code_block(language: Option<&str>, code: &[String], width: usize) -> Vec<Line
                 suffix: Some(bar(" │")),
                 // Padded so the right edge lines up under the corner above.
                 text: format!("{text}{}", " ".repeat(inner.saturating_sub(text.width()))),
-                spans: Vec::new(),
+                spans: slice_spans(line_spans, start, end),
                 style: LineStyle::Code,
                 source_start: start,
                 source_end: end,
@@ -429,6 +439,7 @@ mod tests {
         let blocks = vec![Block::Code {
             language: Some("bash".to_owned()),
             lines: vec!["./scripts/rollback.sh --dry-run".to_owned()],
+            highlights: Vec::new(),
         }];
         let lines = layout_blocks(&blocks, 20);
         assert_eq!(lines.first().map(|l| l.style), Some(LineStyle::CodeBorder));

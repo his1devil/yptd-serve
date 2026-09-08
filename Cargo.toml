@@ -11,6 +11,10 @@ repository = "https://github.com/his1devil/yptd-tui"
 [workspace.dependencies]
 crossterm = "0.29"
 ratatui = "0.30.0"
+ratatui-image = { version = "11.0.5", default-features = false, features = ["crossterm", "image-defaults"] }
+image = "0.25"
+# default-fancy 用纯 Rust 的 fancy-regex，避开 oniguruma 的 C 依赖
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 unicode-segmentation = "1.12"
@@ -18,4 +22,5 @@ unicode-width = "0.2"
 
 im-model = { path = "crates/im-model" }
 tui-richtext = { path = "crates/tui-richtext" }
+tui-textedit = { path = "crates/tui-textedit" }
 tui-theme = { path = "crates/tui-theme" }
