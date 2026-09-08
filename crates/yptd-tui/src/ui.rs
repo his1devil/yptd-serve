@@ -15,6 +15,7 @@ use tui_theme::{BorderSurface, HighlightGroup as HG, Theme};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, NavRow, Pane};
+use crate::browser::{Browser, Kind as BrowseKind};
 use crate::picker::Picker;
 use crate::layout;
 use crate::media::Media;
@@ -45,6 +46,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, media: &mut Media, theme: &Theme) 
     draw_composer(frame, areas.composer, app, theme);
     if let Some(picker) = &app.picker {
         draw_picker(frame, frame.area(), picker, theme);
+    }
+    if let Some(browser) = &app.browser {
+        draw_browser(frame, frame.area(), browser, theme);
     }
 }
 
@@ -163,6 +167,123 @@ fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, theme: &Theme) {
 
     // The caret lives in the filter: typing is the primary gesture here.
     let column = 2 + picker.filter.width() as u16;
+    frame.set_cursor_position((inner.x + column.min(inner.width - 1), inner.y));
+}
+
+/// The file browser. Same shape as the picker, plus a directory to walk.
+fn draw_browser(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Theme) {
+    let entries = browser.visible();
+    let width = area.width.saturating_sub(4).clamp(30, 72);
+    let rows = entries.len().clamp(1, 12) as u16;
+    let height = (rows + 4).min(area.height.saturating_sub(2)).max(6);
+    let rect = centered(area, width, height);
+    frame.render_widget(Clear, rect);
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(theme.border_type(BorderSurface::Picker))
+        .border_style(theme.style(HG::PickerBorder))
+        .title(TuiLine::from(TuiSpan::styled(
+            // The tail of a path is what identifies it, so a long one loses
+            // its head rather than its name.
+            format!(
+                " 选择图片 · {} ",
+                truncate_left(&browser.dir_label(), width.saturating_sub(14) as usize)
+            ),
+            theme.style(HG::ModalTitle),
+        )));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height < 3 || inner.width < 10 {
+        return;
+    }
+
+    let filter = if browser.filter.is_empty() {
+        TuiLine::from(vec![
+            TuiSpan::styled("› ", theme.style(HG::Muted)),
+            TuiSpan::styled("输入过滤", theme.style(HG::Placeholder)),
+        ])
+    } else {
+        TuiLine::from(vec![
+            TuiSpan::styled("› ", theme.style(HG::Muted)),
+            TuiSpan::styled(browser.filter.clone(), theme.style(HG::Normal)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(filter), Rect { height: 1, ..inner });
+
+    let list_height = inner.height.saturating_sub(2) as usize;
+    let start = browser.cursor.saturating_sub(list_height.saturating_sub(1));
+    let mut lines: Vec<TuiLine<'static>> = Vec::new();
+    if let Some(error) = &browser.error {
+        lines.push(TuiLine::from(TuiSpan::styled(
+            format!("  {error}"),
+            theme.style(HG::Error),
+        )));
+    } else if entries.is_empty() {
+        lines.push(TuiLine::from(TuiSpan::styled(
+            "  这里没有图片",
+            theme.style(HG::Muted),
+        )));
+    }
+    for (row, entry) in entries.iter().enumerate().skip(start).take(list_height) {
+        let at_cursor = row == browser.cursor;
+        let mut spans = vec![TuiSpan::styled(
+            if at_cursor { SELECTED_MARK } else { UNSELECTED_MARK },
+            theme.style(HG::SelectionMarker),
+        )];
+        match entry.kind {
+            BrowseKind::Parent | BrowseKind::Directory => {
+                spans.push(TuiSpan::styled("📁 ", theme.style(HG::Muted)));
+                spans.push(TuiSpan::styled(
+                    entry.name.clone(),
+                    theme.style(if at_cursor { HG::SelectedRow } else { HG::Strong }),
+                ));
+            }
+            BrowseKind::Image => {
+                let ticked = browser.is_selected(entry);
+                spans.push(TuiSpan::styled(
+                    if ticked { "[x] " } else { "[ ] " },
+                    theme.style(if ticked { HG::Selection } else { HG::Muted }),
+                ));
+                spans.push(TuiSpan::styled(
+                    entry.name.clone(),
+                    theme.style(if at_cursor { HG::SelectedRow } else { HG::Normal }),
+                ));
+                spans.push(TuiSpan::styled(
+                    format!("  {}", format_bytes(entry.bytes)),
+                    theme.style(HG::Description),
+                ));
+            }
+        }
+        lines.push(TuiLine::from(spans));
+    }
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            y: inner.y + 1,
+            height: list_height as u16,
+            ..inner
+        },
+    );
+
+    let picked = browser.selected_count();
+    let hint = if picked > 0 {
+        format!("已选 {picked} 张   Space 勾选  Enter 发送  Esc 取消")
+    } else {
+        "↑↓ 移动  Enter 进目录 / 选中  Space 多选  Backspace 上一级".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(TuiLine::from(TuiSpan::styled(
+            truncate(&hint, inner.width as usize),
+            theme.style(HG::Hint),
+        ))),
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+    );
+    let column = 2 + browser.filter.width() as u16;
     frame.set_cursor_position((inner.x + column.min(inner.width - 1), inner.y));
 }
 
@@ -440,11 +561,44 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
     }
 
+    if !app.pending.is_empty() {
+        let names: Vec<String> = app
+            .pending
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string())
+            })
+            .collect();
+        let summary = format!("{} 个待发：{}", names.len(), names.join("  "));
+        frame.render_widget(
+            Paragraph::new(TuiLine::from(vec![
+                TuiSpan::styled("📎 ", theme.style(HG::MessageAttachment)),
+                TuiSpan::styled(
+                    truncate(&summary, inner.width.saturating_sub(3) as usize),
+                    theme.style(HG::Tag),
+                ),
+            ])),
+            Rect { height: 1, ..inner },
+        );
+        inner = Rect {
+            y: inner.y + 1,
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        if inner.height == 0 {
+            return;
+        }
+    }
+
     if app.composer.is_empty() && !active {
         frame.render_widget(
             Paragraph::new(TuiLine::from(TuiSpan::styled(
                 if app.reply_to.is_some() {
                     "按 i 输入回复，Esc 取消引用"
+                } else if !app.pending.is_empty() {
+                    "按 i 补一句说明，Enter 发送，Esc 取消"
                 } else if app.snapshot.conversations.is_empty() {
                     "按 : 输入 :new 群名 建群，或 :dm 找人私聊"
                 } else {
@@ -529,16 +683,105 @@ fn draw_empty_state(frame: &mut Frame, inner: Rect, theme: &Theme) {
 
 // -------------------------------------------------------------- messages ---
 
+/// The line above a picture block: a filename when there is one picture, a
+/// count when there are several.
+fn attachment_label(
+    attachments: &[&im_model::Attachment],
+    media: &Media,
+    theme: &Theme,
+) -> Vec<TuiSpan<'static>> {
+    let glyph = attachments[0].kind.glyph();
+    if attachments.len() > 1 {
+        return vec![TuiSpan::styled(
+            format!("{glyph} {} 张图片", attachments.len()),
+            theme.style(HG::MessageAttachment),
+        )];
+    }
+    let attachment = attachments[0];
+    let key = attachment.key();
+    let mut label = format!("{glyph} {}", attachment.name);
+    // OpenIM records no byte count for an uploaded picture, so prefer the
+    // pixel size once it is decoded -- more useful for an image anyway --
+    // and print nothing rather than a confident "0 B".
+    if let Some((w, h)) = media.dimensions(key) {
+        label.push_str(&format!("  {w}×{h}"));
+    } else if attachment.bytes > 0 {
+        label.push_str("  ");
+        label.push_str(&format_bytes(attachment.bytes));
+    }
+    if let Some(reason) = media.failure(key) {
+        label.push_str("  (");
+        label.push_str(reason);
+        label.push(')');
+    }
+    vec![TuiSpan::styled(label, theme.style(HG::MessageAttachment))]
+}
+
+/// Lays out a run's pictures, or `None` when none of them can be drawn.
+///
+/// A picture whose size is not known yet still gets a tile, using a common
+/// photo shape: reserving its space up front means the block does not jump
+/// when the download lands.
+fn album_placement(
+    attachments: &[&im_model::Attachment],
+    media: &Media,
+    width: usize,
+) -> Option<Placement> {
+    let cell = media.cell_size()?;
+    const ASSUMED: crate::album::Source = crate::album::Source { width: 1600, height: 1200 };
+    let drawable: Vec<&&im_model::Attachment> = attachments
+        .iter()
+        .filter(|a| a.kind == im_model::AttachmentKind::Image && media.failure(a.key()).is_none())
+        .collect();
+    if drawable.is_empty() {
+        return None;
+    }
+    let sources: Vec<crate::album::Source> = drawable
+        .iter()
+        .map(|a| {
+            media
+                .dimensions(a.key())
+                .map(|(width, height)| crate::album::Source { width, height })
+                .unwrap_or(ASSUMED)
+        })
+        .collect();
+    let columns = u16::try_from(width).unwrap_or(u16::MAX);
+    let album = crate::album::layout(&sources, columns, cell);
+    if album.is_empty() {
+        return None;
+    }
+    Some(Placement {
+        keys: drawable.iter().map(|a| a.key().to_owned()).collect(),
+        tiles: album.tiles,
+    })
+}
+
+fn block_height(placement: &Placement) -> u16 {
+    placement
+        .tiles
+        .iter()
+        .map(|tile| tile.y.saturating_add(tile.height))
+        .max()
+        .unwrap_or(0)
+}
+
 /// One flattened output line plus the message it belongs to, so the gutter and
 /// the scroll arithmetic can both work in line space.
 struct PaneLine {
     message_index: Option<usize>,
     line: TuiLine<'static>,
-    /// Set on the first row of a reserved image block: the cache key and how
-    /// many rows it spans. The remaining rows are blank placeholders, so the
-    /// height is known during layout and cannot shift when the picture is
-    /// finally painted.
-    image: Option<(String, u16)>,
+    /// Set on the first row of a reserved picture block. The rows below it
+    /// are blank placeholders, so the height is known during layout and
+    /// cannot shift when the pictures are finally painted.
+    album: Option<Placement>,
+}
+
+/// Where a block's pictures go, relative to the row that carries it.
+#[derive(Clone, Debug)]
+struct Placement {
+    /// Media cache keys, in the order the tiles index them.
+    keys: Vec<String>,
+    tiles: Vec<crate::album::Tile>,
 }
 
 fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, media: &mut Media, theme: &Theme) {
@@ -582,32 +825,38 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, media: &mut Media
 
     // Paint the text first so the reserved rows are cleared, then the
     // pictures on top of them.
-    let images: Vec<(usize, String, u16)> = window
+    let blocks: Vec<(usize, Placement)> = window
         .iter()
         .enumerate()
-        .filter_map(|(row, entry)| {
-            entry.image.as_ref().map(|(key, rows)| (row, key.clone(), *rows))
-        })
+        .filter_map(|(row, entry)| entry.album.clone().map(|album| (row, album)))
         .collect();
     let visible: Vec<TuiLine<'static>> = window.into_iter().map(|entry| entry.line).collect();
     frame.render_widget(Paragraph::new(visible), inner);
 
-    for (row, key, rows) in images {
-        let y = inner.y.saturating_add(row as u16);
-        let height = rows.min(inner.y + inner.height - y);
-        if height == 0 {
-            continue;
+    let bottom = inner.y.saturating_add(inner.height);
+    for (row, placement) in blocks {
+        let top = inner.y.saturating_add(row as u16);
+        for tile in &placement.tiles {
+            let Some(key) = placement.keys.get(tile.index) else {
+                continue;
+            };
+            let y = top.saturating_add(tile.y);
+            if y >= bottom {
+                continue;
+            }
+            // A block scrolled half off the bottom paints only what fits.
+            let height = tile.height.min(bottom - y);
+            let x = inner.x.saturating_add(GUTTER).saturating_add(tile.x);
+            let right = inner.x.saturating_add(inner.width);
+            if height == 0 || x >= right {
+                continue;
+            }
+            let width = tile.width.min(right - x);
+            if width == 0 {
+                continue;
+            }
+            media.render(frame, Rect { x, y, width, height }, key);
         }
-        media.render(
-            frame,
-            Rect {
-                x: inner.x.saturating_add(GUTTER),
-                y,
-                width: inner.width.saturating_sub(GUTTER),
-                height,
-            },
-            &key,
-        );
     }
 }
 
@@ -626,22 +875,26 @@ fn viewport_top(app: &App, lines: &[PaneLine], height: usize) -> usize {
         lines
             .iter()
             .position(|entry| entry.message_index == Some(message_index))
-            .unwrap_or(0)
     };
     let last_line_of = |message_index: usize| {
         lines
             .iter()
             .rposition(|entry| entry.message_index == Some(message_index))
-            .unwrap_or(0)
     };
 
-    let mut top = first_line_of(app.message_scroll).min(total.saturating_sub(1));
-    let cursor_start = first_line_of(app.message_cursor);
-    let cursor_end = last_line_of(app.message_cursor);
-    if cursor_start < top {
-        top = cursor_start;
-    } else if cursor_end >= top + height {
-        top = cursor_end.saturating_sub(height.saturating_sub(1));
+    let mut top = first_line_of(app.message_scroll)
+        .unwrap_or(0)
+        .min(total.saturating_sub(1));
+    // A message with no rows of its own -- one folded into a picture block --
+    // must leave the viewport where it is rather than snapping to the top.
+    if let (Some(cursor_start), Some(cursor_end)) =
+        (first_line_of(app.message_cursor), last_line_of(app.message_cursor))
+    {
+        if cursor_start < top {
+            top = cursor_start;
+        } else if cursor_end >= top + height {
+            top = cursor_end.saturating_sub(height.saturating_sub(1));
+        }
     }
     top.min(total.saturating_sub(height.min(total)))
 }
@@ -652,7 +905,14 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
     let unread_at = app.unread_boundary();
     let mut out: Vec<PaneLine> = Vec::new();
 
+    let runs = album_runs(&messages);
     for (index, message) in messages.iter().enumerate() {
+        // A picture that belongs to the block started earlier draws nothing
+        // of its own; its rows are inside that block.
+        if runs[index].0 != index {
+            continue;
+        }
+        let run_len = runs[index].1;
         let previous = index.checked_sub(1).and_then(|i| messages.get(i)).copied();
 
         if starts_new_day(message, previous, app.utc_offset_ms) {
@@ -672,25 +932,87 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
             ));
         }
 
-        let selected = app.pane == Pane::Messages && index == app.message_cursor;
         let show_header = starts_author_group(message, previous);
         if show_header && index > 0 {
-            out.push(gutter_line(Vec::new(), selected, theme, Some(index)));
+            out.push(gutter_line(
+                Vec::new(),
+                selected_run(app, index, run_len),
+                theme,
+                Some(index),
+            ));
         }
 
-        let (lines, preview) = render_message(message, theme, width, show_header, palette, media, app.utc_offset_ms);
-        let image_row = preview
-            .as_ref()
-            .map(|(_, rows)| lines.len() - *rows as usize);
+        let run = &messages[index..index + run_len];
+        let (lines, preview) = render_message(
+            run,
+            theme,
+            width,
+            show_header,
+            palette,
+            media,
+            app.utc_offset_ms,
+        );
+        let block_rows = preview.as_ref().map(block_height).unwrap_or(0) as usize;
+        let first_block_row = lines.len() - block_rows;
         for (offset, line) in lines.into_iter().enumerate() {
-            let mut entry = gutter_line(line, selected, theme, Some(index));
-            if Some(offset) == image_row {
-                entry.image = preview.clone();
+            // Rows inside a block belong to the pictures they cover, so the
+            // cursor can still land on each message of the run.
+            let owner = match offset.checked_sub(first_block_row) {
+                Some(within) if block_rows > 0 => index + within.min(run_len - 1),
+                _ => index,
+            };
+            let mut entry = gutter_line(line, selected_run(app, index, run_len), theme, Some(owner));
+            if offset == first_block_row && block_rows > 0 {
+                entry.album = preview.clone();
             }
             out.push(entry);
         }
     }
     out
+}
+
+/// For each message, which message starts its picture block and how long that
+/// block is. A message that is not part of one is a block of its own.
+///
+/// Sending four pictures is four messages, because OpenIM has no message that
+/// carries more than one. Drawing them as four separate blocks would bury the
+/// conversation, so consecutive pictures from one person, sent close
+/// together, are drawn as a single block.
+fn album_runs(messages: &[&Message]) -> Vec<(usize, usize)> {
+    /// Pictures further apart than this were two thoughts, not one batch.
+    const GROUP_MS: i64 = 60_000;
+    let groupable = |m: &Message| {
+        m.attachment().is_some_and(|a| a.kind == im_model::AttachmentKind::Image)
+            && m.text().is_empty()
+            && m.quote.is_none()
+            && m.reactions.is_empty()
+            && m.visibility == Visibility::Broadcast
+    };
+
+    let mut runs = vec![(0usize, 1usize); messages.len()];
+    let mut index = 0;
+    while index < messages.len() {
+        let mut end = index + 1;
+        if groupable(messages[index]) {
+            while end < messages.len()
+                && groupable(messages[end])
+                && messages[end].sender == messages[index].sender
+                && messages[end].sent_at_ms() - messages[end - 1].sent_at_ms() <= GROUP_MS
+            {
+                end += 1;
+            }
+        }
+        for member in index..end {
+            runs[member] = (index, end - index);
+        }
+        index = end;
+    }
+    runs
+}
+
+/// Whether the cursor is anywhere inside this block.
+fn selected_run(app: &App, start: usize, len: usize) -> bool {
+    app.pane == Pane::Messages && (start..start + len).contains(&app.message_cursor)
 }
 
 fn gutter_line(
@@ -707,7 +1029,7 @@ fn gutter_line(
     PaneLine {
         message_index,
         line: TuiLine::from(spans),
-        image: None,
+        album: None,
     }
 }
 
@@ -721,22 +1043,23 @@ fn divider(label: &str, style: Style, width: usize, message_index: usize) -> Pan
             TuiSpan::styled("  ".to_owned(), style),
             TuiSpan::styled(format!("──{label}{}", "─".repeat(rule)), style),
         ]),
-        image: None,
+        album: None,
     }
 }
 
 /// Renders one message to spans-per-line, without the gutter.
 fn render_message(
-    message: &Message,
+    run: &[&Message],
     theme: &Theme,
     width: usize,
     show_header: bool,
     palette: syntax::Palette,
     media: &Media,
     utc_offset_ms: i64,
-) -> (Vec<Vec<TuiSpan<'static>>>, Option<(String, u16)>) {
+) -> (Vec<Vec<TuiSpan<'static>>>, Option<Placement>) {
+    let message = run[0];
     let mut out = Vec::new();
-    let mut preview: Option<(String, u16)> = None;
+    let mut preview: Option<Placement> = None;
 
     if message.is_system() {
         out.push(vec![TuiSpan::styled(
@@ -836,32 +1159,15 @@ fn render_message(
         out.push(rich_line_to_spans(line, theme, ghost));
     }
 
-    if let Some(attachment) = message.attachment() {
-        let mut label = format!("{} {}", attachment.kind.glyph(), attachment.name);
-        let key = attachment.key();
-        // OpenIM records no byte count for an uploaded picture, so prefer the
-        // pixel size once it is decoded -- more useful for an image anyway --
-        // and print nothing rather than a confident "0 B".
-        if let Some((w, h)) = media.dimensions(key) {
-            label.push_str(&format!("  {w}×{h}"));
-        } else if attachment.bytes > 0 {
-            label.push_str("  ");
-            label.push_str(&format_bytes(attachment.bytes));
-        }
-        if let Some(reason) = media.failure(key) {
-            label.push_str("  (");
-            label.push_str(reason);
-            label.push(')');
-        }
-        out.push(vec![TuiSpan::styled(label, theme.style(HG::MessageAttachment))]);
-
-        // Reserve the rows now; the picture is painted after the text.
-        let rows = media.rows_for(key);
-        if rows > 0 {
-            preview = Some((key.to_owned(), rows));
-            for _ in 0..rows {
+    let attachments: Vec<&im_model::Attachment> =
+        run.iter().filter_map(|m| m.attachment()).collect();
+    if !attachments.is_empty() {
+        out.push(attachment_label(&attachments, media, theme));
+        if let Some(placement) = album_placement(&attachments, media, width) {
+            for _ in 0..block_height(&placement) {
                 out.push(Vec::new());
             }
+            preview = Some(placement);
         }
     }
 
@@ -1060,6 +1366,26 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Truncates from the left, keeping the end. For a path, the end is the part
+/// that says which directory this is.
+fn truncate_left(value: &str, width: usize) -> String {
+    if value.width() <= width || width < 2 {
+        return value.to_owned();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 1; // the leading ellipsis
+    for c in value.chars().rev() {
+        let cell = c.to_string().width().max(1);
+        if used + cell > width {
+            break;
+        }
+        kept.push(c);
+        used += cell;
+    }
+    kept.reverse();
+    format!("…{}", kept.into_iter().collect::<String>())
 }
 
 /// Truncates to a display width, counting CJK as two cells.

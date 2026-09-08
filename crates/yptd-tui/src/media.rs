@@ -99,6 +99,16 @@ impl Media {
         self.sizes.get(key).copied()
     }
 
+    /// How many pixels one terminal cell covers, once the protocol has been
+    /// negotiated. `None` when pictures cannot be drawn at all.
+    pub fn cell_size(&self) -> Option<crate::album::CellSize> {
+        let size = self.picker.as_ref()?.font_size();
+        (size.width > 0 && size.height > 0).then_some(crate::album::CellSize {
+            width: size.width,
+            height: size.height,
+        })
+    }
+
     /// Rows this image occupies, from its aspect ratio and the terminal's
     /// cell geometry. Zero when there is nothing to draw.
     pub fn rows_for(&self, key: &str) -> u16 {

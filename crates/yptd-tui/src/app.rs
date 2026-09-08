@@ -6,6 +6,9 @@ use im_model::{
 };
 use tui_textedit::TextArea;
 
+use std::path::PathBuf;
+
+use crate::browser::Browser;
 use crate::picker::Picker;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +122,15 @@ pub struct App {
     /// Who the draft mentions so far. Recorded when `@` picks somebody, then
     /// filtered at send time against what is actually still in the text.
     pub draft_mentions: Vec<DraftMention>,
+    /// Pictures staged for the next send. Dragging files in or picking them
+    /// from the browser puts them here rather than sending at once, so a
+    /// caption can be typed and several pictures can go together.
+    pub pending: Vec<PathBuf>,
+    /// The file browser, when it is open. Like the picker it owns the
+    /// keyboard while it is up.
+    pub browser: Option<Browser>,
+    /// Where the browser was last time, so it reopens where it was left.
+    pub last_dir: Option<PathBuf>,
 }
 
 impl App {
@@ -148,6 +160,9 @@ impl App {
             picker: None,
             reply_to: None,
             draft_mentions: Vec::new(),
+            pending: Vec::new(),
+            browser: None,
+            last_dir: None,
         };
         app.jump_to_latest();
         app
@@ -176,6 +191,9 @@ impl App {
             picker: self.picker.clone(),
             reply_to: self.reply_to,
             draft_mentions: self.draft_mentions.clone(),
+            pending: self.pending.clone(),
+            browser: self.browser.clone(),
+            last_dir: self.last_dir.clone(),
         }
     }
 
@@ -193,9 +211,32 @@ impl App {
     }
 
     /// How many rows the composer needs: its text, plus one for the strip
-    /// naming what the draft is replying to.
+    /// naming what the draft is replying to and one for staged pictures.
     pub fn composer_rows(&self) -> usize {
-        self.composer.lines().count().max(1) + usize::from(self.reply_to.is_some())
+        self.composer.lines().count().max(1)
+            + usize::from(self.reply_to.is_some())
+            + usize::from(!self.pending.is_empty())
+    }
+
+    /// Stages pictures for the next send, ignoring ones already staged.
+    ///
+    /// Returns how many were added. The cap is not a protocol limit -- each
+    /// picture is its own message -- but sending twenty at once is almost
+    /// always a mistake, and the album only draws four anyway.
+    pub fn attach(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> usize {
+        const MAX_PENDING: usize = 10;
+        let mut added = 0;
+        for path in paths {
+            if self.pending.len() >= MAX_PENDING {
+                break;
+            }
+            if self.pending.contains(&path) {
+                continue;
+            }
+            self.pending.push(path);
+            added += 1;
+        }
+        added
     }
 
     /// The message under the message-pane cursor.
@@ -221,10 +262,17 @@ impl App {
         }
     }
 
-    /// Drops the reply and every mention, leaving the typed text alone.
+    /// Whether anything besides the typed text is attached to this draft.
+    pub fn has_draft_context(&self) -> bool {
+        self.reply_to.is_some() || !self.pending.is_empty() || !self.draft_mentions.is_empty()
+    }
+
+    /// Drops the reply, the mentions and the staged pictures, leaving the
+    /// typed text alone.
     pub fn clear_draft_context(&mut self) {
         self.reply_to = None;
         self.draft_mentions.clear();
+        self.pending.clear();
     }
 
     pub fn messages(&self) -> Vec<&Message> {

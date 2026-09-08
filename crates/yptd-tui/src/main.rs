@@ -6,8 +6,11 @@
 //! `--mock` flag and the capture modes keep the renderer testable without a
 //! server.
 
+mod album;
 mod app;
+mod attach;
 mod auth;
+mod browser;
 mod config;
 mod downloads;
 mod layout;
@@ -26,7 +29,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use im_model::{Conversation, ConversationId, ConversationKind, Member, Role, Snapshot, UserId};
@@ -37,7 +41,8 @@ use crate::config::{Config, Credentials, Paths};
 use crate::downloads::Downloads;
 use crate::picker::{PickItem, Picker, Purpose, Verdict};
 use crate::render::{Palette, Scene};
-use crate::session::Session;
+use crate::browser::{Browser, Verdict as BrowseVerdict};
+use crate::session::{Session, Uploads};
 
 type Fallible<T> = Result<T, Box<dyn Error>>;
 
@@ -56,15 +61,15 @@ const USAGE: &str = "yptd — 终端 IM 客户端
   yptd --ansi     WxH [scene]             离屏出帧（ANSI）
   yptd --html     WxH [scene] [palette]   离屏出帧（HTML）
 
-界面里：r 引用选中的消息，输入时 @ 提及群成员，
-: 输命令：:new 群名 · :invite [用户…] · :dm [用户] · :img 路径 · :help · :q
+界面里：r 引用选中的消息，输入时 @ 提及群成员，把图片文件拖进窗口即可附带，
+: 输命令：:new 群名 · :invite [用户…] · :dm [用户] · :img [路径] · :help · :q
 
 文件都在 ~/.yptd/（或 $YPTD_HOME）。边车二进制通过 $YPTD_SIDECAR、
 yptd 同目录或 PATH 查找。
 ";
 
 const HELP_LINE: &str =
-    ":new 群名 · :invite [用户…] · :dm [用户] · :img 路径 · :q 退出";
+    ":new 群名 · :invite [用户…] · :dm [用户] · :img [路径] 选图 · :q 退出";
 
 /// Shown wherever an action needs a conversation and there is none. Names the
 /// two commands that create one, because a new account starts here.
@@ -468,6 +473,9 @@ enum Input {
     /// A picture finished downloading: its cache key, and the bytes or the
     /// reason there are none.
     Image(downloads::Fetched),
+    /// A staged picture finished uploading, carrying the SDK's echo of the
+    /// message it became.
+    Sent(Result<serde_json::Value, im_sidecar::Error>),
     /// A source closed; the loop decides whether that is fatal.
     Closed(&'static str),
 }
@@ -521,7 +529,10 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
     };
 
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    // Bracketed paste is what turns a dragged file into one event instead of
+    // a burst of keystrokes that would land in the composer character by
+    // character.
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let mut clicks = mouse::Clicks::default();
     // Protocol negotiation talks to the terminal, so it happens once at
     // startup rather than on the first message that carries a picture.
@@ -532,6 +543,10 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
         Downloads::start(cache, tx.clone(), Input::Image)
     } else {
         Downloads::disabled()
+    };
+    let mut uploads = match backend.as_ref() {
+        Some(b) => b.session.uploads(tx.clone(), Input::Sent),
+        None => Uploads::disabled(),
     };
     if backend.is_none() {
         load_fixture_images(&mut media, &app);
@@ -606,7 +621,14 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
 
         match input {
             Input::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                if let Flow::Quit = on_key(&mut app, backend.as_mut(), key.code, key.modifiers) {
+                let flow = on_key(
+                    &mut app,
+                    backend.as_mut(),
+                    &mut uploads,
+                    key.code,
+                    key.modifiers,
+                );
+                if let Flow::Quit = flow {
                     break Ok(());
                 }
                 // Foreground input always paints at once; latency here is
@@ -615,7 +637,7 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
             }
             Input::Terminal(Event::Mouse(m)) => {
                 // A modal owns the screen; clicks underneath it do nothing.
-                if app.picker.is_none() {
+                if app.picker.is_none() && app.browser.is_none() {
                     let rows = app.composer_rows();
                     let out = mouse::handle(&mut app, m, area, rows, &mut clicks);
                     if out.activate {
@@ -624,8 +646,28 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
                     dirty = out.redraw;
                 }
             }
+            Input::Terminal(Event::Paste(text)) => {
+                on_paste(&mut app, &text);
+                dirty = true;
+            }
             Input::Terminal(Event::Resize(_, _)) => dirty = true,
             Input::Terminal(_) => {}
+            Input::Sent(outcome) => {
+                let left = uploads.finished();
+                match outcome {
+                    Ok(sent) => {
+                        if let Some(b) = backend.as_mut() {
+                            b.session.absorb(sent, &mut app.snapshot);
+                        }
+                        app.notice = (left > 0).then(|| format!("还有 {left} 张在发"));
+                        if app.follow_latest {
+                            app.jump_to_latest();
+                        }
+                    }
+                    Err(e) => app.notice = Some(format!("图片发送失败: {e}")),
+                }
+                dirty = true;
+            }
             Input::Sidecar(ev) => {
                 if let Some(b) = backend.as_mut() {
                     let mut changed = b.session.apply(&ev, &mut app.snapshot);
@@ -683,7 +725,7 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
         }
     };
 
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -744,7 +786,30 @@ enum Flow {
 }
 
 /// One keypress, routed: the modal first if one is open, then the mode map.
-fn on_key(app: &mut App, mut backend: Option<&mut Backend>, code: KeyCode, modifiers: KeyModifiers) -> Flow {
+fn on_key(
+    app: &mut App,
+    mut backend: Option<&mut Backend>,
+    uploads: &mut Uploads,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> Flow {
+    if let Some(browser) = app.browser.as_mut() {
+        match browser.handle_key(code, modifiers) {
+            BrowseVerdict::Continue => {}
+            BrowseVerdict::Cancel => {
+                app.last_dir = Some(browser.dir().to_path_buf());
+                app.browser = None;
+            }
+            BrowseVerdict::Confirm(paths) => {
+                app.last_dir = Some(browser.dir().to_path_buf());
+                app.browser = None;
+                let added = app.attach(paths);
+                app.mode = Mode::Insert;
+                app.notice = Some(format!("已选 {added} 张，Enter 发送，Esc 取消"));
+            }
+        }
+        return Flow::Continue;
+    }
     if let Some(picker) = app.picker.as_mut() {
         match picker.handle_key(code, modifiers) {
             Verdict::Continue => {}
@@ -759,7 +824,7 @@ fn on_key(app: &mut App, mut backend: Option<&mut Backend>, code: KeyCode, modif
     match handle_key(app, code, modifiers) {
         KeyAction::Quit => Flow::Quit,
         KeyAction::Send => {
-            send_composer(app, backend.map(|b| &mut b.session));
+            send_composer(app, backend.map(|b| &mut b.session), uploads);
             Flow::Continue
         }
         KeyAction::Command(line) => execute_command(app, backend, &line),
@@ -782,9 +847,14 @@ fn on_key(app: &mut App, mut backend: Option<&mut Backend>, code: KeyCode, modif
 }
 
 /// Sends what is in the composer, or explains why it cannot.
-fn send_composer(app: &mut App, session: Option<&mut Session>) {
+///
+/// Text first, then the staged pictures: OpenIM has no message that carries
+/// both, and a caption reads as a caption only when it arrives before what it
+/// captions.
+fn send_composer(app: &mut App, session: Option<&mut Session>, uploads: &mut Uploads) {
     let text = app.composer.text().to_owned();
-    if text.trim().is_empty() {
+    let has_text = !text.trim().is_empty();
+    if !has_text && app.pending.is_empty() {
         return;
     }
     if !app.has_open_conversation() {
@@ -795,15 +865,51 @@ fn send_composer(app: &mut App, session: Option<&mut Session>) {
         app.notice = Some("示例模式下不能发送".into());
         return;
     };
-    let mentions = app::live_mentions(&text, &app.draft_mentions);
-    match s.send_text(&app.open, &text, app.reply_to, &mentions, &mut app.snapshot) {
-        Ok(()) => {
-            app.composer.clear();
-            app.clear_draft_context();
-            app.jump_to_latest();
+
+    if has_text {
+        let mentions = app::live_mentions(&text, &app.draft_mentions);
+        if let Err(e) = s.send_text(&app.open, &text, app.reply_to, &mentions, &mut app.snapshot) {
+            app.notice = Some(format!("发送失败: {e}"));
+            return;
         }
-        Err(e) => app.notice = Some(format!("发送失败: {e}")),
+        app.composer.clear();
     }
+
+    let staged = std::mem::take(&mut app.pending);
+    let count = staged.len();
+    for path in staged {
+        if !uploads.queue(&app.open, path) {
+            app.notice = Some("发不了图片：上传队列没起来".into());
+            break;
+        }
+    }
+    if count > 0 {
+        app.notice = Some(format!("正在发送 {count} 张图片…"));
+    }
+    app.reply_to = None;
+    app.draft_mentions.clear();
+    app.jump_to_latest();
+}
+
+/// A paste is either files to attach or text to type.
+fn on_paste(app: &mut App, text: &str) {
+    app.notice = None;
+    if let Some(paths) = attach::parse_paths(text) {
+        let images = paths.len();
+        let added = app.attach(paths);
+        app.mode = Mode::Insert;
+        app.notice = Some(if added == images {
+            format!("已附带 {added} 个文件，Enter 发送")
+        } else {
+            format!("已附带 {added} 个，其余重复或超过上限（共 {images} 个）")
+        });
+        return;
+    }
+    if app.mode == Mode::Normal {
+        return;
+    }
+    // Ordinary text goes in at the cursor, newlines and all.
+    app.composer.insert_str(text);
 }
 
 /// Opens the `@` list: the people in this conversation, plus everyone at once
@@ -907,12 +1013,11 @@ fn execute_command(app: &mut App, mut backend: Option<&mut Backend>, line: &str)
             }
         },
         "img" | "image" => {
-            let path = rest.join(" ");
-            if path.is_empty() {
-                app.notice = Some("用法: :img 图片路径".into());
-                return Flow::Continue;
+            if rest.is_empty() {
+                open_browser(app);
+            } else {
+                stage_path(app, &rest.join(" "));
             }
-            send_image(app, backend, &path);
         }
         "help" | "h" => app.notice = Some(HELP_LINE.into()),
         other => app.notice = Some(format!("未知命令 :{other}，:help 看列表")),
@@ -920,31 +1025,26 @@ fn execute_command(app: &mut App, mut backend: Option<&mut Backend>, line: &str)
     Flow::Continue
 }
 
-/// Sends a picture from disk, reporting what went wrong in the status line
-/// rather than in a log nobody is reading.
-fn send_image(app: &mut App, backend: Option<&mut Backend>, path: &str) {
-    if !app.has_open_conversation() {
-        app.notice = Some(NO_CONVERSATION.into());
-        return;
-    }
-    let path = match resolve_path(path) {
-        Ok(path) => path,
-        Err(e) => {
-            app.notice = Some(e);
-            return;
+/// Stages a picture named on the command line. Like a drag, it waits for
+/// Enter rather than going out immediately, so several can go together.
+fn stage_path(app: &mut App, raw: &str) {
+    match resolve_path(raw) {
+        Ok(path) => {
+            let name = file_label(&path);
+            if app.attach([path]) == 0 {
+                app.notice = Some(format!("{name} 已经在待发列表里"));
+            } else {
+                app.mode = Mode::Insert;
+                app.notice = Some(format!("已附带 {name}，Enter 发送"));
+            }
         }
-    };
-    let Some(b) = backend else {
-        app.notice = Some("示例模式下不能发送".into());
-        return;
-    };
-    match b.session.send_image(&app.open, &path, &mut app.snapshot) {
-        Ok(()) => {
-            app.jump_to_latest();
-            app.notice = Some(format!("已发送 {}", file_label(&path)));
-        }
-        Err(e) => app.notice = Some(format!("发送失败: {e}")),
+        Err(e) => app.notice = Some(e),
     }
+}
+
+/// Opens the file browser where it was last left.
+fn open_browser(app: &mut App) {
+    app.browser = Some(Browser::open(app.last_dir.as_deref()));
 }
 
 /// Turns what somebody typed into a path the SDK will accept: `~` expanded,
@@ -1167,7 +1267,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyActio
                 // Escape peels one layer at a time: the reply first, then
                 // insert mode. Dropping both at once loses a quote the person
                 // may have picked several keystrokes ago.
-                if app.mode == Mode::Insert && app.reply_to.is_some() {
+                if app.mode == Mode::Insert && app.has_draft_context() {
                     app.clear_draft_context();
                 } else {
                     if app.mode == Mode::Command {
@@ -1279,7 +1379,7 @@ mod tests {
     }
 
     fn press(app: &mut App, code: KeyCode) -> Flow {
-        on_key(app, None, code, KeyModifiers::NONE)
+        on_key(app, None, &mut Uploads::disabled(), code, KeyModifiers::NONE)
     }
 
     fn type_command(app: &mut App, line: &str) -> Flow {
@@ -1397,7 +1497,7 @@ mod tests {
     fn sending_in_mock_mode_keeps_the_draft_and_explains() {
         let mut app = mock_app();
         app.composer.insert_str("hello");
-        send_composer(&mut app, None);
+        send_composer(&mut app, None, &mut Uploads::disabled());
         assert_eq!(app.composer.text(), "hello", "draft must survive a failed send");
         assert!(app.notice.is_some());
     }
@@ -1549,6 +1649,107 @@ mod tests {
             p.items.iter().any(|i| i.id == im_model::AT_ALL_TAG)
         });
         assert_eq!(offered, Some(false), "there is no 'everyone' in a two-person chat");
+    }
+
+    #[test]
+    fn a_dragged_file_is_staged_rather_than_sent_at_once() {
+        let dir = std::env::temp_dir().join(format!("yptd-drag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let one = dir.join("a.png");
+        let two = dir.join("b b.png");
+        std::fs::write(&one, b"x").expect("file");
+        std::fs::write(&two, b"x").expect("file");
+
+        let mut app = mock_app();
+        // What a terminal inserts when two files are dropped at once.
+        let pasted = format!(
+            "{} {}",
+            one.display(),
+            two.display().to_string().replace(' ', "\\ ")
+        );
+        on_paste(&mut app, &pasted);
+        assert_eq!(app.pending.len(), 2, "both files staged: {:?}", app.pending);
+        assert_eq!(app.mode, Mode::Insert, "ready for a caption");
+        assert!(app.composer.is_empty(), "the paths must not land in the text");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pasting_prose_types_it_instead_of_attaching_it() {
+        let mut app = mock_app();
+        app.mode = Mode::Insert;
+        on_paste(&mut app, "这是一段普通文字");
+        assert!(app.pending.is_empty());
+        assert_eq!(app.composer.text(), "这是一段普通文字");
+    }
+
+    #[test]
+    fn escape_drops_staged_pictures_before_leaving_insert() {
+        let mut app = mock_app();
+        app.mode = Mode::Insert;
+        app.pending.push(std::path::PathBuf::from("/tmp/a.png"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.pending.is_empty());
+        assert_eq!(app.mode, Mode::Insert);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn staging_the_same_picture_twice_keeps_one() {
+        let mut app = mock_app();
+        assert_eq!(app.attach([std::path::PathBuf::from("/tmp/a.png")]), 1);
+        assert_eq!(app.attach([std::path::PathBuf::from("/tmp/a.png")]), 0);
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    #[test]
+    fn img_without_a_path_opens_the_browser_and_keys_go_to_it() {
+        let mut app = mock_app();
+        type_command(&mut app, "img");
+        assert!(app.browser.is_some(), "the browser opens");
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Flow::Continue, "q filters here too");
+        assert_eq!(app.browser.as_ref().map(|b| b.filter.as_str()), Some("q"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.browser.is_none());
+        assert!(app.last_dir.is_some(), "reopening remembers where it was");
+    }
+
+    #[test]
+    fn sending_with_nothing_typed_but_pictures_staged_still_sends() {
+        let mut app = mock_app();
+        app.pending.push(std::path::PathBuf::from("/tmp/a.png"));
+        // No text, no live session: the mock path reports why rather than
+        // silently doing nothing, which is what an empty composer would do.
+        send_composer(&mut app, None, &mut Uploads::disabled());
+        assert!(app.notice.is_some());
+        assert_eq!(app.pending.len(), 1, "staged pictures survive a failed send");
+    }
+
+    #[test]
+    fn the_browse_scene_shows_the_list_over_the_conversation() {
+        let (width, height) = parse_size("100x24");
+        let out = render::to_text(&render::capture(width, height, Scene::Browse).expect("render"));
+        assert!(out.contains("选择图片"), "modal title");
+        assert!(out.contains("[x] 现场-1.png"), "a ticked picture");
+        assert!(out.contains("📁 上周归档"), "a directory row");
+        assert!(out.contains("已选 2 张"), "the hint counts them");
+    }
+
+    #[test]
+    fn the_attach_scene_shows_what_is_staged_above_the_input() {
+        let (width, height) = parse_size("100x20");
+        let out = render::to_text(&render::capture(width, height, Scene::Attach).expect("render"));
+        assert!(out.contains("3 个待发"), "the strip counts them: {out}");
+        assert!(out.contains("现场-2.png"));
+    }
+
+    #[test]
+    fn consecutive_pictures_from_one_person_are_labelled_as_a_group() {
+        let (width, height) = parse_size("100x26");
+        let out = render::to_text(&render::capture(width, height, Scene::Live).expect("render"));
+        assert!(out.contains("🖼️ 3 张图片"), "the fixture's run collapses: {out}");
     }
 
     #[test]

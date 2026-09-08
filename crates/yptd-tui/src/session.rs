@@ -6,7 +6,9 @@
 //! same renderer.
 
 use std::collections::HashSet;
-use std::sync::mpsc::Receiver;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 
 use im_model::translate::{self, Interner};
 use im_model::{
@@ -19,7 +21,7 @@ use crate::app::DraftMention;
 use crate::config::{Config, Paths};
 
 pub struct Session {
-    sidecar: Sidecar,
+    sidecar: Arc<Sidecar>,
     interner: Interner,
     me: UserId,
     my_name: String,
@@ -85,7 +87,7 @@ impl Session {
 
         Ok((
             Self {
-                sidecar,
+                sidecar: Arc::new(sidecar),
                 interner: Interner::default(),
                 me: UserId(user_id.to_owned()),
                 my_name: nickname.to_owned(),
@@ -307,40 +309,39 @@ impl Session {
             .cloned())
     }
 
-    /// Sends a picture. The SDK uploads the file as part of the send, so all
-    /// this needs is a path that exists; what comes back already carries the
-    /// object-store URL everyone else will fetch it from.
+    /// Sends a picture and waits for it. Uploading blocks, so the interactive
+    /// client uses [`Uploads`] instead; this is for the one-shot diagnostics.
     pub fn send_image(
         &mut self,
         conv: &ConversationId,
         path: &std::path::Path,
         snapshot: &mut Snapshot,
     ) -> Result<(), im_sidecar::Error> {
-        let created = self
-            .sidecar
-            .call("create_image", json!({ "path": path.to_string_lossy() }))?;
-        self.dispatch(conv, created, snapshot)
+        let sent = upload(&self.sidecar, &self.me, conv, path)?;
+        self.absorb(sent, snapshot);
+        Ok(())
     }
 
-    /// Hands a created message to the SDK and folds the echo into the
-    /// snapshot. Every send funnels through here so the "trust the echo, not
-    /// a local guess" rule has exactly one implementation.
-    fn dispatch(
-        &mut self,
-        conv: &ConversationId,
-        created: Value,
-        snapshot: &mut Snapshot,
-    ) -> Result<(), im_sidecar::Error> {
-        let (recv_id, group_id) = target_of(conv, &self.me)?;
-        let sent = self.sidecar.call(
-            "send",
-            json!({ "message": created, "recv_id": recv_id, "group_id": group_id }),
-        )?;
-        if let Some(mut m) = translate::message(&sent, &self.me, &mut self.interner) {
-            m.send_state = SendState::Sent;
-            snapshot.upsert_message(m);
+    /// A queue for pictures, so the interface keeps painting while they go
+    /// up. Every job it finishes comes back to the caller's channel.
+    pub fn uploads<T, F>(&self, out: Sender<T>, wake: F) -> Uploads
+    where
+        T: Send + 'static,
+        F: Fn(Result<Value, im_sidecar::Error>) -> T + Send + 'static,
+    {
+        Uploads::start(Arc::clone(&self.sidecar), self.me.clone(), out, wake)
+    }
+
+    /// Folds the SDK's echo of a message we sent into the snapshot.
+    pub fn absorb(&mut self, sent: Value, snapshot: &mut Snapshot) -> bool {
+        match translate::message(&sent, &self.me, &mut self.interner) {
+            Some(mut m) => {
+                m.send_state = SendState::Sent;
+                snapshot.upsert_message(m);
+                true
+            }
+            None => false,
         }
-        Ok(())
     }
 
     /// Sends a message, optionally quoting one and mentioning people. The SDK
@@ -580,6 +581,80 @@ pub fn local_direct(snapshot: &mut Snapshot, me: &str, user_id: &str, nickname: 
         });
     }
     id
+}
+
+/// One picture, start to finish: create the message, hand it to the SDK,
+/// return what came back. Free of `Session` so it can run off the main
+/// thread; the translation that needs `&mut Session` happens back home.
+fn upload(
+    sidecar: &Sidecar,
+    me: &UserId,
+    conv: &ConversationId,
+    path: &std::path::Path,
+) -> Result<Value, im_sidecar::Error> {
+    let (recv_id, group_id) = target_of(conv, me)?;
+    let created = sidecar.call("create_image", json!({ "path": path.to_string_lossy() }))?;
+    sidecar.call(
+        "send",
+        json!({ "message": created, "recv_id": recv_id, "group_id": group_id }),
+    )
+}
+
+/// A single worker that sends queued pictures in order.
+///
+/// In order, and one at a time, on purpose: four pictures sent at once would
+/// race into the conversation in whatever order the uploads finished, and
+/// the album that groups them would shuffle every time it redrew.
+pub struct Uploads {
+    jobs: Option<Sender<(ConversationId, PathBuf)>>,
+    /// Pictures queued but not yet answered for, for the status line.
+    outstanding: usize,
+}
+
+impl Uploads {
+    fn start<T, F>(sidecar: Arc<Sidecar>, me: UserId, out: Sender<T>, wake: F) -> Self
+    where
+        T: Send + 'static,
+        F: Fn(Result<Value, im_sidecar::Error>) -> T + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel::<(ConversationId, PathBuf)>();
+        let spawned = std::thread::Builder::new()
+            .name("image-uploads".into())
+            .spawn(move || {
+                for (conv, path) in rx {
+                    let outcome = upload(&sidecar, &me, &conv, &path);
+                    if out.send(wake(outcome)).is_err() {
+                        break;
+                    }
+                }
+            });
+        Self {
+            jobs: spawned.is_ok().then_some(tx),
+            outstanding: 0,
+        }
+    }
+
+    /// An `Uploads` that accepts nothing, for the mock.
+    pub fn disabled() -> Self {
+        Self { jobs: None, outstanding: 0 }
+    }
+
+    pub fn queue(&mut self, conv: &ConversationId, path: PathBuf) -> bool {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return false;
+        };
+        if jobs.send((conv.clone(), path)).is_err() {
+            return false;
+        }
+        self.outstanding += 1;
+        true
+    }
+
+    /// Records that one job answered. Returns how many are still out.
+    pub fn finished(&mut self) -> usize {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        self.outstanding
+    }
 }
 
 fn now_ms() -> i64 {

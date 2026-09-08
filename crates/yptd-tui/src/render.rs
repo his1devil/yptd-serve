@@ -35,6 +35,10 @@ pub enum Scene {
     Reply,
     /// A brand-new account: no conversations at all.
     Empty,
+    /// The file browser open over the conversation, two pictures ticked.
+    Browse,
+    /// Three pictures staged and a caption half typed.
+    Attach,
 }
 
 impl Scene {
@@ -48,6 +52,8 @@ impl Scene {
             "picker" => Self::Picker,
             "reply" => Self::Reply,
             "empty" => Self::Empty,
+            "browse" => Self::Browse,
+            "attach" => Self::Attach,
             _ => return None,
         })
     }
@@ -85,6 +91,38 @@ impl Scene {
                 picker.selected.insert("wuhao".into());
                 picker.cursor = 1;
                 app.picker = Some(picker);
+            }
+            Self::Browse => {
+                use crate::browser::{Browser, Entry, Kind};
+                let row = |name: &str, kind, bytes| Entry {
+                    path: std::path::PathBuf::from("/Users/me/Desktop").join(name),
+                    name: name.to_owned(),
+                    kind,
+                    bytes,
+                };
+                let mut browser = Browser::synthetic(
+                    "/Users/me/Desktop",
+                    vec![
+                        row("..", Kind::Parent, 0),
+                        row("上周归档", Kind::Directory, 0),
+                        row("会场全景.png", Kind::Image, 2_411_724),
+                        row("现场-1.png", Kind::Image, 1_258_291),
+                        row("现场-2.png", Kind::Image, 998_112),
+                        row("现场-3.png", Kind::Image, 1_104_003),
+                    ],
+                );
+                browser.cursor = 3;
+                browser.selected.insert("/Users/me/Desktop/现场-1.png".into());
+                browser.selected.insert("/Users/me/Desktop/现场-2.png".into());
+                app.browser = Some(browser);
+            }
+            Self::Attach => {
+                app.mode = Mode::Insert;
+                app.composer.set_text("现场三张，你看下第二张的角度");
+                app.pending = ["现场-1.png", "现场-2.png", "现场-3.png"]
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
             }
             Self::Reply => {
                 app.focus(Pane::Messages);

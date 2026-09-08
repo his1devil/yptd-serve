@@ -159,6 +159,24 @@ pub fn snapshot() -> Snapshot {
         },
     );
 
+    // Three pictures in a row from one person: the case an album exists for.
+    for (offset, name) in [(0, "现场-1.png"), (2, "现场-2.png"), (4, "现场-3.png")] {
+        build.push(
+            minutes(32) + offset * 1_000,
+            "u_chen",
+            "陈明",
+            Body::Attachment {
+                caption: None,
+                attachment: Attachment {
+                    name: name.to_owned(),
+                    bytes: 0,
+                    kind: AttachmentKind::Image,
+                    url: String::new(),
+                },
+            },
+        );
+    }
+
     let failed = build.push(
         minutes(33),
         "7036948217",
@@ -187,7 +205,7 @@ pub fn snapshot() -> Snapshot {
             name: "排期讨论".to_owned(),
             kind: ConversationKind::Group,
             category: Some("产品".to_owned()),
-            unread: 4,
+            unread: 7,
             mentions: 0,
             muted: false,
             member_count: 12,
