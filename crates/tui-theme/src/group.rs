@@ -140,6 +140,15 @@ define_groups! {
 
     // ---- message content --------------------------------------------------
     MessageAuthor       => (Some(G::Strong),         plain()),
+    // One colour per person, picked from their id so it never changes on
+    // them. Six, not sixteen: a chat window with a dozen hues reads as
+    // noise, and these have to stay legible on both light and dark grounds.
+    Author1             => (None,                    fg(Color::Cyan).bold()),
+    Author2             => (None,                    fg(Color::Green).bold()),
+    Author3             => (None,                    fg(Color::Magenta).bold()),
+    Author4             => (None,                    fg(Color::Blue).bold()),
+    Author5             => (None,                    fg(Color::Yellow).bold()),
+    Author6             => (None,                    fg(Color::Red).bold()),
     MessageTimestamp    => (Some(G::Timestamp),      plain()),
     MessageBody         => (None,                    fg(Color::Reset)),
     MessageSecondary    => (Some(G::Muted),          plain()),

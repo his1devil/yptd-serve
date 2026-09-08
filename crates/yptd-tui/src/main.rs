@@ -401,7 +401,15 @@ fn connect() -> Fallible<Live> {
 fn live_app(snapshot: Snapshot) -> App {
     let mut app = App::new(snapshot);
     app.utc_offset_ms = local_utc_offset_ms();
+    app.now_ms = now_ms();
     app
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Seconds east of UTC for the current moment, via `localtime_r`, which
@@ -596,6 +604,9 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
         }
 
         if dirty {
+            // Kept current so a conversation left open across midnight starts
+            // calling yesterday "昨天" rather than "今天".
+            app.now_ms = now_ms();
             if let Err(error) =
                 terminal.draw(|frame| ui::draw(frame, &mut app, &mut media, &theme, &mut layout_cache))
             {
@@ -686,7 +697,9 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
                 on_paste(&mut app, &text);
                 dirty = true;
             }
-            Input::Terminal(Event::Resize(_, _)) => dirty = true,
+            Input::Terminal(Event::Resize(_, _)) => {
+                dirty = true;
+            }
             Input::Terminal(_) => {}
             Input::Sent(outcome) => {
                 let left = uploads.finished();
@@ -1431,7 +1444,11 @@ mod tests {
         let out = frame("100x24").expect("render");
         assert_eq!(out.lines().count(), 24);
         assert!(out.contains("排期讨论"), "the open conversation is titled");
-        assert!(out.contains("以下为未读"), "the unread divider is drawn");
+        // Tall enough to hold the whole fixture, so the divider is on screen
+        // wherever the scene happens to be anchored.
+        let tall = frame("100x48").expect("render");
+        assert!(tall.contains("以下为未读"), "the unread divider is drawn");
+        assert!(tall.contains("─  今天  ─"), "the day divider is centred");
     }
 
     #[test]

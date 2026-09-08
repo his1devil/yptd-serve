@@ -464,7 +464,7 @@ mod tests {
         let top = to_text(&capture(110, 26, Scene::Top).expect("render"));
         assert!(top.contains("加入了群聊"), "system notification");
         assert!(top.contains("已读 8"), "read receipt");
-        assert!(top.contains("2026-09-08"), "date divider");
+        assert!(top.contains("今天"), "date divider names the day");
     }
 
     #[test]

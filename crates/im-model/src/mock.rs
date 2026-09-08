@@ -9,7 +9,7 @@ use crate::*;
 
 /// Fixed base time so snapshot output never changes between runs.
 /// 2026-09-08T06:00:00Z.
-const BASE_MS: i64 = 1_788_847_200_000;
+pub const BASE_MS: i64 = 1_788_847_200_000;
 
 fn minutes(n: i64) -> i64 {
     BASE_MS + n * 60_000
@@ -178,6 +178,21 @@ pub fn snapshot() -> Snapshot {
         );
     }
 
+    // Somebody names the local user: the case the gutter's mention bar and
+    // the sidebar's badge both exist for.
+    let at_me = build.push(
+        minutes(13),
+        "u_lina",
+        "李娜",
+        text("@张伟 回滚脚本你今天能合吗"),
+    );
+    at_me.mentions.push(Mention {
+        start: 0,
+        end: "@张伟".len(),
+        user: user("7036948217"),
+        notifies_me: true,
+    });
+
     let failed = build.push(
         minutes(33),
         "7036948217",
@@ -206,8 +221,8 @@ pub fn snapshot() -> Snapshot {
             name: "排期讨论".to_owned(),
             kind: ConversationKind::Group,
             category: Some("产品".to_owned()),
-            unread: 7,
-            mentions: 0,
+            unread: 8,
+            mentions: 1,
             muted: false,
             member_count: 12,
             last_activity_ms: minutes(34),

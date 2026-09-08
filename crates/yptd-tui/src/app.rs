@@ -109,6 +109,9 @@ pub struct App {
     /// A one-line status message: a send failure, a lost sidecar. Cleared on
     /// the next keypress so it never lingers past its relevance.
     pub notice: Option<String>,
+    /// What the clock says, so "今天" means today. Fixed for the mock and the
+    /// off-screen captures, which must render the same on any day.
+    pub now_ms: i64,
     /// Added to every timestamp before display. Zero for the mock and the
     /// off-screen captures so a test renders the same in every time zone;
     /// the live client sets it from the machine's zone at startup.
@@ -156,6 +159,7 @@ impl App {
             show_members: true,
             show_conversations: true,
             notice: None,
+            now_ms: im_model::mock::BASE_MS,
             utc_offset_ms: 0,
             picker: None,
             reply_to: None,
@@ -187,6 +191,7 @@ impl App {
             show_members: self.show_members,
             show_conversations: self.show_conversations,
             notice: self.notice.clone(),
+            now_ms: self.now_ms,
             utc_offset_ms: self.utc_offset_ms,
             picker: self.picker.clone(),
             reply_to: self.reply_to,

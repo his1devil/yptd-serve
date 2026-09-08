@@ -27,6 +27,9 @@ use crate::syntax;
 /// would jump under the reader.
 const GUTTER: u16 = 2;
 const SELECTED_MARK: &str = "▌ ";
+/// A thinner bar for a message that names you, so a mention is findable while
+/// scrolling past without reading a word.
+const MENTION_MARK: &str = "▏ ";
 const UNSELECTED_MARK: &str = "  ";
 
 /// Consecutive messages from one sender inside this window share a header.
@@ -41,7 +44,7 @@ const AUTHOR_GROUP_MS: i64 = 5 * 60_000;
 /// scrolling that stutters.
 #[derive(Default)]
 pub struct Cache {
-    key: Option<(ConversationId, usize, u64, u64, i64)>,
+    key: Option<(ConversationId, usize, u64, u64, i64, i64)>,
     lines: Vec<PaneLine>,
 }
 
@@ -61,9 +64,12 @@ impl Cache {
             app.snapshot.revision(),
             media.revision(),
             app.utc_offset_ms,
+            // Only the day matters, so the rows survive until midnight rather
+            // than being thrown away every second.
+            day_index(app.now_ms + app.utc_offset_ms),
         );
         if self.key.as_ref() != Some(&key) {
-            self.lines = build_message_lines(app, theme, media, width);
+            self.lines = build_message_lines(app, theme, media, width, app.now_ms);
             self.key = Some(key);
         }
         &self.lines
@@ -807,6 +813,8 @@ fn block_height(placement: &Placement) -> u16 {
 /// the scroll arithmetic can both work in line space.
 struct PaneLine {
     message_index: Option<usize>,
+    /// Whether the message on this row names the local user.
+    mentions_me: bool,
     /// Which run of messages this row belongs to, as (first, length). The
     /// selection marker is decided from this at draw time rather than baked
     /// in, so moving the cursor costs nothing and the laid-out lines can be
@@ -953,7 +961,13 @@ fn viewport_top(app: &App, lines: &[PaneLine], height: usize) -> usize {
     top.min(total.saturating_sub(height.min(total)))
 }
 
-fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) -> Vec<PaneLine> {
+fn build_message_lines(
+    app: &App,
+    theme: &Theme,
+    media: &Media,
+    width: usize,
+    now_ms: i64,
+) -> Vec<PaneLine> {
     let palette = syntax_palette(theme);
     let messages = app.messages();
     let unread_at = app.unread_boundary();
@@ -977,7 +991,7 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
 
         if starts_new_day(message, previous, app.utc_offset_ms) {
             out.push(divider(
-                &format!(" {} ", format_date(message.sent_at_ms() + app.utc_offset_ms)),
+                &format!("  {}  ", day_label(message.sent_at_ms() + app.utc_offset_ms, now_ms + app.utc_offset_ms)),
                 theme.style(HG::DateDivider),
                 width,
                 index,
@@ -985,7 +999,7 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
         }
         if unread_at == Some(index) {
             out.push(divider(
-                " 以下为未读 ",
+                "  以下为未读  ",
                 theme.style(HG::UnreadDivider),
                 width,
                 index,
@@ -994,9 +1008,10 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
 
         let show_header = starts_author_group(message, previous);
         if show_header && index > 0 {
-            out.push(content_line(Vec::new(), Some((index, run_len)), Some(index)));
+            out.push(content_line(Vec::new(), Some((index, run_len)), Some(index), false));
         }
 
+        let addressed = message.mentions.iter().any(|m| m.notifies_me);
         let run = &messages[index..index + run_len];
         let (lines, preview) = render_message(
             run,
@@ -1016,7 +1031,7 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
                 Some(within) if block_rows > 0 => index + within.min(run_len - 1),
                 _ => index,
             };
-            let mut entry = content_line(line, Some((index, run_len)), Some(owner));
+            let mut entry = content_line(line, Some((index, run_len)), Some(owner), addressed);
             if offset == first_block_row && block_rows > 0 {
                 entry.album = preview.clone();
             }
@@ -1096,37 +1111,51 @@ fn content_line(
     spans: Vec<TuiSpan<'static>>,
     run: Option<(usize, usize)>,
     message_index: Option<usize>,
+    mentions_me: bool,
 ) -> PaneLine {
     PaneLine {
         message_index,
+        mentions_me,
         run,
         line: TuiLine::from(spans),
         album: None,
     }
 }
 
-/// Prepends the selection gutter. Two columns either way, so the content
-/// width never changes and nothing re-wraps when the cursor moves.
+/// Prepends the gutter. Two columns either way, so the content width never
+/// changes and nothing re-wraps when the cursor moves.
+///
+/// The same two columns carry two different facts: where the cursor is, and
+/// which messages are addressed to you. Selection wins when both apply --
+/// you can see the mention in the text, but only the gutter says where you
+/// are.
 fn with_gutter(entry: &PaneLine, selected: bool, theme: &Theme) -> TuiLine<'static> {
     let mut spans = Vec::with_capacity(entry.line.spans.len() + 1);
-    spans.push(TuiSpan::styled(
-        if selected { SELECTED_MARK } else { UNSELECTED_MARK },
-        theme.style(HG::MessageSelectedBorder),
-    ));
+    spans.push(match (selected, entry.mentions_me) {
+        (true, _) => TuiSpan::styled(SELECTED_MARK, theme.style(HG::MessageSelectedBorder)),
+        (false, true) => TuiSpan::styled(MENTION_MARK, theme.style(HG::MentionSelf)),
+        (false, false) => TuiSpan::styled(UNSELECTED_MARK, theme.style(HG::MessageSelectedBorder)),
+    });
     spans.extend(entry.line.spans.iter().cloned());
     TuiLine::from(spans)
 }
 
 /// A divider belongs to the message it introduces, not to nothing. Tagging it
 /// `None` would make scrolling to that message land *below* its own divider.
+/// A rule with its label centred, the way a chat window separates one day
+/// from the next: the eye should read the date, not hunt for it at one end.
 fn divider(label: &str, style: Style, width: usize, message_index: usize) -> PaneLine {
-    let rule = width.saturating_sub(label.width() + 2);
+    let rule = width.saturating_sub(label.width());
+    let left = rule / 2;
+    let right = rule - left;
     PaneLine {
         message_index: Some(message_index),
+        mentions_me: false,
         run: None,
         line: TuiLine::from(vec![
-            TuiSpan::styled("".to_owned(), style),
-            TuiSpan::styled(format!("──{label}{}", "─".repeat(rule)), style),
+            TuiSpan::styled("─".repeat(left), style),
+            TuiSpan::styled(label.to_owned(), style),
+            TuiSpan::styled("─".repeat(right), style),
         ]),
         album: None,
     }
@@ -1163,7 +1192,11 @@ fn render_message(
         }
         header.push(TuiSpan::styled(
             message.sender_name.clone(),
-            theme.style(if ghost { HG::GhostMessage } else { HG::MessageAuthor }),
+            if ghost {
+                theme.style(HG::GhostMessage)
+            } else {
+                theme.style(author_colour(&message.sender.0))
+            },
         ));
         header.push(TuiSpan::styled(
             format!("  {}", format_time(message.sent_at_ms() + utc_offset_ms)),
@@ -1406,6 +1439,16 @@ fn starts_author_group(message: &Message, previous: Option<&Message>) -> bool {
         || previous.visibility != message.visibility
 }
 
+/// "今天" and "昨天" read faster than a date, and a date is only useful
+/// further back than that.
+fn day_label(when_ms: i64, now_ms: i64) -> String {
+    match day_index(now_ms) - day_index(when_ms) {
+        0 => "今天".to_owned(),
+        1 => "昨天".to_owned(),
+        _ => format_date(when_ms),
+    }
+}
+
 fn starts_new_day(message: &Message, previous: Option<&Message>, offset_ms: i64) -> bool {
     match previous {
         None => true,
@@ -1484,6 +1527,28 @@ fn truncate_left(value: &str, width: usize) -> String {
 }
 
 /// Truncates to a display width, counting CJK as two cells.
+/// A stable colour for one person, derived from their id.
+///
+/// Names carry most of the work of scanning a busy channel, and a colour that
+/// belongs to somebody makes them findable without reading. Derived rather
+/// than assigned, so it survives restarts and agrees between clients.
+fn author_colour(user_id: &str) -> HG {
+    const PALETTE: [HG; 6] = [
+        HG::Author1,
+        HG::Author2,
+        HG::Author3,
+        HG::Author4,
+        HG::Author5,
+        HG::Author6,
+    ];
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in user_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    PALETTE[(hash % PALETTE.len() as u64) as usize]
+}
+
 /// Whether a message is worth handing to the markdown parser.
 ///
 /// A cheap check first, because most chat lines contain none of this and
@@ -1533,6 +1598,28 @@ fn truncate(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use im_model::AttachmentKind;
+
+    #[test]
+    fn recent_days_are_named_rather_than_dated() {
+        let day = 86_400_000i64;
+        let now = im_model::mock::BASE_MS;
+        assert_eq!(super::day_label(now, now), "今天");
+        assert_eq!(super::day_label(now - day, now), "昨天");
+        assert_eq!(super::day_label(now - 5 * day, now), super::format_date(now - 5 * day));
+    }
+
+    #[test]
+    fn one_person_always_gets_the_same_colour() {
+        let once = super::author_colour("u_lina");
+        assert_eq!(once, super::author_colour("u_lina"));
+        // Not a hard requirement that any two differ, but a palette that
+        // collapsed everyone onto one colour would be useless.
+        let spread: std::collections::HashSet<_> = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .iter()
+            .map(|id| super::author_colour(id))
+            .collect();
+        assert!(spread.len() > 1, "every id landed on one colour");
+    }
 
     #[test]
     fn moving_the_cursor_does_not_relay_out_the_messages() {
@@ -1643,11 +1730,11 @@ mod tests {
         let mut app = app();
         let theme = Theme::default();
         let width = 44;
-        let baseline = build_message_lines(&app, &theme, &Media::disabled(), width).len();
+        let baseline = build_message_lines(&app, &theme, &Media::disabled(), width, app.now_ms).len();
         for cursor in 0..app.messages().len() {
             app.message_cursor = cursor;
             assert_eq!(
-                build_message_lines(&app, &theme, &Media::disabled(), width).len(),
+                build_message_lines(&app, &theme, &Media::disabled(), width, app.now_ms).len(),
                 baseline,
                 "cursor {cursor} changed the rendered height"
             );
@@ -1659,7 +1746,7 @@ mod tests {
         let app = app();
         let theme = Theme::default();
         for width in [30usize, 44, 60, 100] {
-            for entry in build_message_lines(&app, &theme, &Media::disabled(), width) {
+            for entry in build_message_lines(&app, &theme, &Media::disabled(), width, app.now_ms) {
                 let rendered: String = entry
                     .line
                     .spans
@@ -1680,7 +1767,7 @@ mod tests {
     fn both_dividers_are_emitted_once() {
         let app = app();
         let theme = Theme::default();
-        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60);
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
         let text = |entry: &PaneLine| {
             entry
                 .line
@@ -1693,8 +1780,10 @@ mod tests {
             lines.iter().filter(|l| text(l).contains("以下为未读")).count(),
             1
         );
+        // Match the rule around the label, not the word: a message that says
+        // "今天能出个修订版吗" is not a divider.
         assert_eq!(
-            lines.iter().filter(|l| text(l).contains("2026-")).count(),
+            lines.iter().filter(|l| text(l).contains("─  今天  ─")).count(),
             1,
             "one date divider for a single-day fixture"
         );
@@ -1707,7 +1796,7 @@ mod tests {
         app.message_scroll = 0;
         app.message_cursor = 0;
         let theme = Theme::default();
-        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60);
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
         let top = viewport_top(&app, &lines, 12);
         let first = lines[top]
             .line
@@ -1716,7 +1805,7 @@ mod tests {
             .map(|span| span.content.to_string())
             .collect::<String>();
         assert!(
-            first.contains("2026-"),
+            first.contains("今天"),
             "the date divider must scroll with its message, got {first:?}"
         );
     }
@@ -1725,7 +1814,7 @@ mod tests {
     fn following_the_live_edge_anchors_the_viewport_to_the_bottom() {
         let app = app();
         let theme = Theme::default();
-        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60);
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
         let height = 10;
         assert_eq!(viewport_top(&app, &lines, height), lines.len() - height);
     }
@@ -1737,7 +1826,7 @@ mod tests {
         app.message_scroll = 0;
         app.message_cursor = app.messages().len() - 1;
         let theme = Theme::default();
-        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60);
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
         let height = 6;
         let top = viewport_top(&app, &lines, height);
         let cursor_line = lines
