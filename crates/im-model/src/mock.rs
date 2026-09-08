@@ -152,6 +152,9 @@ pub fn snapshot() -> Snapshot {
                 name: "排期草稿-v3.png".to_owned(),
                 bytes: 1_258_291,
                 kind: AttachmentKind::Image,
+                // The fixture's picture is generated at runtime, so there is
+                // nothing to fetch.
+                url: String::new(),
             },
         },
     );

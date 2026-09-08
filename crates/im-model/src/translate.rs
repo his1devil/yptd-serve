@@ -181,8 +181,28 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
                 caption: None,
                 attachment: Attachment {
                     name: file_name(str_of(elem, "sourcePath"), str_of(&source, "uuid"), "png"),
-                    bytes: i64_of(&source, "size").max(0) as u64,
+                    // Whichever size the server actually filled in: on the
+                    // echo of a message we just sent, `sourcePicture.size`
+                    // comes back as 0.
+                    bytes: [
+                        elem.get("sourcePicture"),
+                        elem.get("bigPicture"),
+                        elem.get("snapshotPicture"),
+                    ]
+                    .iter()
+                    .flatten()
+                    .map(|v| i64_of(v, "size"))
+                    .find(|size| *size > 0)
+                    .unwrap_or(0) as u64,
                     kind: AttachmentKind::Image,
+                    // `sourcePicture` is the original. The snapshot is a
+                    // thumbnail the server may not have made, so it is the
+                    // fallback rather than the first choice.
+                    url: first_url(&[
+                        elem.get("sourcePicture"),
+                        elem.get("bigPicture"),
+                        elem.get("snapshotPicture"),
+                    ]),
                 },
             }
         }
@@ -194,6 +214,7 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
                     name: str_of(elem, "fileName").to_owned(),
                     bytes: i64_of(elem, "fileSize").max(0) as u64,
                     kind: AttachmentKind::File,
+                    url: str_of(elem, "sourceUrl").to_owned(),
                 },
             }
         }
@@ -205,6 +226,7 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
                     name: file_name(str_of(elem, "videoPath"), str_of(elem, "videoUUID"), "mp4"),
                     bytes: i64_of(elem, "videoSize").max(0) as u64,
                     kind: AttachmentKind::Video,
+                    url: str_of(elem, "videoUrl").to_owned(),
                 },
             }
         }
@@ -216,6 +238,7 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
                     name: file_name(str_of(elem, "soundPath"), str_of(elem, "uuid"), "m4a"),
                     bytes: i64_of(elem, "dataSize").max(0) as u64,
                     kind: AttachmentKind::Audio,
+                    url: str_of(elem, "sourceUrl").to_owned(),
                 },
             }
         }
@@ -269,6 +292,18 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
         edited: false,
         mentions,
     })
+}
+
+/// The first element that actually carries a URL. The SDK fills in whichever
+/// sizes the server produced and leaves the rest null.
+fn first_url(candidates: &[Option<&Value>]) -> String {
+    candidates
+        .iter()
+        .flatten()
+        .map(|v| str_of(v, "url"))
+        .find(|url| !url.is_empty())
+        .unwrap_or("")
+        .to_owned()
 }
 
 fn file_name(path: &str, uuid: &str, ext: &str) -> String {

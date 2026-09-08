@@ -156,6 +156,20 @@ pub struct Attachment {
     pub name: String,
     pub bytes: u64,
     pub kind: AttachmentKind,
+    /// Where the file lives on the object store. Empty for an attachment that
+    /// has not been uploaded yet, or for the mock.
+    pub url: String,
+}
+
+impl Attachment {
+    /// The cache key for this file.
+    ///
+    /// The URL, not the name: two people sending `screenshot.png` are sending
+    /// two different pictures, and keying by name would show the first one
+    /// twice. Falls back to the name only when there is no URL yet.
+    pub fn key(&self) -> &str {
+        if self.url.is_empty() { &self.name } else { &self.url }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,6 +373,30 @@ mod tests {
         let sent = EPOCH_MS + 5_000;
         let id = MessageId::from_send_time(sent, u64::MAX);
         assert_eq!(id.sent_at_ms(), sent);
+    }
+
+    #[test]
+    fn two_pictures_with_the_same_file_name_are_cached_apart() {
+        let named = |url: &str| Attachment {
+            name: "screenshot.png".to_owned(),
+            bytes: 0,
+            kind: AttachmentKind::Image,
+            url: url.to_owned(),
+        };
+        let mine = named("https://im.example/object/alice/a.png");
+        let theirs = named("https://im.example/object/bob/b.png");
+        assert_ne!(mine.key(), theirs.key(), "keying by name would show one twice");
+    }
+
+    #[test]
+    fn an_attachment_with_nowhere_to_fetch_it_from_falls_back_to_its_name() {
+        let local = Attachment {
+            name: "draft.png".to_owned(),
+            bytes: 12,
+            kind: AttachmentKind::Image,
+            url: String::new(),
+        };
+        assert_eq!(local.key(), "draft.png");
     }
 
     #[test]

@@ -287,6 +287,45 @@ impl Session {
             .cloned())
     }
 
+    /// Sends a picture. The SDK uploads the file as part of the send, so all
+    /// this needs is a path that exists; what comes back already carries the
+    /// object-store URL everyone else will fetch it from.
+    pub fn send_image(
+        &mut self,
+        conv: &ConversationId,
+        path: &std::path::Path,
+        snapshot: &mut Snapshot,
+    ) -> Result<(), im_sidecar::Error> {
+        let created = self
+            .sidecar
+            .call("create_image", json!({ "path": path.to_string_lossy() }))?;
+        self.dispatch(conv, created, snapshot)
+    }
+
+    /// Hands a created message to the SDK and folds the echo into the
+    /// snapshot. Every send funnels through here so the "trust the echo, not
+    /// a local guess" rule has exactly one implementation.
+    fn dispatch(
+        &mut self,
+        conv: &ConversationId,
+        created: Value,
+        snapshot: &mut Snapshot,
+    ) -> Result<(), im_sidecar::Error> {
+        let (recv_id, group_id) = match conv.0.strip_prefix("sg_") {
+            Some(g) => (String::new(), g.to_owned()),
+            None => (peer_of(conv, &self.me), String::new()),
+        };
+        let sent = self.sidecar.call(
+            "send",
+            json!({ "message": created, "recv_id": recv_id, "group_id": group_id }),
+        )?;
+        if let Some(mut m) = translate::message(&sent, &self.me, &mut self.interner) {
+            m.send_state = SendState::Sent;
+            snapshot.upsert_message(m);
+        }
+        Ok(())
+    }
+
     /// Sends a message, optionally quoting one and mentioning people. The SDK
     /// echoes it back with its final ids, and that echo is what goes into the
     /// snapshot -- never a local guess.

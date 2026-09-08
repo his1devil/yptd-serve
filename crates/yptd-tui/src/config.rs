@@ -65,6 +65,12 @@ impl Paths {
         self.root.join("data")
     }
 
+    /// Downloaded pictures, keyed by the object store's own file name. Safe
+    /// to delete: anything missing is fetched again.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)?;
         #[cfg(unix)]

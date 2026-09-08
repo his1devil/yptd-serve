@@ -94,6 +94,11 @@ impl Media {
         self.failed.get(key).map(String::as_str)
     }
 
+    /// The picture's own size in pixels, once it has been decoded.
+    pub fn dimensions(&self, key: &str) -> Option<(u32, u32)> {
+        self.sizes.get(key).copied()
+    }
+
     /// Rows this image occupies, from its aspect ratio and the terminal's
     /// cell geometry. Zero when there is nothing to draw.
     pub fn rows_for(&self, key: &str) -> u16 {

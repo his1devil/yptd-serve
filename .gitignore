@@ -11,3 +11,6 @@
 
 # SDK 本地日志目录
 /logs/
+
+# 下载的图片缓存
+/crates/**/cache/

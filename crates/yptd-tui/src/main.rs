@@ -9,6 +9,7 @@
 mod app;
 mod auth;
 mod config;
+mod downloads;
 mod layout;
 mod media;
 mod mouse;
@@ -33,6 +34,7 @@ use tui_theme::Theme;
 
 use crate::app::{App, DraftMention, Mode, Pane};
 use crate::config::{Config, Credentials, Paths};
+use crate::downloads::Downloads;
 use crate::picker::{PickItem, Picker, Purpose, Verdict};
 use crate::render::{Palette, Scene};
 use crate::session::Session;
@@ -48,19 +50,21 @@ const USAGE: &str = "yptd — 终端 IM 客户端
   yptd doctor --frame WxH  同上，但把真实数据渲染成一帧文本输出
   yptd doctor --new 群名 [用户…]   建群并拉人，打印结果
   yptd doctor --reply 用户 文本     引用最新一条并 @ 这个人
+  yptd doctor --img 路径            发一张图片，打印回显里的 URL
   yptd --mock              用内置示例数据启动，不连服务器
   yptd --snapshot WxH [scene] [palette]   离屏出帧（文本）
   yptd --ansi     WxH [scene]             离屏出帧（ANSI）
   yptd --html     WxH [scene] [palette]   离屏出帧（HTML）
 
 界面里：r 引用选中的消息，输入时 @ 提及群成员，
-: 输命令：:new 群名 · :invite [用户…] · :dm [用户] · :help · :q
+: 输命令：:new 群名 · :invite [用户…] · :dm [用户] · :img 路径 · :help · :q
 
 文件都在 ~/.yptd/（或 $YPTD_HOME）。边车二进制通过 $YPTD_SIDECAR、
 yptd 同目录或 PATH 查找。
 ";
 
-const HELP_LINE: &str = ":new 群名 建群并拉人 · :invite [用户…] 拉人进当前群 · :dm [用户] 私聊 · :q 退出";
+const HELP_LINE: &str =
+    ":new 群名 · :invite [用户…] · :dm [用户] · :img 路径 · :q 退出";
 
 fn main() -> Fallible<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -72,6 +76,7 @@ fn main() -> Fallible<()> {
             Some("--frame") => cmd_doctor_frame(args.get(2).map(String::as_str).unwrap_or("120x32")),
             Some("--new") => cmd_doctor_new(args.get(2).map(String::as_str), args.get(3..).unwrap_or(&[])),
             Some("--reply") => cmd_doctor_reply(args.get(2).map(String::as_str), args.get(3..).unwrap_or(&[])),
+            Some("--img") => cmd_doctor_image(args.get(2).map(String::as_str)),
             text => cmd_doctor(text),
         },
         Some("--mock") => run(App::new(im_model::mock::snapshot()), None),
@@ -154,7 +159,7 @@ fn cmd_doctor(text: Option<&str>) -> Fallible<()> {
     let msgs = snapshot.messages_in(&first);
     println!("{} 最近 {} 条，成员 {} 人", first.0, msgs.len(), snapshot.members.len());
     for m in msgs.iter().rev().take(5).rev() {
-        println!("  [{}] {}: {}", m.sent_at_ms(), m.sender_name, m.text().lines().next().unwrap_or(""));
+        println!("  [{}] {}: {}", m.sent_at_ms(), m.sender_name, summarize(m));
     }
     if let Some(text) = text {
         session.send_text(&first, text, None, &[], &mut snapshot)?;
@@ -294,6 +299,45 @@ fn cmd_doctor_reply(user_id: Option<&str>, words: &[String]) -> Fallible<()> {
     Ok(())
 }
 
+/// Sends one picture and prints what came back, so the upload and the URL
+/// the object store hands out can be checked without a terminal.
+fn cmd_doctor_image(path: Option<&str>) -> Fallible<()> {
+    let Some(path) = path.filter(|p| !p.is_empty()) else {
+        return Err("用法: yptd doctor --img 图片路径".into());
+    };
+    let path = resolve_path(path)?;
+    let Live { mut backend, mut snapshot, .. } = connect()?;
+    let Some(conv) = snapshot.conversations.first().map(|c| c.id.clone()) else {
+        return Err("没有会话可发".into());
+    };
+    println!("发送 {} 到 {}", path.display(), conv.0);
+    backend.session.send_image(&conv, &path, &mut snapshot)?;
+    let sent = snapshot
+        .messages_in(&conv)
+        .into_iter()
+        .next_back()
+        .ok_or("发出去的图片没有回到快照里")?;
+    let Some(a) = sent.attachment() else {
+        println!("  ✗ 回显不是附件消息");
+        return Ok(());
+    };
+    println!("回显: {} {} 字节", a.name, a.bytes);
+    if a.url.is_empty() {
+        println!("  ✗ 回显里没有 URL，别人下不到这张图");
+        return Ok(());
+    }
+    println!("  URL: {}", a.url);
+
+    // Fetch it back the way another client would, so the round trip -- not
+    // just the upload -- is what gets checked.
+    let cache = Paths::discover().cache_dir();
+    let bytes = downloads::fetch(&cache, &a.url)?;
+    let image = media::decode(&bytes)?;
+    println!("  取回 {} 字节，解码 {}x{}", bytes.len(), image.width(), image.height());
+    println!("  缓存在 {}", cache.display());
+    Ok(())
+}
+
 /// The SDK session plus the server credentials, which the roster endpoint
 /// wants. Everything the live loop needs besides the UI.
 struct Backend {
@@ -413,6 +457,9 @@ fn parse_size(value: &str) -> (u16, u16) {
 enum Input {
     Terminal(Event),
     Sidecar(im_sidecar::Event),
+    /// A picture finished downloading: its cache key, and the bytes or the
+    /// reason there are none.
+    Image(downloads::Fetched),
     /// A source closed; the loop decides whether that is fatal.
     Closed(&'static str),
 }
@@ -424,6 +471,7 @@ const COALESCE: Duration = Duration::from_millis(40);
 fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>) -> Fallible<()> {
     let theme = Theme::default();
     let (tx, rx) = mpsc::channel::<Input>();
+    let cache = Paths::discover().cache_dir();
 
     // Terminal input on its own thread: `event::read` blocks, and the loop
     // must also wake for sidecar traffic.
@@ -470,6 +518,13 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
     // Protocol negotiation talks to the terminal, so it happens once at
     // startup rather than on the first message that carries a picture.
     let mut media = media::Media::detect();
+    // Nothing to fetch without a server, and nothing to show without a
+    // graphics protocol, so in either case the worker never starts.
+    let mut downloads = if backend.is_some() && media.enabled() {
+        Downloads::start(cache, tx.clone(), Input::Image)
+    } else {
+        Downloads::disabled()
+    };
     if backend.is_none() {
         load_fixture_images(&mut media, &app);
     }
@@ -491,6 +546,19 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
             app.jump_to_latest();
             last_open = Some(open);
             dirty = true;
+        }
+
+        // Ask for any picture in this conversation we have not fetched yet.
+        // Doing it here rather than on arrival covers history too, and the
+        // request set makes repeats free.
+        for message in app.messages() {
+            if let Some(a) = message.attachment()
+                && a.kind == im_model::AttachmentKind::Image
+                && media.rows_for(a.key()) == 0
+                && media.failure(a.key()).is_none()
+            {
+                downloads.request(a.key(), &a.url);
+            }
         }
 
         if dirty {
@@ -577,6 +645,22 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
                     }
                 }
             }
+            Input::Image((key, outcome)) => {
+                match outcome.and_then(|bytes| media::decode(&bytes)) {
+                    Ok(image) => {
+                        media.insert(&key, image);
+                    }
+                    Err(reason) => media.mark_failed(&key, reason),
+                }
+                // A picture changes how tall its message is, so this is a
+                // layout change, not just a repaint.
+                if app.follow_latest {
+                    app.jump_to_latest();
+                }
+                if deadline.is_none() {
+                    deadline = Some(Instant::now() + COALESCE);
+                }
+            }
             Input::Closed("sidecar") => {
                 app.notice = Some("边车已退出，重启 yptd 重连".into());
                 app.snapshot.connected = false;
@@ -590,6 +674,15 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// One line describing a message for the diagnostic output. An attachment
+/// has no text of its own, and an empty line tells the reader nothing.
+fn summarize(message: &im_model::Message) -> String {
+    match message.attachment() {
+        Some(a) if message.text().is_empty() => format!("{} {}", a.kind.glyph(), a.name),
+        _ => message.text().lines().next().unwrap_or("").to_owned(),
+    }
 }
 
 /// Whether an incoming-message event is for the conversation on screen. Off-
@@ -797,10 +890,71 @@ fn execute_command(app: &mut App, mut backend: Option<&mut Backend>, line: &str)
                 open_direct(app, backend, user_id, &nickname);
             }
         },
+        "img" | "image" => {
+            let path = rest.join(" ");
+            if path.is_empty() {
+                app.notice = Some("用法: :img 图片路径".into());
+                return Flow::Continue;
+            }
+            send_image(app, backend, &path);
+        }
         "help" | "h" => app.notice = Some(HELP_LINE.into()),
         other => app.notice = Some(format!("未知命令 :{other}，:help 看列表")),
     }
     Flow::Continue
+}
+
+/// Sends a picture from disk, reporting what went wrong in the status line
+/// rather than in a log nobody is reading.
+fn send_image(app: &mut App, backend: Option<&mut Backend>, path: &str) {
+    let path = match resolve_path(path) {
+        Ok(path) => path,
+        Err(e) => {
+            app.notice = Some(e);
+            return;
+        }
+    };
+    let Some(b) = backend else {
+        app.notice = Some("示例模式下不能发送".into());
+        return;
+    };
+    match b.session.send_image(&app.open, &path, &mut app.snapshot) {
+        Ok(()) => {
+            app.jump_to_latest();
+            app.notice = Some(format!("已发送 {}", file_label(&path)));
+        }
+        Err(e) => app.notice = Some(format!("发送失败: {e}")),
+    }
+}
+
+/// Turns what somebody typed into a path the SDK will accept: `~` expanded,
+/// relative paths resolved, and the file confirmed to exist before the send
+/// so the failure names the path instead of an SDK error code.
+fn resolve_path(raw: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = raw.trim().trim_matches('\'').trim_matches('"');
+    let expanded = match trimmed.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .ok_or_else(|| "找不到 home 目录".to_owned())?
+            .join(rest),
+        None => std::path::PathBuf::from(trimmed),
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("取当前目录失败: {e}"))?
+            .join(expanded)
+    };
+    if !absolute.is_file() {
+        return Err(format!("找不到文件: {}", absolute.display()));
+    }
+    Ok(absolute)
+}
+
+fn file_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn group_of(conv: &ConversationId) -> Option<String> {

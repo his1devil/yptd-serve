@@ -776,13 +776,18 @@ fn render_message(
     }
 
     if let Some(attachment) = message.attachment() {
-        let mut label = format!(
-            "{} {}  {}",
-            attachment.kind.glyph(),
-            attachment.name,
-            format_bytes(attachment.bytes)
-        );
-        if let Some(reason) = media.failure(&attachment.name) {
+        let mut label = format!("{} {}", attachment.kind.glyph(), attachment.name);
+        let key = attachment.key();
+        // OpenIM records no byte count for an uploaded picture, so prefer the
+        // pixel size once it is decoded -- more useful for an image anyway --
+        // and print nothing rather than a confident "0 B".
+        if let Some((w, h)) = media.dimensions(key) {
+            label.push_str(&format!("  {w}×{h}"));
+        } else if attachment.bytes > 0 {
+            label.push_str("  ");
+            label.push_str(&format_bytes(attachment.bytes));
+        }
+        if let Some(reason) = media.failure(key) {
             label.push_str("  (");
             label.push_str(reason);
             label.push(')');
@@ -790,9 +795,9 @@ fn render_message(
         out.push(vec![TuiSpan::styled(label, theme.style(HG::MessageAttachment))]);
 
         // Reserve the rows now; the picture is painted after the text.
-        let rows = media.rows_for(&attachment.name);
+        let rows = media.rows_for(key);
         if rows > 0 {
-            preview = Some((attachment.name.clone(), rows));
+            preview = Some((key.to_owned(), rows));
             for _ in 0..rows {
                 out.push(Vec::new());
             }
