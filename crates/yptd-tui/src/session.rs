@@ -20,6 +20,20 @@ use serde_json::{json, Value};
 use crate::app::DraftMention;
 use crate::config::{Config, Paths};
 
+/// The SDK's "User has logged in repeatedly". Not a failure when the session
+/// it is complaining about is the one being asked for.
+const ALREADY_LOGGED_IN: i32 = 10102;
+
+/// Who the sidecar is currently logged in as, if anyone.
+fn logged_in_user(sidecar: &Sidecar) -> Option<String> {
+    sidecar
+        .call("self", json!({}))
+        .ok()?
+        .get("userID")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 pub struct Session {
     sidecar: Arc<Sidecar>,
     interner: Interner,
@@ -33,6 +47,9 @@ pub struct Session {
     /// OpenIM's reserved id for "@everyone", read from the SDK rather than
     /// hardcoded, since it travels in `atUserList` like a real user id.
     at_all_tag: String,
+    /// True when this session took over a sidecar that was already logged in,
+    /// which means the initial sync happened on some earlier run.
+    resumed: bool,
 }
 
 /// What an incoming event changed, so the caller can decide whether a redraw
@@ -76,7 +93,27 @@ impl Session {
                 "platform_id": crate::auth::platform_id(),
             }),
         )?;
-        sidecar.call("login", json!({ "user_id": user_id, "token": im_token }))?;
+        // An adopted sidecar may already be logged in. That is a good thing --
+        // no re-sync, instant start -- but the SDK reports it as an error, so
+        // the "already there" case has to be recognised rather than obeyed.
+        let mut resumed = false;
+        match sidecar.call("login", json!({ "user_id": user_id, "token": im_token })) {
+            Ok(_) => {}
+            Err(im_sidecar::Error::Sdk { code, msg }) if code == ALREADY_LOGGED_IN => {
+                match logged_in_user(&sidecar) {
+                    Some(who) if who == user_id => resumed = true,
+                    // Somebody else's session: end it and take over, rather
+                    // than driving a client that speaks as the wrong person.
+                    _ => {
+                        let _ = sidecar.call("logout", json!({}));
+                        sidecar
+                            .call("login", json!({ "user_id": user_id, "token": im_token }))
+                            .map_err(|_| im_sidecar::Error::Sdk { code, msg })?;
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         let at_all_tag = sidecar
             .call("at_all_tag", json!({}))
@@ -91,6 +128,7 @@ impl Session {
                 interner: Interner::default(),
                 me: UserId(user_id.to_owned()),
                 my_name: nickname.to_owned(),
+                resumed,
                 loaded: HashSet::new(),
                 members_for: None,
                 at_all_tag,
@@ -278,6 +316,12 @@ impl Session {
         snapshot.set_members(members);
         self.members_for = Some(group_id.to_owned());
         Ok(true)
+    }
+
+    /// Whether an already-synced session was taken over, in which case there
+    /// is no first sync to wait for.
+    pub fn resumed(&self) -> bool {
+        self.resumed
     }
 
     pub fn at_all_tag(&self) -> &str {

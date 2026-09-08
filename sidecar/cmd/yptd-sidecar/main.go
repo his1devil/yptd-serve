@@ -70,20 +70,20 @@ func run(socket, dataDir, logPath string) error {
 		_ = listener.Close()
 	}()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return fmt.Errorf("accept: %w", err)
+	// One client, then exit. The SDK holds a single global session, so a
+	// second connection would be sharing one login; and a sidecar that
+	// outlives its client is worse than useless -- it keeps that login held,
+	// so the next start is told the user "has logged in repeatedly".
+	conn, err := listener.Accept()
+	if err != nil {
+		if errors.Is(err, net.ErrClosed) {
+			return nil
 		}
-		// One client at a time, on purpose: the SDK holds a single global
-		// session, so a second connection would be sharing one login. Serving
-		// it serially makes that obvious instead of subtly wrong.
-		serve(conn)
-		log.Print("client disconnected")
+		return fmt.Errorf("accept: %w", err)
 	}
+	serve(conn)
+	log.Print("client disconnected, exiting")
+	return nil
 }
 
 // maxSocketPath is the sockaddr_un limit: 104 bytes on macOS, 108 on Linux.

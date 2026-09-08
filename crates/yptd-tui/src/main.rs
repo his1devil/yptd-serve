@@ -380,9 +380,20 @@ fn connect() -> Fallible<Live> {
         Session::start(&paths, &config, &creds.user_id, &creds.nickname, &im_token)?;
     eprint!("同步会话… ");
     let mut snapshot = Snapshot::default();
-    let synced = session.wait_for_sync(&events, &mut snapshot, Duration::from_secs(20));
+    // A session taken over from an earlier run has already synced; waiting
+    // would only stall the start for a sync that is never going to be
+    // announced again.
+    let synced = session.resumed()
+        || session.wait_for_sync(&events, &mut snapshot, Duration::from_secs(20));
     session.bootstrap(&mut snapshot)?;
-    eprintln!("{}", if synced { "好。" } else { "未等到同步完成，先用本地数据。" });
+    eprintln!(
+        "{}",
+        match (session.resumed(), synced) {
+            (true, _) => "好（沿用上次的会话）。",
+            (_, true) => "好。",
+            _ => "未等到同步完成，先用本地数据。",
+        }
+    );
     Ok(Live {
         backend: Backend { session, config, creds },
         events,

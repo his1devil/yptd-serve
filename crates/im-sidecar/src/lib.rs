@@ -97,7 +97,9 @@ pub struct Config {
 
 /// A running sidecar with its request channel.
 pub struct Sidecar {
-    child: Child,
+    /// `None` when an already-running sidecar was adopted rather than
+    /// started, in which case it is not ours to kill.
+    child: Option<Child>,
     writer: Mutex<BufWriter<UnixStream>>,
     pending: Arc<Mutex<HashMap<u64, Sender<Frame>>>>,
     next_id: AtomicU64,
@@ -116,21 +118,30 @@ impl Sidecar {
             std::fs::create_dir_all(parent)?;
         }
 
-        let child = Command::new(&binary)
-            .arg("--socket")
-            .arg(&config.socket)
-            .arg("--data-dir")
-            .arg(&config.data_dir)
-            // The sidecar redirects its own stdio into a log file; these are
-            // belt-and-braces so nothing reaches the terminal even before it
-            // gets that far.
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| Error::Spawn(format!("{}: {e}", binary.display())))?;
-
-        let stream = connect_with_retry(&config.socket, CONNECT_DEADLINE)?;
+        // A sidecar left behind by a client that died without cleaning up is
+        // still a working sidecar, and adopting it is both faster and kinder
+        // than refusing to start. Starting a second one would fail anyway:
+        // it cannot bind a socket that is already taken.
+        let (child, stream) = match UnixStream::connect(&config.socket) {
+            Ok(stream) => (None, stream),
+            Err(_) => {
+                let child = Command::new(&binary)
+                    .arg("--socket")
+                    .arg(&config.socket)
+                    .arg("--data-dir")
+                    .arg(&config.data_dir)
+                    // The sidecar redirects its own stdio into a log file;
+                    // these are belt-and-braces so nothing reaches the
+                    // terminal even before it gets that far.
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| Error::Spawn(format!("{}: {e}", binary.display())))?;
+                let stream = connect_with_retry(&config.socket, CONNECT_DEADLINE)?;
+                (Some(child), stream)
+            }
+        };
         let reader = BufReader::new(stream.try_clone()?);
         let writer = Mutex::new(BufWriter::new(stream));
 
@@ -194,16 +205,24 @@ impl Sidecar {
 
     /// Whether the child process is still running.
     pub fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            // An adopted sidecar has no handle to poll; the link itself is
+            // the only evidence, and the reader thread reports when it goes.
+            None => true,
+        }
     }
 }
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        // Closing our end of the socket lets the sidecar finish its current
-        // client; killing is the fallback for a process that does not exit.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Closing our end of the socket is enough: the sidecar serves one
+        // client and exits when it goes. Killing is the fallback for a
+        // process that ignores that, and only for one we started.
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
