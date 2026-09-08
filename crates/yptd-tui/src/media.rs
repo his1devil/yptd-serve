@@ -80,11 +80,14 @@ impl Media {
     }
 
     /// Registers a decoded image and returns the rows it will occupy.
-    pub fn insert(&mut self, key: &str, image: DynamicImage) -> u16 {
+    ///
+    /// `natural` is the picture's size before [`decode`] shrank it, because
+    /// that is the size worth telling the reader about.
+    pub fn insert(&mut self, key: &str, image: DynamicImage, natural: (u32, u32)) -> u16 {
         let Some(picker) = self.picker.as_mut() else {
             return 0;
         };
-        let (w, h) = (image.width(), image.height());
+        let (w, h) = natural;
         self.revision = self.revision.wrapping_add(1);
         self.sizes.insert(key.to_owned(), (w, h));
         self.protocols
@@ -207,6 +210,37 @@ impl Default for Media {
     }
 }
 
+/// The longest edge a picture keeps once decoded.
+///
+/// A phone photo is twenty-odd megapixels; a terminal shows it in a few
+/// hundred. Resizing straight from the original with a good filter costs
+/// about half a second *per picture*, and that happens on the drawing thread
+/// -- which is what makes a conversation full of photos freeze on open.
+/// Shrinking once, cheaply, up front leaves the final resize working on a
+/// twentieth of the pixels and still far more than the screen can show.
+const MAX_STORED_EDGE: u32 = 1600;
+
+/// Decodes image bytes and shrinks them to something a terminal can use.
+///
+/// Returns the picture and its size before shrinking, which is what the
+/// attachment line reports.
+pub fn decode_for_display(bytes: &[u8]) -> Result<(DynamicImage, (u32, u32)), String> {
+    let image = decode(bytes)?;
+    let natural = (image.width(), image.height());
+    let longest = natural.0.max(natural.1);
+    if longest <= MAX_STORED_EDGE {
+        return Ok((image, natural));
+    }
+    // Triangle, not Lanczos: this step throws away most of the pixels, and
+    // the quality that matters comes from the final resize onto the cells.
+    let shrunk = image.resize(
+        MAX_STORED_EDGE,
+        MAX_STORED_EDGE,
+        image::imageops::FilterType::Triangle,
+    );
+    Ok((shrunk, natural))
+}
+
 /// Decodes image bytes, rejecting anything implausible before handing it to
 /// the decoder.
 ///
@@ -277,7 +311,7 @@ mod tests {
     fn a_disabled_media_never_reserves_rows() {
         let mut m = Media::disabled();
         assert!(!m.enabled());
-        assert_eq!(m.insert("a.png", gradient(100, 100)), 0);
+        assert_eq!(m.insert("a.png", gradient(100, 100), (100, 100)), 0);
         assert_eq!(m.rows_for("a.png"), 0);
         assert_eq!(m.protocol_name(), "off");
     }
@@ -331,7 +365,7 @@ mod tests {
         // Without a picker there is no cell geometry, so this asserts the
         // no-terminal path stays at zero rather than guessing.
         let mut m = Media::disabled();
-        m.insert("tall.png", gradient(10, 10_000));
+        m.insert("tall.png", gradient(10, 10_000), (10, 10_000));
         assert_eq!(m.rows_for("tall.png"), 0);
         assert!(MAX_PREVIEW_ROWS <= 12, "cap must stay modest");
     }

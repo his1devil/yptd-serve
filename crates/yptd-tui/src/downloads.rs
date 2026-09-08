@@ -17,9 +17,13 @@ use std::time::Duration;
 const MAX_BYTES: u64 = 24 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// What the worker sends back: the cache key it was asked about, and the
-/// bytes or the reason there are none.
-pub type Fetched = (String, Result<Vec<u8>, String>);
+/// What the worker sends back: the cache key, and either a picture ready to
+/// hand to the terminal along with its original size, or why there is none.
+///
+/// Decoded and shrunk here rather than on the main thread: a twenty-megapixel
+/// photo costs a tenth of a second to decode and half a second to resize, and
+/// doing that while drawing is what freezes a conversation full of photos.
+pub type Fetched = (String, Result<(image::DynamicImage, (u32, u32)), String>);
 
 pub struct Downloads {
     jobs: Option<Sender<(String, String)>>,
@@ -43,7 +47,8 @@ impl Downloads {
             .name("image-downloads".into())
             .spawn(move || {
                 for (key, url) in rx {
-                    let outcome = fetch(&worker_cache, &url);
+                    let outcome = fetch(&worker_cache, &url)
+                        .and_then(|bytes| crate::media::decode_for_display(&bytes));
                     if results.send(wake((key, outcome))).is_err() {
                         break;
                     }
@@ -215,6 +220,37 @@ mod tests {
     fn a_disabled_downloader_queues_nothing() {
         let mut downloads = Downloads::disabled();
         assert!(!downloads.request("k", "https://h/x.png"));
+    }
+
+    #[test]
+    fn a_big_photo_is_shrunk_before_the_drawing_thread_sees_it() {
+        // A phone photo is twenty-odd megapixels. Resizing that with a good
+        // filter costs about half a second, and the drawing thread is the one
+        // place that cost must not land.
+        let big = image::DynamicImage::new_rgb8(4284, 5712);
+        let mut bytes = Vec::new();
+        big.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("encode");
+        let (small, natural) = crate::media::decode_for_display(&bytes).expect("decode");
+        assert_eq!(natural, (4284, 5712), "the original size is still reported");
+        assert!(small.width().max(small.height()) <= 1600, "{}x{}", small.width(), small.height());
+        assert_eq!(
+            small.width() * 5712,
+            small.height() * 4284,
+            "proportions are kept"
+        );
+    }
+
+    #[test]
+    fn a_picture_small_enough_already_is_left_alone() {
+        let small = image::DynamicImage::new_rgb8(800, 600);
+        let mut bytes = Vec::new();
+        small
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("encode");
+        let (kept, natural) = crate::media::decode_for_display(&bytes).expect("decode");
+        assert_eq!((kept.width(), kept.height()), (800, 600));
+        assert_eq!(natural, (800, 600));
     }
 
     #[test]

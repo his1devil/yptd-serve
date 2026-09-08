@@ -346,8 +346,15 @@ fn cmd_doctor_image(path: Option<&str>) -> Fallible<()> {
     // just the upload -- is what gets checked.
     let cache = Paths::discover().cache_dir();
     let bytes = downloads::fetch(&cache, &a.url)?;
-    let image = media::decode(&bytes)?;
-    println!("  取回 {} 字节，解码 {}x{}", bytes.len(), image.width(), image.height());
+    let (image, natural) = media::decode_for_display(&bytes)?;
+    println!(
+        "  取回 {} 字节，原图 {}x{}，存为 {}x{}",
+        bytes.len(),
+        natural.0,
+        natural.1,
+        image.width(),
+        image.height()
+    );
     println!("  缓存在 {}", cache.display());
     Ok(())
 }
@@ -767,9 +774,9 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
                 }
             }
             Input::Image((key, outcome)) => {
-                match outcome.and_then(|bytes| media::decode(&bytes)) {
-                    Ok(image) => {
-                        media.insert(&key, image);
+                match outcome {
+                    Ok((image, natural)) => {
+                        media.insert(&key, image, natural);
                     }
                     Err(reason) => media.mark_failed(&key, reason),
                 }
@@ -834,10 +841,11 @@ fn load_fixture_images(media: &mut media::Media, app: &App) {
         }
         // Encode then decode, so the fixture exercises the same path a real
         // attachment will take rather than a shortcut around it.
-        let decoded = media::demo_image_png(&attachment.name).and_then(|b| media::decode(&b));
+        let decoded =
+            media::demo_image_png(&attachment.name).and_then(|b| media::decode_for_display(&b));
         match decoded {
-            Ok(image) => {
-                media.insert(&attachment.name, image);
+            Ok((image, natural)) => {
+                media.insert(&attachment.name, image, natural);
             }
             Err(reason) => media.mark_failed(&attachment.name, reason),
         }
