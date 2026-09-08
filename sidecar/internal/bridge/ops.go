@@ -292,6 +292,35 @@ func (h *Handler) Dispatch(op string, raw json.RawMessage) (json.RawMessage, err
 	case "at_all_tag":
 		return jsonOrString(open_im_sdk.GetAtAllTag(operationID())), nil
 
+	// A custom message is the only envelope OpenIM offers for something that
+	// is not itself a message -- a reaction, say. `content_type` overrides
+	// what the SDK stamps on it, which is how 119 (the kind that does not
+	// bump a conversation) gets used.
+	case "create_custom":
+		var a struct {
+			Data        string `json:"data"`
+			Extension   string `json:"extension"`
+			Description string `json:"description"`
+			ContentType int32  `json:"content_type"`
+		}
+		if err := args(raw, &a); err != nil {
+			return nil, err
+		}
+		created := open_im_sdk.CreateCustomMessage(operationID(), a.Data, a.Extension, a.Description)
+		if a.ContentType == 0 {
+			return jsonOrString(created), nil
+		}
+		var msg map[string]any
+		if err := json.Unmarshal([]byte(created), &msg); err != nil {
+			return nil, fmt.Errorf("create_custom: %w", err)
+		}
+		msg["contentType"] = a.ContentType
+		out, err := json.Marshal(msg)
+		if err != nil {
+			return nil, err
+		}
+		return json.RawMessage(out), nil
+
 	case "create_image":
 		var a struct {
 			Path string `json:"path"`
