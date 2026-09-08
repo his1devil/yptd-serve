@@ -1,10 +1,10 @@
 [package]
-name = "im-model"
+name = "im-sidecar"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Domain model for the yptd terminal IM client"
+description = "Rust client for the yptd OpenIM sidecar (NDJSON over a Unix socket)"
 
 [dependencies]
 serde = { workspace = true }

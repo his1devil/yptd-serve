@@ -5,6 +5,7 @@
 //! who has seen a message rather than a per-user acknowledgement.
 
 pub mod mock;
+pub mod translate;
 
 /// Epoch for synthetic message ids: 2020-01-01T00:00:00Z.
 pub const EPOCH_MS: i64 = 1_577_836_800_000;
@@ -278,6 +279,35 @@ impl Snapshot {
 
     pub fn total_mentions(&self) -> u32 {
         self.conversations.iter().map(|c| c.mentions).sum()
+    }
+
+    /// Inserts or replaces a conversation, keeping the list ordered by most
+    /// recent activity so the sidebar reads newest-first without a sort on
+    /// every frame.
+    pub fn upsert_conversation(&mut self, conversation: Conversation) {
+        match self.conversations.iter().position(|c| c.id == conversation.id) {
+            Some(i) => self.conversations[i] = conversation,
+            None => self.conversations.push(conversation),
+        }
+        self.conversations
+            .sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
+    }
+
+    /// Inserts or replaces a message by id. A message that arrives twice --
+    /// history and live push -- lands on the same id and overwrites in place.
+    pub fn upsert_message(&mut self, message: Message) {
+        match self.messages.iter().position(|m| m.id == message.id) {
+            Some(i) => self.messages[i] = message,
+            None => self.messages.push(message),
+        }
+    }
+
+    pub fn set_members(&mut self, members: Vec<Member>) {
+        self.members = members;
+    }
+
+    pub fn conversation_mut(&mut self, id: &ConversationId) -> Option<&mut Conversation> {
+        self.conversations.iter_mut().find(|c| &c.id == id)
     }
 }
 

@@ -147,12 +147,20 @@ pub fn capture(
     height: u16,
     scene: Scene,
 ) -> Result<Buffer, Box<dyn std::error::Error>> {
-    let theme = Theme::default();
     let mut app = App::new(im_model::mock::snapshot());
     scene.apply(&mut app);
+    capture_app(width, height, &app)
+}
 
+/// Renders whatever `app` holds -- mock or live -- into an off-screen buffer.
+pub fn capture_app(
+    width: u16,
+    height: u16,
+    app: &App,
+) -> Result<Buffer, Box<dyn std::error::Error>> {
+    let theme = Theme::default();
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
-    terminal.draw(|frame| ui::draw_static(frame, &app, &theme))?;
+    terminal.draw(|frame| ui::draw_static(frame, app, &theme))?;
     Ok(terminal.backend().buffer().clone())
 }
 

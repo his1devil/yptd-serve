@@ -5,38 +5,66 @@
 交互与视觉设计参考 [concord](https://github.com/chojs23/concord)（Discord 的 TUI 客户端），
 但代码从零编写，不含其 GPL 代码。
 
-> **当前状态：渲染层骨架。** 数据来自 `im-model::mock` 的固定快照，
-> OpenIM 边车尚未接入，因此不需要任何服务端或账号就能跑起来看。
+> **当前状态：已接真实后端。** `yptd login` 用邀请码登录一次，之后 `yptd`
+> 直接进入：会话列表、历史、群成员、发文本、实时推送都走 OpenIM。
+> 没账号也能跑 `yptd --mock` 看渲染。
 
 ---
 
-## 快速查看
+## 组成
 
-只需要 Rust 1.90+：
-
-```sh
-# 没装 Rust 的话
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-git clone https://github.com/his1devil/yptd-serve.git yptd-tui
-cd yptd-tui
-cargo run
+```
+crates/yptd-tui   Rust 终端客户端（本仓库主体）
+sidecar/          Go 边车：把 openim-sdk-core 包成本地 Unix socket 上的 NDJSON 服务
+server/           Go 服务端 yptd-server：邀请码、设备凭据、换 OpenIM token；自带管理 CLI
 ```
 
-`q` 退出。首次编译约 30 秒。
+OpenIM 的 WebSocket 帧用 Go 的 `encoding/gob` 编码，Rust 没有实现，
+所以 SDK 逻辑留在 Go 里，TUI 通过边车拿数据。边车与 `yptd` 是两个二进制，
+`yptd` 启动时自动拉起并在退出时收掉，用户不需要知道它存在。
 
-### 不进交互也能看
+---
 
-三种离屏输出，方便截图、比对和回归：
+## 安装与登录
+
+需要 Rust 1.90+、Go 1.24+ 和 C 编译器（边车里的 sqlite 走 CGO）。
 
 ```sh
-# 纯文本，管道友好
-cargo run -- --snapshot 112x28 top
+git clone https://github.com/his1devil/yptd-serve.git yptd-tui
+cd yptd-tui
+make install            # 构建 release 并装到 ~/.cargo/bin：yptd + yptd-sidecar
+```
 
-# 真 ANSI —— 用你自己终端的配色，这才是真实观感
-cargo run -- --ansi 112x28 top
+找管理员要一个邀请码（形如 `YPTD-XXXX-XXXX`，24 小时内有效，只能用一次）：
 
-# 单文件 HTML，逐格定宽，可直接用浏览器打开或截图
+```sh
+yptd login              # 邀请码 → 昵称 → 用户名（可留空）
+yptd                    # 以后每次就这一条
+```
+
+登录时服务端返回一个**设备凭据**，存在 `~/.yptd/credentials.toml`（0600）。
+之后每次启动用它换一个新的 OpenIM token，token 本身不落盘。
+`yptd logout` 删掉本机凭据；管理员 `yptd-server user revoke <id>` 可远程吊销。
+
+不想装到 PATH 的话，`make` 之后 `./target/debug/yptd` 也行——边车放在同目录即可，
+也可用 `$YPTD_SIDECAR` 指定路径。所有文件都在 `~/.yptd/`（或 `$YPTD_HOME`）。
+
+### 不进界面的自检
+
+```sh
+yptd doctor                       # 登录、起边车、拉会话与历史，监听 8 秒推送
+yptd doctor "hello"               # 同上，并向最近的会话发一条
+yptd doctor --frame 120x32        # 把真实数据渲染成一帧文本，ssh 里也能看
+```
+
+---
+
+## 只看渲染
+
+```sh
+cargo run -- --mock               # 内置示例数据，不连服务器
+cargo run -- --snapshot 112x28 top       # 纯文本
+cargo run -- --ansi 112x28 top           # 真 ANSI，用你自己终端的配色
 cargo run -- --html 112x28 top dark > frame.html
 ```
 
@@ -46,11 +74,9 @@ cargo run -- --html 112x28 top dark > frame.html
 | --- | --- |
 | `live` | 默认。跟随最新消息，含附件、发送失败、ghost 回复 |
 | `top` | 会话顶部。日期分隔线、系统通知、提及高亮、reaction、已读回执 |
-| `code` | 围栏代码块与行内代码 |
+| `code` | 围栏代码块与 syntect 语法高亮 |
 | `nav` | 焦点在会话栏，一个分类被折叠 |
 | `insert` | 输入模式，composer 激活 |
-
-配色只影响 `--html`（`dark` / `light`）。终端里跑时用你自己的配色。
 
 ---
 
@@ -67,8 +93,12 @@ cargo run -- --html 112x28 top dark > frame.html
 | `Enter` | 打开会话；在分类上则折叠 |
 | `z` | 折叠 / 展开分类 |
 | `i` | 进入 INSERT（`Esc` 退出） |
+| `Enter` / `S-Enter` | INSERT 里：发送 / 换行 |
+| `C-a` `C-e` `C-u` `C-k` `C-w`、`M-←` `M-→` | INSERT 里的行编辑 |
 | `:` | 进入 COMMAND（`Esc` 退出） |
 | `q` | 退出 |
+
+鼠标：点击切换焦点与选中，双击会话打开，滚轮滚动各栏。
 
 `/` 留给 composer 里的 agent 命令，`:` 留给客户端命令——两者语义不同，刻意分开。
 
@@ -88,11 +118,23 @@ cargo run -- --html 112x28 top dark > frame.html
 
 ---
 
+## 运行时的几条约定
+
+- **一个通道，两个来源。** 终端输入和边车事件各占一个线程，都推进同一个 `mpsc`，
+  主循环只做 `recv()`，不轮询。键盘和鼠标立刻重绘；后台事件先合并 40 ms 再画一帧，
+  且只有当变化落在屏幕上（当前会话的消息、侧栏、连接状态）才画。
+- **登录后等同步。** SDK 的 `Login` 在 socket 建好时就返回，会话与群是之后异步拉进本地库的；
+  客户端等到 `OnSyncServerFinish`（最多 20 秒，连接后静默 1.5 秒也算）再读列表，
+  否则第一帧是空的。
+- **发出去的消息以 SDK 回显为准。** 不在本地猜 ID；`send` 返回的完整消息进快照。
+- **历史按会话懒拉一次**（最新 60 条）并标记已读；同步完成后清掉缓存重新拉。
+
+---
+
 ## 测试
 
 ```sh
-cargo test          # 97 个
-cargo build         # 应当零警告
+make test           # cargo test + go test
 ```
 
 值得一看的几条，它们守着容易写错的地方：
@@ -103,6 +145,8 @@ cargo build         # 应当零警告
 - `cjk_is_measured_two_cells_wide` —— 中文按显示宽度而非字符数换行。
 - `spans_survive_a_rewrite_that_lengthens_the_text` —— 文本改写后标注跟着平移，不重新解析。
 - `scrolling_to_a_message_keeps_its_own_divider_in_view` —— 分隔线属于它引出的那条消息。
+- `a_garbage_send_time_still_yields_distinct_ids` —— `sendTime` 缺失也不会让两条消息撞 ID。
+- `sending_in_mock_mode_keeps_the_draft_and_explains` —— 发送失败不能吞掉草稿。
 
 ---
 
@@ -112,11 +156,14 @@ cargo build         # 应当零警告
 crates/
   tui-theme/     具名高亮组 + link 继承；颜色与边框几何分离
   tui-richtext/  纯文本 + 字节区间标注；改写重映射、宽度感知换行、Markdown 子集
-  im-model/      OpenIM 语义的领域模型 + 合成雪花 ID + mock 快照
-  yptd-tui/      三栏骨架、消息行渲染、双光标、离屏截帧
+  tui-textedit/  composer 的文本缓冲：字素边界、词跳、纵向移动
+  im-model/      OpenIM 语义的领域模型 + 合成雪花 ID + mock 快照 + SDK JSON 翻译
+  im-sidecar/    边车进程管理与 NDJSON 请求/事件通道
+  yptd-tui/      三栏骨架、消息行渲染、双光标、图片、离屏截帧、登录与会话
 ```
 
-依赖方向单向：`yptd-tui` → `im-model` / `tui-richtext` / `tui-theme`，反向不可见。
+依赖方向单向：`yptd-tui` → `im-sidecar` / `im-model` / `tui-*`，反向不可见。
+`im-model::translate` 是 SDK JSON 进入领域模型的唯一入口；`App` 从不看到 SDK 字段名。
 
 ### 两个设计要点
 
@@ -128,14 +175,29 @@ crates/
 **消息 ID 自带时间。** OpenIM 用 `clientMsgID`(UUID) + 每会话 `seq` 标识消息，
 两者都不能跨会话排序。把发送时间打进高 42 位，一次拿到三样东西：
 与真实时间一致的全序、不必单独存储的时间戳、以及便宜到能当 `BTreeMap` 键的 `Copy` 类型。
-低 22 位是毫秒内计数器。
+低 22 位是毫秒内计数器；`clientMsgID` ↔ ID 的映射在 `Interner` 里。
+
+---
+
+## 服务端
+
+部署与运维见 `server/`。管理员常用：
+
+```sh
+yptd-server invite new "给谁的"      # 生成邀请码
+yptd-server invite list -a
+yptd-server user list
+yptd-server user disable <userID>   # 停用（同时吊销设备凭据）
+yptd-server user revoke <userID>    # 只吊销凭据，账号保留
+yptd-server check                   # Mongo 与 OpenIM 连通性
+```
 
 ---
 
 ## 尚未实现
 
-模糊会话切换器、leader 键提示窗、弹层、滚动条、syntect 语法高亮、
-终端内图片（Kitty / iTerm2 / Sixel）、可配置键位、OpenIM 边车。
+建群 / 拉人的界面、引用与 @ 发送、发图片、reaction、模糊会话切换器、
+leader 键提示窗、可配置键位、钥匙串存凭据（目前是 0600 文件）。
 
 ## 许可
 

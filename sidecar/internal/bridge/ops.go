@@ -144,17 +144,17 @@ func (h *Handler) Dispatch(op string, raw json.RawMessage) (json.RawMessage, err
 			"logFilePath":         a.DataDir,
 			"isExternalExtensions": false,
 		})
-		// Listeners must be registered before InitSDK: the SDK starts its
-		// connection machinery inside that call, and an event fired before a
-		// listener exists is simply lost.
+		// InitSDK creates the SDK's user object; every Set*Listener before it
+		// is dropped with a "UserForSDK is nil" warning. So: init, then
+		// listeners, then login -- login is what starts the traffic.
+		if !open_im_sdk.InitSDK(Conn{Out: h.Out}, operationID(), string(config)) {
+			return nil, errors.New("InitSDK 失败，检查 api_addr / ws_addr 格式")
+		}
 		open_im_sdk.SetConversationListener(Conversation{Out: h.Out})
 		open_im_sdk.SetAdvancedMsgListener(Message{Out: h.Out})
 		open_im_sdk.SetBatchMsgListener(Batch{Out: h.Out})
 		open_im_sdk.SetGroupListener(Group{Out: h.Out})
 		open_im_sdk.SetUserListener(User{Out: h.Out})
-		if !open_im_sdk.InitSDK(Conn{Out: h.Out}, operationID(), string(config)) {
-			return nil, errors.New("InitSDK 失败，检查 api_addr / ws_addr 格式")
-		}
 		return json.RawMessage(`{"ok":true}`), nil
 
 	case "login":

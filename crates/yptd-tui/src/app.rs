@@ -90,6 +90,13 @@ pub struct App {
     pub message_line_map: Vec<Option<usize>>,
     pub show_members: bool,
     pub show_conversations: bool,
+    /// A one-line status message: a send failure, a lost sidecar. Cleared on
+    /// the next keypress so it never lingers past its relevance.
+    pub notice: Option<String>,
+    /// Added to every timestamp before display. Zero for the mock and the
+    /// off-screen captures so a test renders the same in every time zone;
+    /// the live client sets it from the machine's zone at startup.
+    pub utc_offset_ms: i64,
 }
 
 impl App {
@@ -114,6 +121,8 @@ impl App {
             message_line_map: Vec::new(),
             show_members: true,
             show_conversations: true,
+            notice: None,
+            utc_offset_ms: 0,
         };
         app.jump_to_latest();
         app
@@ -137,6 +146,8 @@ impl App {
             message_line_map: Vec::new(),
             show_members: self.show_members,
             show_conversations: self.show_conversations,
+            notice: self.notice.clone(),
+            utc_offset_ms: self.utc_offset_ms,
         }
     }
 

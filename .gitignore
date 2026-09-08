@@ -8,3 +8,6 @@
 /sidecar/logs/
 /sidecar/OpenIM.log*
 **/*.log
+
+# SDK 本地日志目录
+/logs/

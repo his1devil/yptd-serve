@@ -95,6 +95,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, media: &Media, theme: &
             theme.style(HG::SyncProgress),
         ));
     }
+    if let Some(notice) = &app.notice {
+        left.push(TuiSpan::styled(format!("  {notice}"), theme.style(HG::Warning)));
+    }
 
     let unread = app.snapshot.total_unread();
     let mentions = app.snapshot.total_mentions();
@@ -444,9 +447,9 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
     for (index, message) in messages.iter().enumerate() {
         let previous = index.checked_sub(1).and_then(|i| messages.get(i)).copied();
 
-        if starts_new_day(message, previous) {
+        if starts_new_day(message, previous, app.utc_offset_ms) {
             out.push(divider(
-                &format!(" {} ", format_date(message.sent_at_ms())),
+                &format!(" {} ", format_date(message.sent_at_ms() + app.utc_offset_ms)),
                 theme.style(HG::DateDivider),
                 width,
                 index,
@@ -467,7 +470,7 @@ fn build_message_lines(app: &App, theme: &Theme, media: &Media, width: usize) ->
             out.push(gutter_line(Vec::new(), selected, theme, Some(index)));
         }
 
-        let (lines, preview) = render_message(message, theme, width, show_header, palette, media);
+        let (lines, preview) = render_message(message, theme, width, show_header, palette, media, app.utc_offset_ms);
         let image_row = preview
             .as_ref()
             .map(|(_, rows)| lines.len() - *rows as usize);
@@ -522,6 +525,7 @@ fn render_message(
     show_header: bool,
     palette: syntax::Palette,
     media: &Media,
+    utc_offset_ms: i64,
 ) -> (Vec<Vec<TuiSpan<'static>>>, Option<(String, u16)>) {
     let mut out = Vec::new();
     let mut preview: Option<(String, u16)> = None;
@@ -546,7 +550,7 @@ fn render_message(
             theme.style(if ghost { HG::GhostMessage } else { HG::MessageAuthor }),
         ));
         header.push(TuiSpan::styled(
-            format!("  {}", format_time(message.sent_at_ms())),
+            format!("  {}", format_time(message.sent_at_ms() + utc_offset_ms)),
             theme.style(HG::MessageTimestamp),
         ));
         if message.edited {
@@ -786,10 +790,12 @@ fn starts_author_group(message: &Message, previous: Option<&Message>) -> bool {
         || previous.visibility != message.visibility
 }
 
-fn starts_new_day(message: &Message, previous: Option<&Message>) -> bool {
+fn starts_new_day(message: &Message, previous: Option<&Message>, offset_ms: i64) -> bool {
     match previous {
         None => true,
-        Some(previous) => day_index(message.sent_at_ms()) != day_index(previous.sent_at_ms()),
+        Some(previous) => {
+            day_index(message.sent_at_ms() + offset_ms) != day_index(previous.sent_at_ms() + offset_ms)
+        }
     }
 }
 
@@ -797,9 +803,8 @@ fn day_index(unix_ms: i64) -> i64 {
     unix_ms.div_euclid(86_400_000)
 }
 
-/// UTC formatting, deliberately dependency-free for now. Local-zone handling
-/// arrives with the real backend, where the offset has to come from config
-/// anyway.
+/// Formats a wall-clock time. Callers pass a timestamp already shifted by
+/// `App::utc_offset_ms`, so this stays a pure function of its input.
 fn format_time(unix_ms: i64) -> String {
     let seconds = unix_ms.div_euclid(1000);
     let minute_of_day = seconds.rem_euclid(86_400) / 60;
