@@ -1,7 +1,7 @@
 //! Rendering. Every color comes from a named highlight group -- there is not a
 //! single `Color::` literal below this line.
 
-use im_model::{Body, ConversationId, Message, SendState, Visibility};
+use im_model::{Body, ConversationId, Member, Message, SendState, Visibility};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span as TuiSpan};
@@ -1106,6 +1106,7 @@ fn build_message_lines(
     let unread_at = app.unread_boundary();
     let mut out: Vec<PaneLine> = Vec::new();
 
+    let members = app.members();
     let runs = album_runs(&messages);
     let superseded = superseded_placeholders(&messages);
     // The first row says what scrolling up will do, so nobody has to guess
@@ -1171,7 +1172,7 @@ fn build_message_lines(
             };
             let mut entry = content_line(line, Some((index, run_len)), Some(owner), addressed);
             if show_header && offset == 0 {
-                entry.avatar = Some(avatar_for(message));
+                entry.avatar = Some(avatar_for(message, &members));
             }
             if offset == first_block_row && block_rows > 0 {
                 entry.album = preview.clone();
@@ -1183,11 +1184,21 @@ fn build_message_lines(
 }
 
 /// The avatar for one message's sender.
-fn avatar_for(message: &Message) -> Avatar {
+///
+/// The member list wins over the copy stamped on the message: OpenIM writes
+/// the sender's picture into each message as it is sent, so a person who
+/// changes their picture would otherwise keep the old one on everything they
+/// said before. A direct conversation has no member list, and there the
+/// message's own copy is all there is.
+fn avatar_for(message: &Message, members: &[&Member]) -> Avatar {
+    let current = members
+        .iter()
+        .find(|m| m.id == message.sender)
+        .and_then(|m| m.avatar.clone());
     Avatar {
         // Keyed by URL, the same rule attachments use: two people's
         // pictures are two pictures even with the same file name.
-        key: message.sender_avatar.clone(),
+        key: current.or_else(|| message.sender_avatar.clone()),
         // A grapheme, not a byte: a name starting with a Chinese character or
         // an emoji must not be cut in half.
         initial: message

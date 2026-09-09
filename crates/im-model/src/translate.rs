@@ -442,9 +442,11 @@ pub fn member(v: &Value) -> Option<Member> {
         return None;
     }
     let nick = str_of(v, "nickname");
+    let face = str_of(v, "faceURL");
     Some(Member {
         id: UserId(id.to_owned()),
         name: if nick.is_empty() { id.to_owned() } else { nick.to_owned() },
+        avatar: (!face.is_empty()).then(|| face.to_owned()),
         role: Role::from_level(i64_of(v, "roleLevel").max(0) as u32),
         online: false,
         is_bot: false,

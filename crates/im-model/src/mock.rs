@@ -307,6 +307,7 @@ pub fn snapshot() -> Snapshot {
         Member {
             id: user("7036948217"),
             name: "张伟".to_owned(),
+            avatar: None,
             role: Role::Owner,
             online: true,
             is_bot: false,
@@ -314,6 +315,7 @@ pub fn snapshot() -> Snapshot {
         Member {
             id: user("u_lina"),
             name: "李娜".to_owned(),
+            avatar: None,
             role: Role::Admin,
             online: true,
             is_bot: false,
@@ -321,6 +323,7 @@ pub fn snapshot() -> Snapshot {
         Member {
             id: user("u_chen"),
             name: "陈明".to_owned(),
+            avatar: None,
             role: Role::Admin,
             online: false,
             is_bot: false,
@@ -328,6 +331,7 @@ pub fn snapshot() -> Snapshot {
         Member {
             id: user("bot_openclaw"),
             name: "AI 助手".to_owned(),
+            avatar: None,
             role: Role::Member,
             online: true,
             is_bot: true,
@@ -335,6 +339,7 @@ pub fn snapshot() -> Snapshot {
         Member {
             id: user("u_wang"),
             name: "王强".to_owned(),
+            avatar: None,
             role: Role::Member,
             online: true,
             is_bot: false,
@@ -342,6 +347,7 @@ pub fn snapshot() -> Snapshot {
         Member {
             id: user("u_zhao"),
             name: "赵敏".to_owned(),
+            avatar: None,
             role: Role::Member,
             online: false,
             is_bot: false,

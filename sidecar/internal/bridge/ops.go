@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,20 @@ func (p *promise) OnError(code int32, msg string) {
 // swallowing it here keeps the send path on the same promise as everything
 // else rather than needing a second mechanism.
 func (p *promise) OnProgress(int) {}
+
+// quietUpload satisfies the SDK's upload progress callback without reporting
+// anything. The interface has eight methods and no default implementation,
+// and passing nil crashes inside the SDK.
+type quietUpload struct{}
+
+func (quietUpload) Open(int64)                            {}
+func (quietUpload) PartSize(int64, int)                   {}
+func (quietUpload) HashPartProgress(int, int64, string)   {}
+func (quietUpload) HashPartComplete(string, string)       {}
+func (quietUpload) UploadID(string)                       {}
+func (quietUpload) UploadPartComplete(int, int64, string) {}
+func (quietUpload) UploadComplete(int64, int64, int64)    {}
+func (quietUpload) Complete(int64, string, int)           {}
 
 var errTimeout = errors.New("SDK 调用超时")
 
@@ -320,6 +335,59 @@ func (h *Handler) Dispatch(op string, raw json.RawMessage) (json.RawMessage, err
 			return nil, err
 		}
 		return json.RawMessage(out), nil
+
+	case "upload_file":
+		// Puts a file in OpenIM's object storage and reports where it landed.
+		// Sending a picture does this on its own; an avatar needs the URL
+		// without a message wrapped around it.
+		var a struct {
+			Path string `json:"path"`
+			Name string `json:"name"`
+		}
+		if err := args(raw, &a); err != nil {
+			return nil, err
+		}
+		if a.Name == "" {
+			a.Name = filepath.Base(a.Path)
+		}
+		req, err := json.Marshal(map[string]string{
+			"filepath": a.Path,
+			"name":     a.Name,
+			"cause":    "avatar",
+		})
+		if err != nil {
+			return nil, err
+		}
+		p := newPromise()
+		// A nil progress callback makes the SDK dereference it and panic;
+		// nobody is watching a progress bar here, so it goes nowhere.
+		open_im_sdk.UploadFile(p, operationID(), string(req), quietUpload{})
+		return h.reply(p)
+
+	case "set_self_info":
+		// Nickname and picture. Whatever is left empty is left alone, so this
+		// can change one without knowing the other.
+		var a struct {
+			Nickname string `json:"nickname"`
+			FaceURL  string `json:"face_url"`
+		}
+		if err := args(raw, &a); err != nil {
+			return nil, err
+		}
+		info := map[string]string{}
+		if a.Nickname != "" {
+			info["nickname"] = a.Nickname
+		}
+		if a.FaceURL != "" {
+			info["faceURL"] = a.FaceURL
+		}
+		body, err := json.Marshal(info)
+		if err != nil {
+			return nil, err
+		}
+		p := newPromise()
+		open_im_sdk.SetSelfInfo(p, operationID(), string(body))
+		return h.reply(p)
 
 	case "create_image":
 		var a struct {

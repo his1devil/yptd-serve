@@ -71,7 +71,7 @@ yptd 同目录或 PATH 查找。
 ";
 
 const HELP_LINE: &str =
-    ":new 群名 · :invite [用户…] · :dm [用户] · :img [路径] 选图 · :q 退出";
+    ":new 群名 · :invite [用户…] · :dm [用户] · :img [路径] 选图 · :avatar 路径 · :q 退出";
 
 /// Shown wherever an action needs a conversation and there is none. Names the
 /// two commands that create one, because a new account starts here.
@@ -89,6 +89,7 @@ fn main() -> Fallible<()> {
             Some("--reply") => cmd_doctor_reply(args.get(2).map(String::as_str), args.get(3..).unwrap_or(&[])),
             Some("--img") => cmd_doctor_image(args.get(2).map(String::as_str)),
             Some("--media") => cmd_doctor_media(),
+            Some("--avatar") => cmd_doctor_avatar(args.get(2).map(String::as_str)),
             text => cmd_doctor(text),
         },
         Some("--mock") => run(App::new(im_model::mock::snapshot()), false),
@@ -214,6 +215,39 @@ fn cmd_doctor(text: Option<&str>) -> Fallible<()> {
         }
     }
     println!("事件 {seen} 个，连接 {}，会话现在 {} 个", if snapshot.connected { "正常" } else { "断开" }, snapshot.conversations.len());
+    Ok(())
+}
+
+/// Sets this account's avatar and reads back what the server now reports, so
+/// the round trip is visible without opening the interface.
+fn cmd_doctor_avatar(path: Option<&str>) -> Fallible<()> {
+    let Some(path) = path.filter(|p| !p.is_empty()) else {
+        return Err("用法: yptd doctor --avatar 图片路径".into());
+    };
+    let path = resolve_path(path)?;
+    let Live { mut backend, mut snapshot, .. } = connect()?;
+    let url = backend.session.set_avatar(&path.to_string_lossy())?;
+    println!("已上传 {}", path.display());
+    println!("头像地址 {url}");
+
+    // Read it back from a group's member list, which is where every client
+    // draws avatars from.
+    let group = snapshot
+        .conversations
+        .iter()
+        .map(|c| c.id.clone())
+        .find(|id| id.0.starts_with("sg_"));
+    if let Some(group) = group {
+        backend.session.forget_members();
+        backend.session.ensure_members(&group, &mut snapshot)?;
+        for m in snapshot.members.iter() {
+            println!(
+                "  {:<16} {}",
+                m.name,
+                m.avatar.as_deref().unwrap_or("（没有头像）")
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1211,6 +1245,32 @@ fn execute_command(app: &mut App, mut backend: Option<&mut Backend>, line: &str)
                 stage_path(app, &rest.join(" "));
             }
         }
+        "avatar" => {
+            let raw = rest.join(" ");
+            if raw.is_empty() {
+                app.notice = Some("用法: :avatar 图片路径".into());
+                return Flow::Continue;
+            }
+            match (resolve_path(&raw), backend) {
+                (Err(e), _) => app.notice = Some(e),
+                (Ok(_), None) => app.notice = Some("示例数据里改不了头像".into()),
+                (Ok(path), Some(b)) => {
+                    // Blocking: setting an avatar is a rare, deliberate act,
+                    // and the picture is small. Worth a moment's pause to
+                    // keep the two steps together and report one outcome.
+                    match b.session.set_avatar(&path.to_string_lossy()) {
+                        Ok(_) => {
+                            // The member list carries what everyone sees, so
+                            // pull it again rather than guess.
+                            b.session.forget_members();
+                            let _ = b.session.ensure_members(&app.open, &mut app.snapshot);
+                            app.notice = Some("头像已更新".into());
+                        }
+                        Err(e) => app.notice = Some(format!("设置头像失败: {e}")),
+                    }
+                }
+            }
+        }
         "help" | "h" => app.notice = Some(HELP_LINE.into()),
         other => app.notice = Some(format!("未知命令 :{other}，:help 看列表")),
     }
@@ -1391,6 +1451,7 @@ fn invite_users(app: &mut App, backend: Option<&mut Backend>, group_id: &str, id
                     app.snapshot.members.push(Member {
                         id: UserId(id.clone()),
                         name: name.clone(),
+                        avatar: None,
                         role: Role::Member,
                         online: false,
                         is_bot: false,
@@ -1445,6 +1506,7 @@ fn mock_group(app: &mut App, name: &str) -> ConversationId {
     app.snapshot.set_members(vec![Member {
         id: UserId(me),
         name: my_name,
+        avatar: None,
         role: Role::Owner,
         online: true,
         is_bot: false,

@@ -299,6 +299,38 @@ impl Session {
             .map(str::to_owned)
     }
 
+    /// Forgets which group's members are loaded, so the next `ensure_members`
+    /// fetches them again. What a picture change needs: the rows in the
+    /// snapshot are the ones every avatar is drawn from.
+    pub fn forget_members(&mut self) {
+        self.members_for = None;
+    }
+
+    /// Uploads a picture and makes it this account's avatar.
+    ///
+    /// Two steps because OpenIM keeps them apart: the file goes to object
+    /// storage, then the account is pointed at where it landed. Returns the
+    /// URL so the caller can show it without waiting for the server to echo
+    /// the change back.
+    pub fn set_avatar(&self, path: &str) -> Result<String, String> {
+        let reply = self
+            .sidecar
+            .call("upload_file", json!({ "path": path }))
+            .map_err(|e| e.to_string())?;
+        let url = reply
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if url.is_empty() {
+            return Err("上传没有返回地址".into());
+        }
+        self.sidecar
+            .call("set_self_info", json!({ "face_url": url }))
+            .map_err(|e| e.to_string())?;
+        Ok(url)
+    }
+
     /// A worker that fetches history pages without blocking the interface.
     /// The SDK may have to go to the server for a page, and a stall right when
     /// somebody reaches the top of what they have is the worst place for one.

@@ -114,6 +114,11 @@ impl Role {
 pub struct Member {
     pub id: UserId,
     pub name: String,
+    /// The picture this person has set, when they have. Preferred over the
+    /// copy stamped on each message: somebody who changes their picture
+    /// should change it on everything they ever said, not only on what they
+    /// say next.
+    pub avatar: Option<String>,
     pub role: Role,
     pub online: bool,
     pub is_bot: bool,
