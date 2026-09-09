@@ -37,14 +37,24 @@ echo
 # 不用 codesign --test-requirement="=notarized" 做判定：裸二进制的票据不装订在
 # 文件里，要等 Gatekeeper 联网取回并缓存之后那个检查才会过，所以刚公证完必然
 # 报"没有票据"。下面这一跑本身就会让它取回。
+# 苹果判 Accepted 之后，票据要过一会儿才传播到 Gatekeeper 查的地方——实测第一次
+# 试会被杀，二十秒后就好了。所以重试几轮再下结论，别把传播延迟当成公证失败。
 probe=$(mktemp -d)
 trap 'rm -rf "$probe"' EXIT
-cp dist/bin/yptd-arm64 "$probe/yptd"
-xattr -w com.apple.quarantine "0083;00000000;probe;" "$probe/yptd"
-if "$probe/yptd" --help >/dev/null 2>&1; then
-    echo "带 quarantine 也能跑：微信或浏览器传过去不会被拦"
-else
-    echo "带 quarantine 时跑不起来，公证没生效" >&2
+ok=0
+for attempt in 1 2 3 4 5 6; do
+    rm -f "$probe/yptd"
+    cp dist/bin/yptd-arm64 "$probe/yptd"
+    xattr -w com.apple.quarantine "0083;00000000;probe;" "$probe/yptd"
+    if "$probe/yptd" --version >/dev/null 2>&1; then
+        ok=1
+        echo "带 quarantine 也能跑：微信或浏览器传过去不会被拦（第 $attempt 次）"
+        break
+    fi
+    sleep 20
+done
+if [ "$ok" -eq 0 ]; then
+    echo "带 quarantine 时始终跑不起来，公证没生效" >&2
     exit 1
 fi
 
