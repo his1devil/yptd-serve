@@ -22,6 +22,7 @@ mod render;
 mod session;
 mod syntax;
 mod ui;
+mod update;
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -52,6 +53,8 @@ const USAGE: &str = "yptd — 终端 IM 客户端
   yptd                     启动（需先 login）
   yptd login               用邀请码登录这台机器
   yptd logout              清除本机凭据
+  yptd update              下载并替换成最新的发布版
+  yptd --version           打印版本
   yptd doctor [文本]       不进界面：登录、起边车、拉会话，可选发一条消息
   yptd doctor --frame WxH  同上，但把真实数据渲染成一帧文本输出
   yptd doctor --new 群名 [用户…]   建群并拉人，打印结果
@@ -71,7 +74,7 @@ yptd 同目录或 PATH 查找。
 ";
 
 const HELP_LINE: &str =
-    ":new 群名 · :invite [用户…] · :dm [用户] · :img [路径] 选图 · :avatar 路径 · :q 退出";
+    ":new 群名 · :invite [用户…] · :dm [用户] · :img [路径] · :avatar 路径 · :update · :q 退出";
 
 /// Shown wherever an action needs a conversation and there is none. Names the
 /// two commands that create one, because a new account starts here.
@@ -93,6 +96,11 @@ fn main() -> Fallible<()> {
             text => cmd_doctor(text),
         },
         Some("--mock") => run(App::new(im_model::mock::snapshot()), false),
+        Some("--version" | "-V" | "version") => {
+            println!("yptd {}", update::VERSION);
+            Ok(())
+        }
+        Some("update") => cmd_update(),
         Some("--help" | "-h") => {
             print!("{USAGE}");
             Ok(())
@@ -145,6 +153,22 @@ fn cmd_logout() -> Fallible<()> {
         }
         None => println!("本机没有凭据。"),
     }
+    Ok(())
+}
+
+/// Fetches the published build and replaces this one.
+fn cmd_update() -> Fallible<()> {
+    let config = Paths::discover().load_config();
+    println!("当前 {}", update::VERSION);
+    match update::latest(&config) {
+        None => {
+            println!("已经是最新的了。");
+            return Ok(());
+        }
+        Some(latest) => println!("有新版 {latest}，正在更新…"),
+    }
+    let installed = update::install(&config)?;
+    println!("已更新到 {installed}。重开 yptd 生效。");
     Ok(())
 }
 
@@ -584,6 +608,8 @@ enum Input {
     History(session::Page),
     /// The session came up behind the interface, or could not.
     Connected(Result<Live, String>),
+    /// The version check finished; `Some` when something newer is published.
+    Update(Option<String>),
     /// A staged picture finished uploading, carrying the SDK's echo of the
     /// message it became.
     Sent(Result<serde_json::Value, im_sidecar::Error>),
@@ -616,6 +642,19 @@ fn run(mut app: App, connect: bool) -> Fallible<()> {
     if media.enabled() {
         media.start_encoder(tx.clone(), Input::Encoded);
     }
+    // Nothing else is going to tell anybody that a new build exists, so ask
+    // once at startup. A few hundred bytes, off the drawing thread, and a
+    // failure is simply no news.
+    {
+        let tx = tx.clone();
+        let config = Paths::discover().load_config();
+        let _ = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let _ = tx.send(Input::Update(update::latest(&config)));
+            });
+    }
+
     // Syntax highlighting loads its grammars on first use, a few hundred
     // milliseconds; take that hit here instead of on the first frame that
     // has a code block in it.
@@ -862,6 +901,12 @@ fn run(mut app: App, connect: bool) -> Fallible<()> {
                     if visible && deadline.is_none() {
                         deadline = Some(Instant::now() + COALESCE);
                     }
+                }
+            }
+            Input::Update(latest) => {
+                if latest.is_some() {
+                    app.update_available = latest;
+                    dirty = true;
                 }
             }
             Input::Connected(Err(e)) => break Err(e.into()),
@@ -1282,6 +1327,18 @@ fn execute_command(app: &mut App, mut backend: Option<&mut Backend>, line: &str)
                         Err(e) => app.notice = Some(format!("设置头像失败: {e}")),
                     }
                 }
+            }
+        }
+        "update" => {
+            let config = Paths::discover().load_config();
+            // Blocking: it is a download the person just asked for, and there
+            // is nothing useful to do in the meantime.
+            match update::install(&config) {
+                Ok(version) => {
+                    app.update_available = None;
+                    app.notice = Some(format!("已更新到 {version}，重开 yptd 生效"));
+                }
+                Err(e) => app.notice = Some(format!("更新失败: {e}")),
             }
         }
         "help" | "h" => app.notice = Some(HELP_LINE.into()),

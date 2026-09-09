@@ -136,6 +136,8 @@ pub struct App {
     pub history: HistoryState,
     /// True while the session is still being set up behind the interface.
     pub connecting: bool,
+    /// A newer published version, when the check found one.
+    pub update_available: Option<String>,
     /// New messages scroll into view only while the cursor is already at the
     /// bottom, so reading history is never yanked away.
     pub follow_latest: bool,
@@ -201,6 +203,7 @@ impl App {
             shown_cursor: None,
             history: HistoryState::MayHaveMore,
             connecting: false,
+            update_available: None,
             follow_latest: true,
             nav_cursor: 0,
             member_cursor: 0,
@@ -241,6 +244,7 @@ impl App {
             shown_cursor: self.shown_cursor,
             history: self.history,
             connecting: self.connecting,
+            update_available: self.update_available.clone(),
             follow_latest: self.follow_latest,
             nav_cursor: self.nav_cursor,
             member_cursor: self.member_cursor,

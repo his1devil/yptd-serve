@@ -12,6 +12,13 @@
 use std::path::PathBuf;
 
 fn main() {
+    // The release tag when `dist.sh` builds, the manifest otherwise, so a
+    // development tree still reports something rather than nothing.
+    println!("cargo::rerun-if-env-changed=YPTD_VERSION");
+    let version = std::env::var("YPTD_VERSION")
+        .unwrap_or_else(|_| format!("v{}", env!("CARGO_PKG_VERSION")));
+    println!("cargo::rustc-env=YPTD_VERSION={version}");
+
     println!("cargo::rerun-if-env-changed=YPTD_EMBED_SIDECAR");
     println!("cargo::rustc-check-cfg=cfg(embedded_sidecar)");
     let Some(src) = std::env::var_os("YPTD_EMBED_SIDECAR") else {

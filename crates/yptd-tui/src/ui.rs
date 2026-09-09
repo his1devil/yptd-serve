@@ -365,10 +365,24 @@ fn pane_block<'a>(app: &App, theme: &Theme, pane: Pane, title: String) -> Block<
 // ---------------------------------------------------------------- status ---
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App, media: &Media, theme: &Theme) {
+    // Name and version at the far left, the way concord puts them: the first
+    // thing anybody reads, and the first thing anybody is asked for when
+    // something goes wrong.
     let mut left = vec![
         TuiSpan::styled("yptd", theme.style(HG::StatusTitle)),
+        TuiSpan::styled(
+            format!(" {}", crate::update::VERSION),
+            theme.style(HG::StatusLabel),
+        ),
         TuiSpan::styled("  ", theme.style(HG::StatusLabel)),
     ];
+    if let Some(latest) = app.update_available.as_deref() {
+        left.push(TuiSpan::styled(
+            format!("有新版 {latest}，:update 更新"),
+            theme.style(HG::SyncProgress),
+        ));
+        left.push(TuiSpan::styled("  ", theme.style(HG::StatusLabel)));
+    }
     if let Some(me) = app.snapshot.me.as_ref() {
         let name = if app.snapshot.my_name.is_empty() {
             me.0.as_str()

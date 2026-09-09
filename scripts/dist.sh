@@ -39,7 +39,7 @@ for arch in arm64 x86_64; do
         --sign "$SIGN_ID" "$DIST/bin/yptd-sidecar-$arch"
 
     echo "── $arch ── 客户端（嵌入已签名的边车）"
-    YPTD_EMBED_SIDECAR="$PWD/$DIST/bin/yptd-sidecar-$arch" \
+    YPTD_EMBED_SIDECAR="$PWD/$DIST/bin/yptd-sidecar-$arch" YPTD_VERSION="$VERSION" \
         cargo build --release --target "$rust_target" -p yptd-tui
     cp "target/$rust_target/release/yptd" "$DIST/bin/yptd-$arch"
     codesign --force --timestamp --options runtime \
@@ -55,6 +55,8 @@ for arch in arm64 x86_64; do
 done
 
 cp scripts/install.sh "$DIST/install.sh"
+# What a running client compares itself against to notice an update.
+printf '%s\n' "$VERSION" > "$DIST/VERSION"
 (cd "$DIST" && shasum -a 256 ./*.tar.gz | sed 's|\./||' > SHA256SUMS)
 
 echo
