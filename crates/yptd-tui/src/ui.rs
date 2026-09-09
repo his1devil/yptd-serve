@@ -95,7 +95,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, media: &mut Media, theme: &Theme, 
     }
     draw_messages(frame, areas.messages, app, media, theme, cache);
     if areas.members.width > 0 {
-        draw_members(frame, areas.members, app, theme);
+        draw_members(frame, areas.members, app, media, theme);
     }
     draw_composer(frame, areas.composer, app, theme);
     if let Some(picker) = &app.picker {
@@ -514,12 +514,19 @@ fn draw_conversations(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 // --------------------------------------------------------------- members ---
 
-fn draw_members(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+/// Columns an avatar takes in the member list. Two, not four: a roster earns
+/// its keep by being scannable, and one person per row matters more than a
+/// bigger picture. The colour is the same one their messages carry, which is
+/// what connects a name here to a voice in the conversation.
+const MEMBER_AVATAR_COLS: u16 = 2;
+
+fn draw_members(frame: &mut Frame, area: Rect, app: &App, media: &mut Media, theme: &Theme) {
     let block = pane_block(app, theme, Pane::Members, Pane::Members.title().to_owned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut lines = Vec::new();
+    let mut avatars: Vec<(u16, Avatar, bool)> = Vec::new();
     let mut flat_index = 0usize;
     for (role, bucket) in app.members_by_role() {
         lines.push(TuiLine::from(TuiSpan::styled(
@@ -537,14 +544,10 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     },
                     theme.style(HG::SelectionMarker),
                 ),
-                TuiSpan::styled(
-                    if member.online { "● " } else { "○ " },
-                    theme.style(if member.online {
-                        HG::PresenceOnline
-                    } else {
-                        HG::PresenceOffline
-                    }),
-                ),
+                // Space the avatar is painted over. It replaces the presence
+                // dot: a dimmed block says "not here" as plainly as a hollow
+                // circle did, and carries who it is as well.
+                TuiSpan::raw(" ".repeat(MEMBER_AVATAR_COLS as usize + 1)),
                 TuiSpan::styled(
                     member.name.clone(),
                     theme.style(if member.online {
@@ -557,12 +560,38 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             if member.is_bot {
                 spans.push(TuiSpan::styled(" BOT", theme.style(HG::BotBadge)));
             }
+            avatars.push((
+                lines.len() as u16,
+                Avatar::of(&member.id.0, &member.name, member.avatar.clone()),
+                !member.online,
+            ));
             lines.push(TuiLine::from(spans));
             flat_index += 1;
         }
     }
 
+    let marker = theme.selection_marker().width() as u16;
     frame.render_widget(Paragraph::new(lines), inner);
+
+    // Painted over the reserved spaces, after the text has cleared them.
+    for (row, avatar, dim) in avatars {
+        if row >= inner.height {
+            break;
+        }
+        let area = Rect {
+            x: inner.x.saturating_add(marker),
+            y: inner.y.saturating_add(row),
+            width: MEMBER_AVATAR_COLS.min(inner.width.saturating_sub(marker)),
+            height: 1,
+        };
+        if area.width == 0 {
+            continue;
+        }
+        match avatar.key.as_deref() {
+            Some(key) if media.holds(key) => media.render(frame, area, key, true),
+            _ => draw_avatar_block(frame, area, &avatar, theme, dim),
+        }
+    }
 }
 
 // -------------------------------------------------------------- composer ---
@@ -958,7 +987,7 @@ fn draw_messages(
         }
         match avatar.key.as_deref() {
             Some(key) if media.holds(key) => media.render(frame, area, key, true),
-            _ => draw_avatar_block(frame, area, &avatar, theme),
+            _ => draw_avatar_block(frame, area, &avatar, theme, false),
         }
     }
 
@@ -1000,23 +1029,29 @@ fn draw_messages(
 /// Every terminal can show this, which is the point -- half-block characters
 /// would make a photograph unrecognisable at four columns anyway, so the
 /// letter is the better fallback even where pictures are possible.
-fn draw_avatar_block(frame: &mut Frame, area: Rect, avatar: &Avatar, theme: &Theme) {
+fn draw_avatar_block(frame: &mut Frame, area: Rect, avatar: &Avatar, theme: &Theme, dim: bool) {
     let colour = theme.style(avatar.colour).fg.unwrap_or(Color::DarkGray);
-    let filled = Style::default().bg(colour);
+    let mut filled = Style::default().bg(colour);
+    if dim {
+        // Somebody who is not here: the same colour, stepped back, so the
+        // roster still reads as a list of people rather than a wall of paint.
+        filled = filled.add_modifier(Modifier::DIM);
+    }
     let width = area.width as usize;
     let initial = avatar.initial.width().min(width);
     let left = (width - initial) / 2;
-    let rows = vec![
-        TuiLine::from(vec![
-            TuiSpan::styled(" ".repeat(left), filled),
-            TuiSpan::styled(
-                avatar.initial.clone(),
-                filled.fg(Color::Black).add_modifier(Modifier::BOLD),
-            ),
-            TuiSpan::styled(" ".repeat(width - left - initial), filled),
-        ]),
-        TuiLine::from(TuiSpan::styled(" ".repeat(width), filled)),
-    ];
+    let mut rows = vec![TuiLine::from(vec![
+        TuiSpan::styled(" ".repeat(left), filled),
+        TuiSpan::styled(
+            avatar.initial.clone(),
+            filled.fg(Color::Black).add_modifier(Modifier::BOLD),
+        ),
+        TuiSpan::styled(" ".repeat(width - left - initial), filled),
+    ])];
+    // Whatever is left below the letter is the rest of the square.
+    for _ in 1..area.height {
+        rows.push(TuiLine::from(TuiSpan::styled(" ".repeat(width), filled)));
+    }
     frame.render_widget(Paragraph::new(rows), area);
 }
 
@@ -1183,6 +1218,22 @@ fn build_message_lines(
     out
 }
 
+impl Avatar {
+    fn of(user_id: &str, name: &str, url: Option<String>) -> Self {
+        Self {
+            key: url,
+            // A character, not a byte: a name starting with a Chinese
+            // character or an emoji must not be cut in half.
+            initial: name
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_owned()),
+            colour: author_colour(user_id),
+        }
+    }
+}
+
 /// The avatar for one message's sender.
 ///
 /// The member list wins over the copy stamped on the message: OpenIM writes
@@ -1195,20 +1246,13 @@ fn avatar_for(message: &Message, members: &[&Member]) -> Avatar {
         .iter()
         .find(|m| m.id == message.sender)
         .and_then(|m| m.avatar.clone());
-    Avatar {
-        // Keyed by URL, the same rule attachments use: two people's
-        // pictures are two pictures even with the same file name.
-        key: current.or_else(|| message.sender_avatar.clone()),
-        // A grapheme, not a byte: a name starting with a Chinese character or
-        // an emoji must not be cut in half.
-        initial: message
-            .sender_name
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".to_owned()),
-        colour: author_colour(&message.sender.0),
-    }
+    // Keyed by URL, the same rule attachments use: two people's pictures are
+    // two pictures even with the same file name.
+    Avatar::of(
+        &message.sender.0,
+        &message.sender_name,
+        current.or_else(|| message.sender_avatar.clone()),
+    )
 }
 
 /// Who a row's picture belongs to.

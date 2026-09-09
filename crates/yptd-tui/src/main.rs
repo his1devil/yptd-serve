@@ -693,6 +693,19 @@ fn run(mut app: App, connect: bool) -> Fallible<()> {
         // Ask for any picture in this conversation we have not fetched yet.
         // Doing it here rather than on arrival covers history too, and the
         // request set makes repeats free.
+        // Somebody in the member list who has not spoken has no message to
+        // carry their picture, and the roster draws them all.
+        for url in app
+            .snapshot
+            .members
+            .iter()
+            .filter_map(|m| m.avatar.clone())
+            .collect::<Vec<_>>()
+        {
+            if media.failure(&url).is_none() && !media.holds(&url) {
+                downloads.request(&url, &url);
+            }
+        }
         for message in app.messages() {
             // The sender's picture, if they have set one. Same worker and the
             // same cache as attachments -- an avatar is just a small image.
