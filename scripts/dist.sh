@@ -9,7 +9,8 @@ set -eu
 
 cd "$(dirname "$0")/.."
 DIST=dist
-VERSION=${VERSION:-$(git describe --tags --always 2>/dev/null || echo dev)}
+# --dirty：从没提交干净的工作区打的包，版本号要说出来，否则日后对不上号。
+VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
 SIGN_ID=${YPTD_SIGN_ID:-$(security find-identity -v -p codesigning |
     awk -F'"' '/Developer ID Application/ { print $2; exit }')}
 
