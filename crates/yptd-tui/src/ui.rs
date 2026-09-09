@@ -587,9 +587,15 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &App, media: &mut Media, the
         if area.width == 0 {
             continue;
         }
-        match avatar.key.as_deref() {
-            Some(key) if media.holds(key) => media.render(frame, area, key, true),
-            _ => draw_avatar_block(frame, area, &avatar, theme, dim),
+        // The block stands in until the picture is decoded and encoded, and
+        // stays for good where the picture cannot be drawn -- one row is too
+        // thin for the graphics protocols to place safely.
+        let drawn = avatar
+            .key
+            .as_deref()
+            .is_some_and(|key| media.render(frame, area, key, true));
+        if !drawn {
+            draw_avatar_block(frame, area, &avatar, theme, dim);
         }
     }
 }
@@ -985,9 +991,12 @@ fn draw_messages(
         if area.width == 0 || area.height == 0 {
             continue;
         }
-        match avatar.key.as_deref() {
-            Some(key) if media.holds(key) => media.render(frame, area, key, true),
-            _ => draw_avatar_block(frame, area, &avatar, theme, false),
+        let drawn = avatar
+            .key
+            .as_deref()
+            .is_some_and(|key| media.render(frame, area, key, true));
+        if !drawn {
+            draw_avatar_block(frame, area, &avatar, theme, false);
         }
     }
 

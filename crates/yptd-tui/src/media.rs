@@ -315,21 +315,34 @@ impl Media {
     /// `fill` covers the whole area, cropping what does not fit, which is what
     /// makes a row of pictures read as one block; otherwise the picture is
     /// fitted whole inside it.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, key: &str, fill: bool) {
-        if area.width == 0 || area.height == 0 {
-            return;
+    /// Draws a picture, reporting whether anything was actually painted.
+    ///
+    /// `false` means the caller should draw whatever it shows in place of a
+    /// picture: the file is still downloading, the encoder has not caught up,
+    /// or the area is too small to draw into safely. Leaving the space blank
+    /// instead would be a hole that fills in a moment later.
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, key: &str, fill: bool) -> bool {
+        // One cell in either direction is refused on purpose. ratatui-image
+        // ends every row of a picture with `ESC[u ESC[{w-1}C ESC[{h-1}B` to
+        // put the cursor back where ratatui expects it -- but a cursor
+        // movement with a parameter of 0 means *one* in ECMA-48, not none. So
+        // a picture one row tall moves the cursor a row further than ratatui
+        // accounts for, and everything drawn afterwards lands one row low.
+        // That is what makes an avatar look like it floated above its name.
+        if area.width < 2 || area.height < 2 {
+            return false;
         }
         self.touch(key);
         let cached = (key.to_owned(), area.width, area.height, fill);
         if let Some(protocol) = self.protocols.get(&cached) {
             frame.render_widget(Image::new(protocol), area);
-            return;
+            return true;
         }
         if self.pending.contains(&cached) {
-            return;
+            return false;
         }
         let Some(source) = self.images.get(key) else {
-            return;
+            return false;
         };
         match self.encoder.as_ref() {
             Some(encoder) => {
@@ -348,12 +361,14 @@ impl Media {
                         Ok(protocol) => {
                             frame.render_widget(Image::new(&protocol), area);
                             self.protocols.insert(cached, protocol);
+                            return true;
                         }
                         Err(reason) => self.mark_failed(key, reason),
                     }
                 }
             }
         }
+        false
     }
 
     /// Keeps the encoded set bounded. Pictures are cheap to re-encode and a
@@ -502,6 +517,75 @@ pub fn demo_image_png(name: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Renders one picture through the real kitty protocol into an offscreen
+    /// buffer and returns what would go to the terminal.
+    fn kitty_cells(cols: u16, rows: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui_image::FontSize;
+        use ratatui::Terminal;
+        use ratatui_image::picker::ProtocolType;
+        use ratatui_image::Image;
+
+        let mut picker = Picker::from_fontsize(FontSize { width: 10, height: 20 });
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let protocol = encode(&picker, &gradient(64, 64), cols, rows, true).expect("encode");
+        let mut terminal = Terminal::new(TestBackend::new(cols + 2, rows + 2)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Image::new(&protocol),
+                    Rect { x: 0, y: 0, width: cols, height: rows },
+                );
+            })
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// The reason [`Media::render`] refuses an area one cell tall or wide.
+    ///
+    /// ratatui-image closes every row of a picture by restoring the saved
+    /// cursor and stepping `width-1` right and `height-1` down. In ECMA-48 a
+    /// cursor movement with a parameter of 0 means *one*, not none -- so at a
+    /// height of one the terminal ends up a row below where ratatui believes
+    /// it is, and everything drawn afterwards lands a row low. That is what
+    /// made an avatar appear to float above its own name.
+    #[test]
+    fn a_picture_one_row_tall_would_walk_the_cursor_off_by_a_row() {
+        assert!(
+            kitty_cells(4, 1).contains("\x1b[0B"),
+            "a one-row picture still emits the zero-parameter cursor move"
+        );
+        assert!(
+            !kitty_cells(4, 2).contains("\x1b[0B"),
+            "two rows and up are safe: the parameter is never zero"
+        );
+    }
+
+    #[test]
+    fn an_area_too_thin_to_place_a_picture_reports_that_it_drew_nothing() {
+        let mut media = Media::disabled();
+        media.insert("k", gradient(64, 64), (64, 64));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 8)).expect("terminal");
+        for (w, h) in [(1u16, 4u16), (4, 1), (1, 1)] {
+            terminal
+                .draw(|frame| {
+                    let area = Rect { x: 0, y: 0, width: w, height: h };
+                    assert!(
+                        !media.render(frame, area, "k", true),
+                        "{w}x{h} must report nothing drawn so the caller falls back"
+                    );
+                })
+                .expect("draw");
+        }
+    }
 
     fn gradient(w: u32, h: u32) -> DynamicImage {
         let mut buf = image::RgbImage::new(w, h);
