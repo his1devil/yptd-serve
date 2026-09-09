@@ -91,6 +91,9 @@ YPTD_IMAGE=halfblocks:16x35 yptd # 退回半块字符
 YPTD_IMAGE=off yptd              # 完全关掉图片
 ```
 
+`yptd doctor --media` 会画一个方块加两行对齐标线，一眼就能看出终端有没有把图片
+放歪；换协议再跑一次就知道哪个是对的。
+
 **已知的终端坑**：ratatui-image 画 kitty 图片时，每一行都以 `CSI s`（保存光标）
 开头、`CSI u`（恢复光标）加相对移动结尾。而不带参数的 `CSI s` 是有歧义的——
 有的终端当"保存光标"，有的当 DECSLRM（设置左右边距）。后者那里 `CSI u` 恢复不了，

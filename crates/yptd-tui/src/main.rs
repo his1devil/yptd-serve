@@ -451,6 +451,66 @@ fn cmd_doctor_media() -> Fallible<()> {
     println!();
     println!("像素数越大越清晰。如果这些数字明显小于你屏幕上那块区域的实际像素，");
     println!("说明终端报的是逻辑像素而不是设备像素，图会被拉伸。");
+    println!();
+    alignment_probe(media)
+}
+
+/// Draws one picture next to two labelled rows.
+///
+/// Some terminals place a graphics-protocol picture a row or two off from the
+/// cells they were told to use, and the only way to know is to look. Two
+/// lines that name where the picture's edges belong turn "the avatars look
+/// wrong" into something anybody can check in a second, and let a protocol be
+/// tried against the one that misbehaves:
+///
+///   YPTD_IMAGE=iterm2:16x35 yptd doctor --media
+fn alignment_probe(mut media: media::Media) -> Fallible<()> {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Paragraph;
+    use ratatui::backend::Backend as _;
+    use ratatui::{Terminal, TerminalOptions, Viewport};
+
+    // Drawing needs a real terminal to ask for its size; piped into a file
+    // there is nothing to look at anyway.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        println!("（输出不是终端，跳过对齐自检）");
+        return Ok(());
+    }
+    println!("对齐自检 —— 方块的上下边应当分别和这两行文字齐平：");
+
+    // A picture that makes its own edges obvious.
+    let mut pixels = image::RgbImage::new(96, 96);
+    for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+        let edge = x < 6 || y < 6 || x >= 90 || y >= 90;
+        *pixel = if edge { image::Rgb([255, 255, 255]) } else { image::Rgb([220, 90, 40]) };
+    }
+    media.insert("probe", image::DynamicImage::ImageRgb8(pixels), (96, 96));
+
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions { viewport: Viewport::Inline(3) },
+    )?;
+    let drew = terminal.draw(|frame| {
+        let area = frame.area();
+        frame.render_widget(
+            Paragraph::new(vec![
+                ratatui::text::Line::from("      ← 上边应与本行齐平"),
+                ratatui::text::Line::from("      ← 下边应与本行齐平"),
+            ]),
+            area,
+        );
+        let square = Rect { x: area.x, y: area.y, width: 4, height: 2 };
+        media.render(frame, square, "probe", true);
+    });
+    if let Err(e) = drew {
+        println!("画不出来: {e}");
+        return Ok(());
+    }
+    // Leave the cursor under what was drawn, or the shell prompt lands on it.
+    let _ = terminal.backend_mut().append_lines(1);
+    println!();
+    println!("上下没对齐就换个协议再看：YPTD_IMAGE=iterm2:{} yptd doctor --media", media.status_label().split_whitespace().nth(1).unwrap_or("16x35").replace('×', "x"));
     Ok(())
 }
 
