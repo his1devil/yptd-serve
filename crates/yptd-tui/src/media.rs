@@ -80,7 +80,7 @@ impl Media {
     /// than the client refusing to start.
     pub fn detect() -> Self {
         Self {
-            picker: Picker::from_query_stdio().ok(),
+            picker: forced_picker().or_else(|| Picker::from_query_stdio().ok()),
             images: HashMap::new(),
             last_used: HashMap::new(),
             tick: 0,
@@ -122,6 +122,16 @@ impl Media {
     }
 
     /// A `Media` that never renders pictures, for off-screen capture and tests.
+    /// A media store around a picker chosen by the caller, for tests that
+    /// need a particular graphics protocol rather than whatever the terminal
+    /// running them happens to support.
+    #[cfg(test)]
+    pub fn with_picker(picker: Picker) -> Self {
+        let mut media = Self::disabled();
+        media.picker = Some(picker);
+        media
+    }
+
     pub fn disabled() -> Self {
         Self {
             picker: None,
@@ -421,6 +431,36 @@ fn encode(
     picker
         .new_protocol(canvas, Size::new(cols, rows), Resize::Fit(None))
         .map_err(|e| format!("编码失败: {e}"))
+}
+
+/// An override for the detected graphics protocol and cell size.
+///
+/// `YPTD_IMAGE=kitty:16x35` forces both; `YPTD_IMAGE=off` turns pictures off.
+/// Terminals disagree about the graphics protocols in ways that only show up
+/// on somebody else's machine, and a person who can see the problem needs a
+/// way to try another protocol without rebuilding. It also lets a headless
+/// test drive a protocol the pseudo-terminal would never negotiate.
+fn forced_picker() -> Option<Picker> {
+    use ratatui_image::picker::ProtocolType;
+
+    let raw = std::env::var("YPTD_IMAGE").ok()?;
+    let (name, size) = raw.split_once(':').unwrap_or((raw.as_str(), "10x20"));
+    let (w, h) = size.split_once('x')?;
+    let font = ratatui_image::FontSize {
+        width: w.parse().ok()?,
+        height: h.parse().ok()?,
+    };
+    let protocol = match name.trim().to_ascii_lowercase().as_str() {
+        "kitty" => ProtocolType::Kitty,
+        "iterm2" => ProtocolType::Iterm2,
+        "sixel" => ProtocolType::Sixel,
+        "halfblocks" | "blocks" => ProtocolType::Halfblocks,
+        "off" | "none" => return None,
+        _ => return None,
+    };
+    let mut picker = Picker::from_fontsize(font);
+    picker.set_protocol_type(protocol);
+    Some(picker)
 }
 
 /// Scales to cover the canvas and trims the overflow from the centre, so a

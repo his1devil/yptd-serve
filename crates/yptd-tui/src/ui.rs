@@ -1912,6 +1912,109 @@ fn truncate(value: &str, width: usize) -> String {
 mod tests {
     use im_model::AttachmentKind;
 
+    /// Where the avatar lands, in buffer rows, next to where the author's
+    /// name lands.
+    ///
+    /// The kitty protocol places a picture with unicode placeholders written
+    /// into the very cells it should occupy, so the buffer says exactly what
+    /// the terminal is being told. If these rows agree, anything the reader
+    /// sees out of place happened after the frame left us.
+    fn avatar_and_name_rows(cell: (u16, u16)) -> (Vec<u16>, Option<u16>) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use ratatui_image::picker::{Picker, ProtocolType};
+        use ratatui_image::FontSize;
+
+        let mut app = app();
+        let (name, sender) = {
+            let messages = app.messages();
+            let last = messages.last().expect("a message");
+            (last.sender_name.clone(), last.sender.clone())
+        };
+        for message in app.snapshot.messages.iter_mut() {
+            if message.sender == sender {
+                message.sender_avatar = Some("http://example/a.png".into());
+            }
+        }
+        let mut picker = Picker::from_fontsize(FontSize { width: cell.0, height: cell.1 });
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut media = Media::with_picker(picker);
+        let mut pixels = image::RgbImage::new(64, 64);
+        for (_, _, p) in pixels.enumerate_pixels_mut() {
+            *p = image::Rgb([200, 100, 50]);
+        }
+        media.insert(
+            "http://example/a.png",
+            image::DynamicImage::ImageRgb8(pixels),
+            (64, 64),
+        );
+
+        let theme = Theme::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        let mut cache = Cache::default();
+        // Twice: the first frame asks for the encode, the second draws it.
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| draw(frame, &mut app, &mut media, &theme, &mut cache))
+                .expect("draw");
+        }
+
+        let buffer = terminal.backend().buffer().clone();
+        let placeholder = |x: u16, y: u16| buffer[(x, y)].symbol().contains('\u{10EEEE}');
+
+        // Where the picture went, and which column it starts at -- the member
+        // pane lists the same names, so the search for the author line has to
+        // stay inside the message pane.
+        let mut avatar_rows = Vec::new();
+        let mut left = buffer.area.width;
+        for y in 0..buffer.area.height {
+            if let Some(x) = (0..buffer.area.width).find(|x| placeholder(*x, y)) {
+                avatar_rows.push(y);
+                left = left.min(x);
+            }
+        }
+
+        // A wide character leaves a blank filler cell behind it, so the row
+        // read back has gaps the name does not.
+        let squeeze = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        let wanted = squeeze(&name);
+        // Stop at the pane's own right border, or the member list -- which
+        // shows the same names -- answers first.
+        let right = (left..buffer.area.width)
+            .find(|x| buffer[(*x, avatar_rows[0])].symbol() == "│")
+            .unwrap_or(buffer.area.width);
+        let name_row = (0..buffer.area.height).find(|y| {
+            let row: String = (left..right).map(|x| buffer[(x, *y)].symbol()).collect();
+            squeeze(&row).contains(&wanted)
+        });
+        (avatar_rows, name_row)
+    }
+
+    /// A reader once saw avatars sitting a couple of rows above the names
+    /// they belong to. This pins down which side of the handover is at fault:
+    /// the cells we fill are the cells the terminal is told to use, so if
+    /// these agree, the picture we asked for is in the right place and
+    /// anything still crooked happened while the terminal read the frame.
+    ///
+    /// (It was the terminal. ratatui-image ends every row of a kitty picture
+    /// with `CSI s` … `CSI u` plus a relative move, and `CSI s` without
+    /// parameters is save-cursor to some terminals and set-margins to others.
+    /// Where the restore does not restore, the relative move walks the cursor
+    /// down a row per picture row. `YPTD_IMAGE=iterm2:WxH` picks a protocol
+    /// that places pictures without touching the cursor at all.)
+    #[test]
+    fn the_avatar_fills_the_same_rows_the_author_line_starts_at() {
+        for cell in [(16u16, 35u16), (10, 20), (8, 16)] {
+            let (avatar_rows, name_row) = avatar_and_name_rows(cell);
+            let name_row = name_row.expect("the author line is on screen");
+            assert_eq!(
+                avatar_rows,
+                vec![name_row, name_row + 1],
+                "cell {cell:?}: the picture starts on the author's own row"
+            );
+        }
+    }
+
     #[test]
     fn recent_days_are_named_rather_than_dated() {
         let day = 86_400_000i64;

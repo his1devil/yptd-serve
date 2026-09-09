@@ -83,6 +83,21 @@ yptd                    # 以后每次就这一条
 
 状态栏右上角写着当前协商到的协议（`kitty 14×30`、`iterm2 …`、`halfblocks 10×20`）。
 
+**协议探测不准或画得不对时**，用 `YPTD_IMAGE` 手动指定，格式是 `协议:宽x高`（像素）：
+
+```sh
+YPTD_IMAGE=iterm2:16x35 yptd     # 换一个协议
+YPTD_IMAGE=halfblocks:16x35 yptd # 退回半块字符
+YPTD_IMAGE=off yptd              # 完全关掉图片
+```
+
+**已知的终端坑**：ratatui-image 画 kitty 图片时，每一行都以 `CSI s`（保存光标）
+开头、`CSI u`（恢复光标）加相对移动结尾。而不带参数的 `CSI s` 是有歧义的——
+有的终端当"保存光标"，有的当 DECSLRM（设置左右边距）。后者那里 `CSI u` 恢复不了，
+末尾的相对移动就每画一行图把光标多带下去一行，于是图片看起来比它该在的位置高。
+Ghostty 正常，某些基于它的分支不正常。撞上了就改用 `YPTD_IMAGE=iterm2:WxH`——
+iTerm2 那条路径只写一个单元格，完全不碰光标。
+
 ---
 
 ## 打包分发
