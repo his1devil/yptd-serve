@@ -22,8 +22,32 @@ echo "提交公证（要等几分钟）…"
 xcrun notarytool submit dist/notarize.zip --keychain-profile "$PROFILE" --wait
 
 echo
-echo "核对 Gatekeeper 怎么看这些文件："
+# 不要用 spctl：它评估的是 .app，裸的命令行二进制永远报
+# "does not seem to be an app"，看着像失败其实什么都没说明。
+# codesign 的 =notarized 要求才是命令行二进制该用的检查。
+echo "核对公证票据："
+failed=0
 for binary in dist/bin/yptd-*; do
-    printf '  %s: ' "$(basename "$binary")"
-    spctl -a -vv -t exec "$binary" 2>&1 | tail -1
+    if codesign --test-requirement="=notarized" --verify "$binary" 2>/dev/null; then
+        echo "  $(basename "$binary")  已公证"
+    else
+        echo "  $(basename "$binary")  没有公证票据"
+        failed=1
+    fi
 done
+
+# 真正决定朋友能不能跑起来的是这个：带 quarantine 属性时会不会被 Gatekeeper
+# 杀掉。微信、浏览器、AirDrop 传过来的文件都带这个属性；公证之前这一步是
+# 直接 SIGKILL。
+probe=$(mktemp -d)
+trap 'rm -rf "$probe"' EXIT
+cp dist/bin/yptd-arm64 "$probe/yptd"
+xattr -w com.apple.quarantine "0083;00000000;probe;" "$probe/yptd"
+if "$probe/yptd" --help >/dev/null 2>&1; then
+    echo "  带 quarantine 也能跑，微信或浏览器传过去不会被拦"
+else
+    echo "  带 quarantine 时跑不起来，公证没生效" >&2
+    failed=1
+fi
+
+exit "$failed"
