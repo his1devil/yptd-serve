@@ -441,7 +441,7 @@ fn cmd_doctor_image(path: Option<&str>) -> Fallible<()> {
 /// What this terminal can do with pictures, and how many pixels one actually
 /// gets. Needs a real terminal: the numbers come from asking it.
 fn cmd_doctor_media() -> Fallible<()> {
-    let media = media::Media::detect();
+    let media = media::Media::detect_with(&Paths::discover().load_config().image);
     // Which binary this is: the installed release and a local build behave
     // differently, and telling them apart afterwards is guesswork.
     println!("yptd {} — {}", update::VERSION, std::env::args().next().unwrap_or_default());
@@ -521,8 +521,12 @@ fn alignment_probe(mut media: media::Media) -> Fallible<()> {
     // will not have the setting the hint is asking to try.
     let me = std::env::args().next().unwrap_or_else(|| "yptd".to_owned());
     println!("上下没对齐就换个协议再看（同一个二进制）：");
-    println!("  YPTD_IMAGE=iterm2:{w}x{h} {me} doctor --media");
-    println!("  YPTD_IMAGE=halfblocks:{w}x{h} {me} doctor --media");
+    println!("  YPTD_IMAGE=iterm2 {me} doctor --media");
+    println!("  YPTD_IMAGE=halfblocks {me} doctor --media");
+    println!();
+    println!("哪个对就写进 ~/.yptd/config.toml，以后不用再带环境变量：");
+    println!("  image = \"halfblocks\"");
+    let _ = (w, h);
     Ok(())
 }
 
@@ -710,7 +714,7 @@ fn run(mut app: App, connect: bool) -> Fallible<()> {
     // times out, and every picture degrades to half-block characters drawn
     // with a guessed cell size -- which is what "blurry and laggy" looks
     // like from the outside.
-    let mut media = media::Media::detect();
+    let mut media = media::Media::detect_with(&Paths::discover().load_config().image);
     if media.enabled() {
         media.start_encoder(tx.clone(), Input::Encoded);
     }

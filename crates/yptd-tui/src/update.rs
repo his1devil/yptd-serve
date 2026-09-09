@@ -321,6 +321,7 @@ mod tests {
             server: "https://im.example.com/yptd".into(),
             api: String::new(),
             ws: String::new(),
+            image: String::new(),
         };
         assert_eq!(base(&config), "https://im.example.com/dl");
     }

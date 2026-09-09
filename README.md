@@ -83,13 +83,18 @@ yptd                    # 以后每次就这一条
 
 状态栏右上角写着当前协商到的协议（`kitty 14×30`、`iterm2 …`、`halfblocks 10×20`）。
 
-**协议探测不准或画得不对时**，用 `YPTD_IMAGE` 手动指定，格式是 `协议:宽x高`（像素）：
+**协议探测不准或画得不对时**，先用 `YPTD_IMAGE` 试，确定了写进
+`~/.yptd/config.toml` 的 `image`：
 
 ```sh
-YPTD_IMAGE=iterm2:16x35 yptd     # 换一个协议
-YPTD_IMAGE=halfblocks:16x35 yptd # 退回半块字符
-YPTD_IMAGE=off yptd              # 完全关掉图片
+YPTD_IMAGE=halfblocks yptd doctor --media   # 试
 ```
+```toml
+image = "halfblocks"                        # 定
+```
+
+可选 `kitty` / `iterm2` / `sixel` / `halfblocks` / `off`。只写协议名就沿用探测到的
+字号；要连字号一起指定就写 `halfblocks:16x35`。
 
 `yptd doctor --media` 会画一个方块加两行对齐标线，一眼就能看出终端有没有把图片
 放歪；换协议再跑一次就知道哪个是对的。
@@ -98,8 +103,14 @@ YPTD_IMAGE=off yptd              # 完全关掉图片
 开头、`CSI u`（恢复光标）加相对移动结尾。而不带参数的 `CSI s` 是有歧义的——
 有的终端当"保存光标"，有的当 DECSLRM（设置左右边距）。后者那里 `CSI u` 恢复不了，
 末尾的相对移动就每画一行图把光标多带下去一行，于是图片看起来比它该在的位置高。
-Ghostty 正常，某些基于它的分支不正常。撞上了就改用 `YPTD_IMAGE=iterm2:WxH`——
-iTerm2 那条路径只写一个单元格，完全不碰光标。
+Ghostty 正常，vibtty（Ghostty 的分支）不正常。
+
+vibtty 上实测：kitty 画得出来但文字被推下一行；iterm2 一个像素都画不出来
+（Ghostty 系只实现 kitty graphics，从来不支持 iTerm2 的 inline image）；
+**只有 halfblocks 是对的**。而且任何尺寸都躲不掉——`down = height-1`，
+一行高发 `ESC[0B`（在 ECMA-48 里等同下移一行）、两行高发 `ESC[1B`，
+每画一行都多带一行。所以在这类终端上只能 `image = "halfblocks"`，
+代价是头像变成马赛克块。真正的修复在终端那边：实现 `CSI s` / `CSI u` 即可。
 
 ---
 

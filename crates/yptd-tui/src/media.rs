@@ -79,8 +79,17 @@ impl Media {
     /// terminal that answers nothing -- images degrade to a text line rather
     /// than the client refusing to start.
     pub fn detect() -> Self {
+        Self::detect_with("")
+    }
+
+    /// Detection, with a protocol the configuration asked for taking
+    /// precedence over what the terminal claims. `YPTD_IMAGE` still wins over
+    /// both, for trying one without editing anything.
+    pub fn detect_with(preference: &str) -> Self {
         Self {
-            picker: forced_picker().or_else(|| Picker::from_query_stdio().ok()),
+            picker: forced_picker()
+                .or_else(|| chosen(preference, Picker::from_query_stdio().ok().as_ref()))
+                .or_else(|| Picker::from_query_stdio().ok()),
             images: HashMap::new(),
             last_used: HashMap::new(),
             tick: 0,
@@ -441,16 +450,34 @@ fn encode(
 /// way to try another protocol without rebuilding. It also lets a headless
 /// test drive a protocol the pseudo-terminal would never negotiate.
 fn forced_picker() -> Option<Picker> {
+    build_picker(&std::env::var("YPTD_IMAGE").ok()?, None)
+}
+
+/// The configured protocol, keeping the cell size the terminal reported.
+fn chosen(preference: &str, detected: Option<&Picker>) -> Option<Picker> {
+    (!preference.trim().is_empty()).then(|| build_picker(preference, detected))?
+}
+
+fn build_picker(raw: &str, detected: Option<&Picker>) -> Option<Picker> {
     use ratatui_image::picker::ProtocolType;
 
-    let raw = std::env::var("YPTD_IMAGE").ok()?;
-    let (name, size) = raw.split_once(':').unwrap_or((raw.as_str(), "10x20"));
-    // Accept both separators: the status line prints "16×35", and that is
-    // what anybody copying from it will type back.
-    let (w, h) = size.split_once(['x', 'X', '×'])?;
-    let font = ratatui_image::FontSize {
-        width: w.parse().ok()?,
-        height: h.parse().ok()?,
+    let raw = raw.to_owned();
+    // A bare protocol name keeps whatever cell size was detected, so the
+    // configuration never has to carry a number that depends on the font.
+    let fallback = detected
+        .map(Picker::font_size)
+        .unwrap_or(ratatui_image::FontSize { width: 10, height: 20 });
+    let (name, font) = match raw.split_once(':') {
+        None => (raw.as_str(), fallback),
+        Some((name, size)) => {
+            // Accept both separators: the status line prints "16×35", and
+            // that is what anybody copying from it will type back.
+            let (w, h) = size.split_once(['x', 'X', '×'])?;
+            (
+                name,
+                ratatui_image::FontSize { width: w.parse().ok()?, height: h.parse().ok()? },
+            )
+        }
     };
     let protocol = match name.trim().to_ascii_lowercase().as_str() {
         "kitty" => ProtocolType::Kitty,

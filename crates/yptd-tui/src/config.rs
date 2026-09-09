@@ -18,6 +18,18 @@ pub struct Config {
     pub api: String,
     /// OpenIM WebSocket gateway URL.
     pub ws: String,
+    /// Which graphics protocol to draw pictures with, when the detected one
+    /// is wrong for this terminal. `kitty`, `iterm2`, `sixel`, `halfblocks`
+    /// or `off`; empty means whatever the terminal says it supports.
+    ///
+    /// Needed because a terminal can answer the capability query correctly
+    /// and still place the picture wrong: some do not implement the
+    /// save-and-restore-cursor pair the kitty path leans on, and every row of
+    /// a picture then walks the text after it down a line.
+    /// `yptd doctor --media` draws a square against two labelled rows, which
+    /// is how to tell which protocol this terminal actually gets right.
+    #[serde(default)]
+    pub image: String,
 }
 
 impl Default for Config {
@@ -26,6 +38,7 @@ impl Default for Config {
             server: "https://im.zhanghuanyang.com/yptd".into(),
             api: "https://im.zhanghuanyang.com".into(),
             ws: "wss://im.zhanghuanyang.com/ws".into(),
+            image: String::new(),
         }
     }
 }
