@@ -41,6 +41,7 @@ impl Builder {
             conversation: self.conversation.clone(),
             sender: user(sender),
             sender_name: name.to_owned(),
+            sender_avatar: None,
             body,
             quote: None,
             reactions: Vec::new(),

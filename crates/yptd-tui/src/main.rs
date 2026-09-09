@@ -660,6 +660,14 @@ fn run(mut app: App, connect: bool) -> Fallible<()> {
         // Doing it here rather than on arrival covers history too, and the
         // request set makes repeats free.
         for message in app.messages() {
+            // The sender's picture, if they have set one. Same worker and the
+            // same cache as attachments -- an avatar is just a small image.
+            if let Some(url) = message.sender_avatar.as_deref()
+                && media.failure(url).is_none()
+                && !media.holds(url)
+            {
+                downloads.request(url, url);
+            }
             if let Some(a) = message.attachment()
                 && a.kind == im_model::AttachmentKind::Image
                 && (media.rows_for(a.key()) == 0 || !media.holds(a.key()))

@@ -290,6 +290,10 @@ pub fn message(msg: &Value, me: &UserId, interner: &mut Interner) -> Option<Mess
             let n = str_of(msg, "senderNickname");
             if n.is_empty() { sender.0.clone() } else { n.to_owned() }
         },
+        sender_avatar: {
+            let url = str_of(msg, "senderFaceURL");
+            (!url.is_empty()).then(|| url.to_owned())
+        },
         body,
         quote,
         reactions: Vec::new(),

@@ -3,7 +3,7 @@
 
 use im_model::{Body, ConversationId, Message, SendState, Visibility};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span as TuiSpan};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -26,6 +26,15 @@ use crate::syntax;
 /// content width, every cursor move would re-wrap the text and the viewport
 /// would jump under the reader.
 const GUTTER: u16 = 2;
+/// An avatar is four columns by two rows: about square once a cell's own
+/// proportions are taken into account, and short enough that a one-line
+/// message still costs one line. Same figures concord settled on.
+const AVATAR_COLS: u16 = 4;
+const AVATAR_ROWS: u16 = 2;
+/// One column between the picture and the text, or they touch.
+const AVATAR_GAP: u16 = 1;
+/// What the whole avatar column takes out of the width available to text.
+const AVATAR_OFFSET: u16 = AVATAR_COLS + AVATAR_GAP;
 const SELECTED_MARK: &str = "▌ ";
 /// A thinner bar for a message that names you, so a mention is findable while
 /// scrolling past without reading a word.
@@ -834,6 +843,9 @@ fn block_height(placement: &Placement) -> u16 {
 /// the scroll arithmetic can both work in line space.
 struct PaneLine {
     message_index: Option<usize>,
+    /// Set on the row an author group starts at: the picture spans this row
+    /// and the one below it.
+    avatar: Option<Avatar>,
     /// A row that precedes a message without being part of it: a divider,
     /// the gap between author groups, the notice above the oldest message.
     chrome: bool,
@@ -880,7 +892,7 @@ fn draw_messages(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let content_width = inner.width.saturating_sub(GUTTER) as usize;
+    let content_width = inner.width.saturating_sub(GUTTER + AVATAR_OFFSET) as usize;
     if content_width == 0 || inner.height == 0 {
         return;
     }
@@ -922,6 +934,34 @@ fn draw_messages(
     frame.render_widget(Paragraph::new(visible), inner);
 
     let bottom = inner.y.saturating_add(inner.height);
+
+    // Avatars first: a picture block below one may overlap the rows it spans,
+    // and whatever is drawn last wins.
+    for (row, avatar) in window
+        .iter()
+        .enumerate()
+        .filter_map(|(row, e)| e.avatar.clone().map(|a| (row, a)))
+    {
+        let y = inner.y.saturating_add(row as u16);
+        if y >= bottom {
+            continue;
+        }
+        let area = Rect {
+            x: inner.x.saturating_add(GUTTER),
+            y,
+            width: AVATAR_COLS.min(inner.width.saturating_sub(GUTTER)),
+            // An avatar on the last visible row draws only its top half.
+            height: AVATAR_ROWS.min(bottom - y),
+        };
+        if area.width == 0 || area.height == 0 {
+            continue;
+        }
+        match avatar.key.as_deref() {
+            Some(key) if media.holds(key) => media.render(frame, area, key, true),
+            _ => draw_avatar_block(frame, area, &avatar, theme),
+        }
+    }
+
     for (row, placement) in blocks {
         let top = inner.y.saturating_add(row as u16);
         for tile in &placement.tiles {
@@ -934,7 +974,10 @@ fn draw_messages(
             }
             // A block scrolled half off the bottom paints only what fits.
             let height = tile.height.min(bottom - y);
-            let x = inner.x.saturating_add(GUTTER).saturating_add(tile.x);
+            let x = inner
+                .x
+                .saturating_add(GUTTER + AVATAR_OFFSET)
+                .saturating_add(tile.x);
             let right = inner.x.saturating_add(inner.width);
             if height == 0 || x >= right {
                 continue;
@@ -949,6 +992,32 @@ fn draw_messages(
             media.render(frame, Rect { x, y, width, height }, key, fill);
         }
     }
+}
+
+/// Draws the stand-in for somebody who has not uploaded a picture: their own
+/// colour, with the first character of their name on it.
+///
+/// Every terminal can show this, which is the point -- half-block characters
+/// would make a photograph unrecognisable at four columns anyway, so the
+/// letter is the better fallback even where pictures are possible.
+fn draw_avatar_block(frame: &mut Frame, area: Rect, avatar: &Avatar, theme: &Theme) {
+    let colour = theme.style(avatar.colour).fg.unwrap_or(Color::DarkGray);
+    let filled = Style::default().bg(colour);
+    let width = area.width as usize;
+    let initial = avatar.initial.width().min(width);
+    let left = (width - initial) / 2;
+    let rows = vec![
+        TuiLine::from(vec![
+            TuiSpan::styled(" ".repeat(left), filled),
+            TuiSpan::styled(
+                avatar.initial.clone(),
+                filled.fg(Color::Black).add_modifier(Modifier::BOLD),
+            ),
+            TuiSpan::styled(" ".repeat(width - left - initial), filled),
+        ]),
+        TuiLine::from(TuiSpan::styled(" ".repeat(width), filled)),
+    ];
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 /// Chooses the first visible row, and settles the selection with it.
@@ -1101,6 +1170,9 @@ fn build_message_lines(
                 _ => index,
             };
             let mut entry = content_line(line, Some((index, run_len)), Some(owner), addressed);
+            if show_header && offset == 0 {
+                entry.avatar = Some(avatar_for(message));
+            }
             if offset == first_block_row && block_rows > 0 {
                 entry.album = preview.clone();
             }
@@ -1108,6 +1180,40 @@ fn build_message_lines(
         }
     }
     out
+}
+
+/// The avatar for one message's sender.
+fn avatar_for(message: &Message) -> Avatar {
+    Avatar {
+        // Keyed by URL, the same rule attachments use: two people's
+        // pictures are two pictures even with the same file name.
+        key: message.sender_avatar.clone(),
+        // A grapheme, not a byte: a name starting with a Chinese character or
+        // an emoji must not be cut in half.
+        initial: message
+            .sender_name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_owned()),
+        colour: author_colour(&message.sender.0),
+    }
+}
+
+/// Who a row's picture belongs to.
+///
+/// Everyone gets one whether or not they have uploaded a picture: a block in
+/// the colour already derived from their id, carrying the first character of
+/// their name. That is what makes a wall of messages scannable, and it costs
+/// no network and no graphics protocol -- a terminal that cannot draw
+/// pictures still gets the colour and the letter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Avatar {
+    /// Cache key of the uploaded picture, when there is one.
+    key: Option<String>,
+    /// First character of the name, for the block drawn without a picture.
+    initial: String,
+    colour: HG,
 }
 
 /// The row above the oldest loaded message.
@@ -1241,6 +1347,7 @@ fn content_line(
         run,
         line: TuiLine::from(spans),
         album: None,
+        avatar: None,
         chrome: false,
     }
 }
@@ -1259,6 +1366,9 @@ fn with_gutter(entry: &PaneLine, selected: bool, theme: &Theme) -> TuiLine<'stat
         (false, true) => TuiSpan::styled(MENTION_MARK, theme.style(HG::MentionSelf)),
         (false, false) => TuiSpan::styled(UNSELECTED_MARK, theme.style(HG::MessageSelectedBorder)),
     });
+    // The avatar is painted over these spaces afterwards; reserving them here
+    // keeps every row of a message lined up under the first, picture or not.
+    spans.push(TuiSpan::raw(" ".repeat(AVATAR_OFFSET as usize)));
     spans.extend(entry.line.spans.iter().cloned());
     TuiLine::from(spans)
 }
@@ -1276,6 +1386,7 @@ fn divider(label: &str, style: Style, width: usize, message_index: usize) -> Pan
         mentions_me: false,
         run: None,
         chrome: true,
+        avatar: None,
         line: TuiLine::from(vec![
             TuiSpan::styled("─".repeat(left), style),
             TuiSpan::styled(label.to_owned(), style),

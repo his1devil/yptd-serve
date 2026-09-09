@@ -222,6 +222,11 @@ pub struct Message {
     pub conversation: ConversationId,
     pub sender: UserId,
     pub sender_name: String,
+    /// Where the sender's picture lives, when they have set one. Carried per
+    /// message rather than looked up: a direct conversation has no member
+    /// list to look anything up in, and OpenIM stamps it onto every message
+    /// anyway.
+    pub sender_avatar: Option<String>,
     pub body: Body,
     pub quote: Option<Quote>,
     pub reactions: Vec<Reaction>,
