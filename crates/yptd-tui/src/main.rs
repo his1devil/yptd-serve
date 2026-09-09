@@ -510,7 +510,12 @@ fn alignment_probe(mut media: media::Media) -> Fallible<()> {
     // Leave the cursor under what was drawn, or the shell prompt lands on it.
     let _ = terminal.backend_mut().append_lines(1);
     println!();
-    println!("上下没对齐就换个协议再看：YPTD_IMAGE=iterm2:{} yptd doctor --media", media.status_label().split_whitespace().nth(1).unwrap_or("16x35").replace('×', "x"));
+    let (w, h) = media
+        .cell_size()
+        .map_or((16, 35), |cell| (cell.width, cell.height));
+    println!("上下没对齐就换个协议再看：");
+    println!("  YPTD_IMAGE=iterm2:{w}x{h} yptd doctor --media");
+    println!("  YPTD_IMAGE=halfblocks:{w}x{h} yptd doctor --media");
     Ok(())
 }
 

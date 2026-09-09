@@ -445,7 +445,9 @@ fn forced_picker() -> Option<Picker> {
 
     let raw = std::env::var("YPTD_IMAGE").ok()?;
     let (name, size) = raw.split_once(':').unwrap_or((raw.as_str(), "10x20"));
-    let (w, h) = size.split_once('x')?;
+    // Accept both separators: the status line prints "16×35", and that is
+    // what anybody copying from it will type back.
+    let (w, h) = size.split_once(['x', 'X', '×'])?;
     let font = ratatui_image::FontSize {
         width: w.parse().ok()?,
         height: h.parse().ok()?,
