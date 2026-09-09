@@ -442,6 +442,9 @@ fn cmd_doctor_image(path: Option<&str>) -> Fallible<()> {
 /// gets. Needs a real terminal: the numbers come from asking it.
 fn cmd_doctor_media() -> Fallible<()> {
     let media = media::Media::detect();
+    // Which binary this is: the installed release and a local build behave
+    // differently, and telling them apart afterwards is guesswork.
+    println!("yptd {} — {}", update::VERSION, std::env::args().next().unwrap_or_default());
     println!("{}", media.report());
     if !media.enabled() {
         println!();
@@ -513,9 +516,13 @@ fn alignment_probe(mut media: media::Media) -> Fallible<()> {
     let (w, h) = media
         .cell_size()
         .map_or((16, 35), |cell| (cell.width, cell.height));
-    println!("上下没对齐就换个协议再看：");
-    println!("  YPTD_IMAGE=iterm2:{w}x{h} yptd doctor --media");
-    println!("  YPTD_IMAGE=halfblocks:{w}x{h} yptd doctor --media");
+    // The path as typed, not the bare name: the installed release and the
+    // build being tested are different binaries, and an older installed one
+    // will not have the setting the hint is asking to try.
+    let me = std::env::args().next().unwrap_or_else(|| "yptd".to_owned());
+    println!("上下没对齐就换个协议再看（同一个二进制）：");
+    println!("  YPTD_IMAGE=iterm2:{w}x{h} {me} doctor --media");
+    println!("  YPTD_IMAGE=halfblocks:{w}x{h} {me} doctor --media");
     Ok(())
 }
 

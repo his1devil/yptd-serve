@@ -16,7 +16,9 @@ fn main() {
     // development tree still reports something rather than nothing.
     println!("cargo::rerun-if-env-changed=YPTD_VERSION");
     let version = std::env::var("YPTD_VERSION")
-        .unwrap_or_else(|_| format!("v{}", env!("CARGO_PKG_VERSION")));
+        .ok()
+        .or_else(described)
+        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
     println!("cargo::rustc-env=YPTD_VERSION={version}");
 
     println!("cargo::rerun-if-env-changed=YPTD_EMBED_SIDECAR");
@@ -35,6 +37,21 @@ fn main() {
     // step.
     println!("cargo::rustc-env=YPTD_SIDECAR_HASH={:016x}", fnv1a(&bytes));
     println!("cargo::rustc-cfg=embedded_sidecar");
+}
+
+/// What `git describe` says, so a build from a working tree identifies
+/// itself as something other than the release it sits after. A release build
+/// is handed its version instead and never gets here.
+fn described() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+    (!text.is_empty()).then_some(text)
 }
 
 /// FNV-1a: not a defence against tampering, just a short stable name for one
