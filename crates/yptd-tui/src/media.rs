@@ -625,6 +625,20 @@ mod tests {
     /// height of one the terminal ends up a row below where ratatui believes
     /// it is, and everything drawn afterwards lands a row low. That is what
     /// made an avatar appear to float above its own name.
+    /// Prints the exact bytes a 4x2 picture puts on the wire, base64'd, so a
+    /// terminal bug can be handed to whoever owns that terminal as something
+    /// they can paste and run. Ignored by default; it is a tool, not a check.
+    #[test]
+    #[ignore]
+    fn dump_the_wire_bytes_for_a_bug_report() {
+        let cells = kitty_cells(4, 2);
+        let mut out = String::new();
+        for byte in cells.as_bytes() {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        println!("HEXDUMP {out}");
+    }
+
     #[test]
     fn a_picture_one_row_tall_would_walk_the_cursor_off_by_a_row() {
         assert!(
