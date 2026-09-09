@@ -66,6 +66,23 @@ pub struct DraftMention {
     pub nickname: String,
 }
 
+/// Rows from the top of the loaded history within which the next page is
+/// asked for, so it is usually there before the reader is.
+pub const PREFETCH_ROWS: usize = 30;
+
+/// Whether there is older history than what is loaded, and whether it is on
+/// its way. Drawn as the first row of the list, so the reader knows what
+/// scrolling up will do before doing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryState {
+    /// Older messages may exist; scrolling to the top asks for them.
+    MayHaveMore,
+    /// A page has been requested and has not arrived yet.
+    Loading,
+    /// The beginning of the conversation is on screen.
+    Exhausted,
+}
+
 /// A row in the conversation pane: either a collapsible category or a
 /// conversation under one.
 #[derive(Clone, Debug)]
@@ -93,6 +110,32 @@ pub struct App {
     /// move the cursor and drag the viewport along, `J`/`K` move the viewport
     /// and leave the cursor where it is.
     pub message_scroll: usize,
+    /// Rows from `message_scroll`'s own first row to the top of the viewport,
+    /// so the wheel can move three rows rather than three messages -- a
+    /// message with a picture in it is a dozen rows, and jumping by whole
+    /// messages makes the wheel feel broken. Negative when the viewport
+    /// starts on a divider above the message.
+    pub scroll_offset: isize,
+    /// Rows the wheel has asked for since the last frame. Applied by the
+    /// renderer, which is the only place that knows how tall each message is.
+    pub pending_scroll: isize,
+    /// Where the last frame actually started, as (message, rows from its
+    /// first row). What `leave_follow` anchors to, so stopping the
+    /// auto-scroll does not move the text under the reader. `None` until a
+    /// frame has been drawn.
+    pub view_anchor: Option<(usize, isize)>,
+    /// Row of the whole list that the last frame started at.
+    pub view_top: usize,
+    /// Rows the message pane had in the last frame; what "half a page" is.
+    pub view_height: usize,
+    /// The selection as of the last frame. The viewport moves to the selection
+    /// only when the selection has moved; otherwise a selection left half
+    /// off screen by the wheel would drag the view back on the next frame.
+    pub shown_cursor: Option<usize>,
+    /// What the top of the list should say about older history.
+    pub history: HistoryState,
+    /// True while the session is still being set up behind the interface.
+    pub connecting: bool,
     /// New messages scroll into view only while the cursor is already at the
     /// bottom, so reading history is never yanked away.
     pub follow_latest: bool,
@@ -150,6 +193,14 @@ impl App {
             open,
             message_cursor: 0,
             message_scroll: 0,
+            scroll_offset: 0,
+            pending_scroll: 0,
+            view_anchor: None,
+            view_top: 0,
+            view_height: 0,
+            shown_cursor: None,
+            history: HistoryState::MayHaveMore,
+            connecting: false,
             follow_latest: true,
             nav_cursor: 0,
             member_cursor: 0,
@@ -182,6 +233,14 @@ impl App {
             open: self.open.clone(),
             message_cursor: self.message_cursor,
             message_scroll: self.message_scroll,
+            scroll_offset: self.scroll_offset,
+            pending_scroll: self.pending_scroll,
+            view_anchor: self.view_anchor,
+            view_top: self.view_top,
+            view_height: self.view_height,
+            shown_cursor: self.shown_cursor,
+            history: self.history,
+            connecting: self.connecting,
             follow_latest: self.follow_latest,
             nav_cursor: self.nav_cursor,
             member_cursor: self.member_cursor,
@@ -247,13 +306,7 @@ impl App {
     /// Whether the reader has scrolled to the oldest message on screen, which
     /// is when the next page of history is worth fetching.
     pub fn at_oldest(&self) -> bool {
-        !self.follow_latest
-            && self
-                .message_line_map
-                .iter()
-                .flatten()
-                .min()
-                .is_none_or(|first| *first <= 1)
+        !self.follow_latest && self.view_top <= PREFETCH_ROWS
     }
 
     /// The message under the message-pane cursor.
@@ -448,6 +501,9 @@ impl App {
             Pane::Messages => {
                 match self.message_line_map.get(index).copied().flatten() {
                     Some(message) => {
+                        // Pin the view where it is first, so selecting a row
+                        // that is already on screen moves nothing else.
+                        self.leave_follow();
                         self.message_cursor = message;
                         self.follow_latest = message + 1 >= self.messages().len();
                         true
@@ -458,14 +514,25 @@ impl App {
         }
     }
 
+    /// Scrolls the message pane by lines. The move is recorded here and made
+    /// by the renderer, which knows the line layout.
+    pub fn scroll_lines(&mut self, delta: isize) {
+        self.leave_follow();
+        self.pending_scroll = self.pending_scroll.saturating_add(delta);
+    }
+
+    /// `C-d` / `C-u`: half of what the pane showed last frame, in the given
+    /// direction. Before any frame, a conventional dozen rows.
+    pub fn scroll_half_page(&mut self, direction: isize) {
+        let half = (self.view_height / 2).max(1) as isize;
+        let half = if self.view_height == 0 { 12 } else { half };
+        self.scroll_lines(direction.signum() * half);
+    }
+
     /// Scrolls one pane without changing focus.
     pub fn scroll_pane(&mut self, pane: Pane, delta: isize) {
         match pane {
-            Pane::Messages => {
-                self.leave_follow();
-                let count = self.messages().len();
-                self.message_scroll = step(self.message_scroll, delta, count);
-            }
+            Pane::Messages => self.scroll_lines(delta),
             Pane::Conversations => {
                 let rows = self.nav_rows().len();
                 self.nav_cursor = step(self.nav_cursor, delta, rows);
@@ -477,10 +544,16 @@ impl App {
         }
     }
 
-    /// Test helper: a single number that moves whenever the message pane does.
+    /// Test helper: everything that moves when the message pane does.
     #[cfg(test)]
-    pub fn message_scroll_or_cursor(&self) -> usize {
-        self.message_scroll * 1000 + self.message_cursor
+    pub fn message_scroll_or_cursor(&self) -> (usize, isize, isize, bool, usize) {
+        (
+            self.message_scroll,
+            self.scroll_offset,
+            self.pending_scroll,
+            self.follow_latest,
+            self.message_cursor,
+        )
     }
 
     /// `j` / `k`: move the selection, letting the viewport follow.
@@ -488,6 +561,7 @@ impl App {
         match self.pane {
             Pane::Messages => {
                 let count = self.messages().len();
+                self.leave_follow();
                 self.message_cursor = step(self.message_cursor, delta, count);
                 self.follow_latest = self.message_cursor + 1 >= count;
             }
@@ -523,13 +597,12 @@ impl App {
             return;
         }
         self.follow_latest = false;
-        self.message_scroll = self
-            .message_line_map
-            .iter()
-            .flatten()
-            .next()
-            .copied()
-            .unwrap_or(self.message_cursor);
+        // Anchor to exactly where the last frame started, row and all. With
+        // no frame drawn yet the selection is the only position there is.
+        let (message, offset) = self.view_anchor.unwrap_or((self.message_cursor, 0));
+        self.message_scroll = message;
+        self.scroll_offset = offset;
+        self.pending_scroll = 0;
     }
 
     pub fn jump_to_latest(&mut self) {
@@ -541,6 +614,10 @@ impl App {
     pub fn jump_to_top(&mut self) {
         self.message_cursor = 0;
         self.message_scroll = 0;
+        self.scroll_offset = 0;
+        // Past the first message's own rows to the very first row, whatever
+        // sits above it; the renderer clamps.
+        self.pending_scroll = isize::MIN / 2;
         self.follow_latest = false;
     }
 
@@ -554,6 +631,12 @@ impl App {
         }
         self.open = id;
         self.message_scroll = 0;
+        self.scroll_offset = 0;
+        self.pending_scroll = 0;
+        self.view_anchor = None;
+        self.view_top = 0;
+        self.shown_cursor = None;
+        self.history = HistoryState::MayHaveMore;
         self.jump_to_latest();
         self.pane = Pane::Messages;
         if let Some(index) = self.nav_rows().iter().position(
@@ -651,14 +734,17 @@ mod tests {
     }
 
     #[test]
-    fn reaching_the_top_is_what_asks_for_older_messages() {
+    fn nearing_the_top_is_what_asks_for_older_messages() {
         let mut app = App::new(im_model::mock::snapshot());
+        app.view_top = 0;
         assert!(!app.at_oldest(), "following the newest is not the top");
         app.follow_latest = false;
-        app.message_line_map = vec![Some(4), Some(4), Some(5)];
+        app.view_top = PREFETCH_ROWS * 4;
         assert!(!app.at_oldest(), "still some way down");
-        app.message_line_map = vec![Some(1), Some(2)];
-        assert!(app.at_oldest(), "the oldest message is on screen");
+        app.view_top = PREFETCH_ROWS;
+        assert!(app.at_oldest(), "close enough to the top to fetch ahead");
+        app.view_top = 0;
+        assert!(app.at_oldest(), "the first row is on screen");
     }
 
     #[test]
@@ -749,20 +835,22 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_up_from_the_live_edge_does_not_jump_to_the_beginning() {
+    fn scrolling_up_from_the_live_edge_starts_where_the_frame_was() {
         let mut app = app();
         assert!(app.follow_latest, "fixture opens at the live edge");
-        // Pretend a frame was drawn showing the last four messages.
+        // Pretend a frame was drawn starting two rows into the fourth-last
+        // message.
         let last = app.messages().len() - 1;
-        app.message_line_map = (last - 3..=last).map(Some).collect();
+        app.view_anchor = Some((last - 3, 2));
 
         app.scroll_pane(Pane::Messages, -3);
         assert!(!app.follow_latest);
-        assert!(
-            app.message_scroll >= last - 6,
-            "scroll landed at {}, expected near the live edge ({last})",
-            app.message_scroll
-        );
+        assert_eq!((app.message_scroll, app.scroll_offset), (last - 3, 2));
+        assert_eq!(app.pending_scroll, -3, "the rows to move are left for the renderer");
+
+        // More wheel before the next frame adds up rather than replacing.
+        app.scroll_pane(Pane::Messages, -3);
+        assert_eq!(app.pending_scroll, -6);
     }
 
     #[test]
@@ -770,7 +858,25 @@ mod tests {
         let mut app = app();
         let cursor = app.message_cursor;
         app.scroll_pane(Pane::Messages, -1);
-        assert!(app.message_scroll <= cursor && app.message_scroll + 2 >= cursor);
+        assert_eq!((app.message_scroll, app.scroll_offset), (cursor, 0));
+    }
+
+    #[test]
+    fn opening_a_conversation_forgets_the_scroll_of_the_last_one() {
+        let mut app = app();
+        app.scroll_pane(Pane::Messages, -5);
+        app.history = HistoryState::Exhausted;
+        let other = app
+            .snapshot
+            .conversations
+            .iter()
+            .map(|c| c.id.clone())
+            .find(|id| *id != app.open)
+            .expect("fixture has several conversations");
+        app.open_conversation(other);
+        assert!(app.follow_latest);
+        assert_eq!(app.pending_scroll, 0);
+        assert_eq!(app.history, HistoryState::MayHaveMore, "the new one may have more");
     }
 
     #[test]

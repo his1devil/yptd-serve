@@ -44,7 +44,7 @@ const AUTHOR_GROUP_MS: i64 = 5 * 60_000;
 /// scrolling that stutters.
 #[derive(Default)]
 pub struct Cache {
-    key: Option<(ConversationId, usize, u64, u64, i64, i64)>,
+    key: Option<(ConversationId, usize, u64, u64, i64, i64, u8)>,
     lines: Vec<PaneLine>,
 }
 
@@ -67,6 +67,7 @@ impl Cache {
             // Only the day matters, so the rows survive until midnight rather
             // than being thrown away every second.
             day_index(app.now_ms + app.utc_offset_ms),
+            app.history as u8,
         );
         if self.key.as_ref() != Some(&key) {
             self.lines = build_message_lines(app, theme, media, width, app.now_ms);
@@ -370,6 +371,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, media: &Media, theme: &
     }
     if app.snapshot.connected {
         left.push(TuiSpan::styled("● 已连接", theme.style(HG::PresenceOnline)));
+    } else if app.connecting {
+        // Not lost: never had yet.
+        left.push(TuiSpan::styled("● 连接中…", theme.style(HG::SyncProgress)));
     } else {
         left.push(TuiSpan::styled("● 连接中断", theme.style(HG::ConnectionLost)));
     }
@@ -694,7 +698,24 @@ fn command_row(command: &str, description: &str, theme: &Theme) -> TuiLine<'stat
 
 /// What to do when there is nothing yet: the two commands that make a
 /// conversation, centred in the empty pane.
-fn draw_empty_state(frame: &mut Frame, inner: Rect, theme: &Theme) {
+fn draw_empty_state(frame: &mut Frame, inner: Rect, theme: &Theme, connecting: bool) {
+    if connecting {
+        // The interface is up before the session is; say so rather than
+        // showing the new-account help to somebody with plenty of groups.
+        let rows = vec![
+            TuiLine::from(TuiSpan::styled("连接中…", theme.style(HG::Title))).centered(),
+            TuiLine::from(""),
+            TuiLine::from(TuiSpan::styled(
+                "正在登录并同步会话，通常只要一两秒",
+                theme.style(HG::Hint),
+            ))
+            .centered(),
+        ];
+        let top = inner.height.saturating_sub(rows.len() as u16) / 3;
+        let area = Rect { y: inner.y + top, height: inner.height.saturating_sub(top), ..inner };
+        frame.render_widget(Paragraph::new(rows), area);
+        return;
+    }
     let rows: Vec<TuiLine<'static>> = vec![
         TuiLine::from(TuiSpan::styled("还没有会话", theme.style(HG::Title))).centered(),
         TuiLine::from(""),
@@ -813,6 +834,9 @@ fn block_height(placement: &Placement) -> u16 {
 /// the scroll arithmetic can both work in line space.
 struct PaneLine {
     message_index: Option<usize>,
+    /// A row that precedes a message without being part of it: a divider,
+    /// the gap between author groups, the notice above the oldest message.
+    chrome: bool,
     /// Whether the message on this row names the local user.
     mentions_me: bool,
     /// Which run of messages this row belongs to, as (first, length). The
@@ -865,12 +889,17 @@ fn draw_messages(
     // teaches nobody the two commands that fix it.
     if app.snapshot.conversations.is_empty() {
         app.message_line_map = Vec::new();
-        draw_empty_state(frame, inner, theme);
+        draw_empty_state(frame, inner, theme, app.connecting);
         return;
     }
 
     let lines = cache.rows(app, theme, media, content_width);
     let top = viewport_top(app, lines, inner.height as usize);
+    // Remember where this frame starts, so leaving the live edge anchors to
+    // it and reaching the top can be told from the row number.
+    app.view_top = top;
+    app.view_height = inner.height as usize;
+    app.view_anchor = (!lines.is_empty()).then(|| anchor_at(lines, top));
     let window: Vec<&PaneLine> = lines.iter().skip(top).take(inner.height as usize).collect();
 
     // Record which message each visible row belongs to, so a click resolves
@@ -922,43 +951,78 @@ fn draw_messages(
     }
 }
 
-/// Chooses the first visible line.
+/// Chooses the first visible row, and settles the selection with it.
 ///
-/// Following the live edge anchors to the bottom. Otherwise the viewport
-/// starts at the scrolled-to message but is nudged so the selection stays on
-/// screen -- a cursor you cannot see is worse than a viewport that moved.
-fn viewport_top(app: &App, lines: &[PaneLine], height: usize) -> usize {
+/// Following the live edge anchors to the bottom. Otherwise the viewport is
+/// the anchored row plus whatever the wheel asked for since the last frame.
+/// Selection and viewport keep each other on screen, and whichever moved last
+/// wins: the wheel drags the selection along rather than being dragged back
+/// to it, and `j`/`k` bring the viewport to the selection.
+fn viewport_top(app: &mut App, lines: &[PaneLine], height: usize) -> usize {
     let total = lines.len();
+    if total == 0 || height == 0 {
+        app.pending_scroll = 0;
+        return 0;
+    }
+    let max_top = total.saturating_sub(height);
     if app.follow_latest {
-        return total.saturating_sub(height);
+        app.pending_scroll = 0;
+        app.shown_cursor = Some(app.message_cursor);
+        return max_top;
     }
 
-    let first_line_of = |message_index: usize| {
-        lines
-            .iter()
-            .position(|entry| entry.message_index == Some(message_index))
-    };
-    let last_line_of = |message_index: usize| {
-        lines
-            .iter()
-            .rposition(|entry| entry.message_index == Some(message_index))
-    };
+    let first_row_of = |message: usize| lines.iter().position(|e| e.message_index == Some(message));
+    let last_row_of = |message: usize| lines.iter().rposition(|e| e.message_index == Some(message));
 
-    let mut top = first_line_of(app.message_scroll)
-        .unwrap_or(0)
-        .min(total.saturating_sub(1));
-    // A message with no rows of its own -- one folded into a picture block --
-    // must leave the viewport where it is rather than snapping to the top.
-    if let (Some(cursor_start), Some(cursor_end)) =
-        (first_line_of(app.message_cursor), last_line_of(app.message_cursor))
-    {
-        if cursor_start < top {
-            top = cursor_start;
-        } else if cursor_end >= top + height {
-            top = cursor_end.saturating_sub(height.saturating_sub(1));
+    let wheel = std::mem::take(&mut app.pending_scroll);
+    let mut top = row_of(lines, (app.message_scroll, app.scroll_offset))
+        .saturating_add_signed(wheel)
+        .min(max_top);
+
+    if wheel != 0 {
+        if wheel > 0 && top >= max_top {
+            // Rolled back down to the newest message: follow it again, the
+            // way every chat client does when the reader returns to the end.
+            app.follow_latest = true;
+            app.message_cursor = app.messages().len().saturating_sub(1);
+            return max_top;
         }
+        // Bring the selection along if the wheel left it off screen. Any row
+        // of a message counts, dividers included, so the frame after this
+        // one has nothing to correct.
+        let bottom = (top + height).min(total) - 1;
+        let on_screen = |message: usize| {
+            matches!((first_row_of(message), last_row_of(message)),
+                (Some(start), Some(end)) if end >= top && start <= bottom)
+        };
+        if !on_screen(app.message_cursor) {
+            let picked = if wheel < 0 { lines[bottom].message_index } else { lines[top].message_index };
+            if let Some(message) = picked {
+                app.message_cursor = message;
+            }
+        }
+    } else if app.shown_cursor != Some(app.message_cursor)
+        && let (Some(start), Some(end)) =
+            (first_row_of(app.message_cursor), last_row_of(app.message_cursor))
+    {
+        // The selection moved: show the whole of it when it fits, and its
+        // beginning when it is taller than the screen.
+        let fits = end - start < height;
+        if end < top || (fits && start < top) {
+            top = start;
+        } else if start >= top + height {
+            top = if fits { end + 1 - height } else { start };
+        } else if fits && end >= top + height {
+            top = end + 1 - height;
+        }
+        top = top.min(max_top);
     }
-    top.min(total.saturating_sub(height.min(total)))
+
+    let (message, offset) = anchor_at(lines, top);
+    app.message_scroll = message;
+    app.scroll_offset = offset;
+    app.shown_cursor = Some(app.message_cursor);
+    top
 }
 
 fn build_message_lines(
@@ -975,6 +1039,9 @@ fn build_message_lines(
 
     let runs = album_runs(&messages);
     let superseded = superseded_placeholders(&messages);
+    // The first row says what scrolling up will do, so nobody has to guess
+    // whether the list simply ends here.
+    out.push(history_notice(app, theme, width));
     for (index, message) in messages.iter().enumerate() {
         // The agent's "working on it" has served its purpose once the answer
         // is under it.
@@ -1008,7 +1075,9 @@ fn build_message_lines(
 
         let show_header = starts_author_group(message, previous);
         if show_header && index > 0 {
-            out.push(content_line(Vec::new(), Some((index, run_len)), Some(index), false));
+            let mut gap = content_line(Vec::new(), Some((index, run_len)), Some(index), false);
+            gap.chrome = true;
+            out.push(gap);
         }
 
         let addressed = message.mentions.iter().any(|m| m.notifies_me);
@@ -1039,6 +1108,59 @@ fn build_message_lines(
         }
     }
     out
+}
+
+/// The row above the oldest loaded message.
+fn history_notice(app: &App, theme: &Theme, width: usize) -> PaneLine {
+    use crate::app::HistoryState;
+    let mut row = match app.history {
+        HistoryState::Exhausted => divider("  这是最早的消息  ", theme.style(HG::DateDivider), width, 0),
+        HistoryState::Loading => content_line(
+            vec![TuiSpan::styled("正在加载更早的消息…", theme.style(HG::Loading))],
+            None,
+            Some(0),
+            false,
+        ),
+        HistoryState::MayHaveMore => content_line(
+            vec![TuiSpan::styled("↑ 继续上滚查看更早的消息", theme.style(HG::Hint))],
+            None,
+            Some(0),
+            false,
+        ),
+    };
+    row.chrome = true;
+    row
+}
+
+/// The message whose rows include `row`, and how far `row` is from that
+/// message's first row of its own. Dividers above a message are not counted,
+/// so the anchor still points at the same text after a page of older history
+/// lands and the dividers move.
+fn anchor_at(lines: &[PaneLine], row: usize) -> (usize, isize) {
+    let row = row.min(lines.len().saturating_sub(1));
+    let message = lines[..=row]
+        .iter()
+        .rev()
+        .find_map(|entry| entry.message_index)
+        .unwrap_or(0);
+    let start = content_start(lines, message).unwrap_or(row);
+    (message, row as isize - start as isize)
+}
+
+/// The first row of a message that is the message itself rather than a
+/// divider above it.
+fn content_start(lines: &[PaneLine], message: usize) -> Option<usize> {
+    lines
+        .iter()
+        .position(|entry| entry.message_index == Some(message) && !entry.chrome)
+        .or_else(|| lines.iter().position(|entry| entry.message_index == Some(message)))
+}
+
+/// The row an anchor from [`anchor_at`] refers to in the current layout.
+fn row_of(lines: &[PaneLine], (message, offset): (usize, isize)) -> usize {
+    let last = lines.len().saturating_sub(1);
+    let start = content_start(lines, message).unwrap_or(if message == 0 { 0 } else { last });
+    start.saturating_add_signed(offset).min(last)
 }
 
 /// Which placeholder messages have been answered already.
@@ -1119,6 +1241,7 @@ fn content_line(
         run,
         line: TuiLine::from(spans),
         album: None,
+        chrome: false,
     }
 }
 
@@ -1152,6 +1275,7 @@ fn divider(label: &str, style: Style, width: usize, message_index: usize) -> Pan
         message_index: Some(message_index),
         mentions_me: false,
         run: None,
+        chrome: true,
         line: TuiLine::from(vec![
             TuiSpan::styled("─".repeat(left), style),
             TuiSpan::styled(label.to_owned(), style),
@@ -1789,34 +1913,36 @@ mod tests {
         );
     }
 
+    fn row_text(line: &PaneLine) -> String {
+        line.line.spans.iter().map(|span| span.content.to_string()).collect()
+    }
+
     #[test]
-    fn scrolling_to_a_message_keeps_its_own_divider_in_view() {
+    fn selecting_a_message_keeps_its_own_divider_in_view() {
         let mut app = app();
         app.follow_latest = false;
         app.message_scroll = 0;
         app.message_cursor = 0;
         let theme = Theme::default();
         let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
-        let top = viewport_top(&app, &lines, 12);
-        let first = lines[top]
-            .line
-            .spans
+        let top = viewport_top(&mut app, &lines, 12);
+        let divider = lines
             .iter()
-            .map(|span| span.content.to_string())
-            .collect::<String>();
+            .position(|l| row_text(l).contains("今天"))
+            .expect("the fixture has a date divider");
         assert!(
-            first.contains("今天"),
-            "the date divider must scroll with its message, got {first:?}"
+            (top..top + 12).contains(&divider),
+            "the date divider must be on screen with its message: top {top}, divider {divider}"
         );
     }
 
     #[test]
     fn following_the_live_edge_anchors_the_viewport_to_the_bottom() {
-        let app = app();
+        let mut app = app();
         let theme = Theme::default();
         let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
         let height = 10;
-        assert_eq!(viewport_top(&app, &lines, height), lines.len() - height);
+        assert_eq!(viewport_top(&mut app, &lines, height), lines.len() - height);
     }
 
     #[test]
@@ -1828,7 +1954,7 @@ mod tests {
         let theme = Theme::default();
         let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
         let height = 6;
-        let top = viewport_top(&app, &lines, height);
+        let top = viewport_top(&mut app, &lines, height);
         let cursor_line = lines
             .iter()
             .rposition(|entry| entry.message_index == Some(app.message_cursor))
@@ -1838,6 +1964,93 @@ mod tests {
             "cursor at line {cursor_line} is outside {top}..{}",
             top + height
         );
+    }
+
+    #[test]
+    fn the_wheel_moves_the_view_by_rows_and_brings_the_selection_along() {
+        let mut app = app();
+        let theme = Theme::default();
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
+        let height = 8;
+        // A frame at the live edge, then the wheel: one notch up.
+        let bottom = viewport_top(&mut app, &lines, height);
+        app.view_anchor = Some(anchor_at(&lines, bottom));
+        app.scroll_pane(Pane::Messages, -3);
+        let top = viewport_top(&mut app, &lines, height);
+        assert_eq!(top, bottom - 3, "three rows, not three messages");
+        assert!(!app.follow_latest);
+
+        // The selection was on the newest message, now off screen; it must
+        // have come along rather than dragging the view back.
+        let first = lines.iter().position(|l| l.message_index == Some(app.message_cursor)).unwrap();
+        let last = lines.iter().rposition(|l| l.message_index == Some(app.message_cursor)).unwrap();
+        assert!(last >= top && first < top + height, "selection {first}..={last} not in {top}..{}", top + height);
+
+        // The frame after a wheel move stays put: nothing left to correct.
+        assert_eq!(viewport_top(&mut app, &lines, height), top);
+    }
+
+    #[test]
+    fn selecting_a_row_that_is_on_screen_moves_nothing_else() {
+        let mut app = app();
+        let theme = Theme::default();
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
+        let height = 8;
+        let bottom = viewport_top(&mut app, &lines, height);
+        app.view_anchor = Some(anchor_at(&lines, bottom));
+        // The frame showed rows bottom..bottom+8; click the second row.
+        app.message_line_map = lines[bottom..bottom + height].iter().map(|l| l.message_index).collect();
+        assert!(app.select_row(Pane::Messages, 1), "a message row");
+        assert_ne!(app.message_cursor, app.messages().len() - 1, "the click left the newest");
+        assert_eq!(viewport_top(&mut app, &lines, height), bottom, "the view did not jump");
+    }
+
+    #[test]
+    fn rolling_back_down_to_the_newest_message_follows_it_again() {
+        let mut app = app();
+        let theme = Theme::default();
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
+        let height = 8;
+        app.follow_latest = false;
+        app.message_scroll = 0;
+        app.scroll_offset = 0;
+        app.pending_scroll = lines.len() as isize * 2;
+        assert_eq!(viewport_top(&mut app, &lines, height), lines.len() - height);
+        assert!(app.follow_latest, "reaching the end resumes following it");
+        assert_eq!(app.message_cursor, app.messages().len() - 1);
+    }
+
+    #[test]
+    fn every_row_is_its_own_anchor() {
+        // Anchors are how the viewport survives relayouts; a row that comes
+        // back as a different row would make the view jump on its own.
+        let app = app();
+        let theme = Theme::default();
+        let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
+        for row in 0..lines.len() {
+            assert_eq!(row_of(&lines, anchor_at(&lines, row)), row, "row {row}");
+        }
+    }
+
+    #[test]
+    fn the_first_row_says_what_scrolling_up_will_do() {
+        use crate::app::HistoryState;
+        let mut app = app();
+        let theme = Theme::default();
+        for (state, expected) in [
+            (HistoryState::MayHaveMore, "上滚"),
+            (HistoryState::Loading, "正在加载"),
+            (HistoryState::Exhausted, "最早的消息"),
+        ] {
+            app.history = state;
+            let lines = build_message_lines(&app, &theme, &Media::disabled(), 60, app.now_ms);
+            assert!(lines[0].chrome, "the notice is not part of any message");
+            assert!(
+                row_text(&lines[0]).contains(expected),
+                "{state:?} should read {expected:?}, got {:?}",
+                row_text(&lines[0])
+            );
+        }
     }
 
     #[test]

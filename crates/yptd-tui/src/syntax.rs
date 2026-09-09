@@ -20,6 +20,15 @@ struct Assets {
     light: Theme,
 }
 
+/// Loads the syntax and theme sets ahead of time.
+///
+/// Loading them costs a few hundred milliseconds, and it happens on first use
+/// -- which, without this, is the first frame that contains a code block, on
+/// the drawing thread. Called from a background thread at startup instead.
+pub fn warm() {
+    let _ = assets();
+}
+
 fn assets() -> &'static Assets {
     static ASSETS: OnceLock<Assets> = OnceLock::new();
     ASSETS.get_or_init(|| {

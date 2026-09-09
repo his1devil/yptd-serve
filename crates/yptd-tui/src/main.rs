@@ -36,13 +36,13 @@ use crossterm::execute;
 use im_model::{Conversation, ConversationId, ConversationKind, Member, Role, Snapshot, UserId};
 use tui_theme::Theme;
 
-use crate::app::{App, DraftMention, Mode, Pane};
+use crate::app::{App, DraftMention, HistoryState, Mode, Pane};
 use crate::config::{Config, Credentials, Paths};
 use crate::downloads::Downloads;
 use crate::picker::{PickItem, Picker, Purpose, Verdict};
 use crate::render::{Palette, Scene};
 use crate::browser::{Browser, Verdict as BrowseVerdict};
-use crate::session::{Session, Uploads};
+use crate::session::{Pager, Session, Uploads};
 
 type Fallible<T> = Result<T, Box<dyn Error>>;
 
@@ -90,7 +90,7 @@ fn main() -> Fallible<()> {
             Some("--media") => cmd_doctor_media(),
             text => cmd_doctor(text),
         },
-        Some("--mock") => run(App::new(im_model::mock::snapshot()), None),
+        Some("--mock") => run(App::new(im_model::mock::snapshot()), false),
         Some("--help" | "-h") => {
             print!("{USAGE}");
             Ok(())
@@ -147,9 +147,18 @@ fn cmd_logout() -> Fallible<()> {
 }
 
 fn cmd_start() -> Fallible<()> {
-    let live = connect()?;
-    run(live_app(live.snapshot), Some((live.backend, live.events)))
+    // The one thing worth failing on before the interface comes up: without
+    // credentials there is nothing to connect to, and the hint belongs on a
+    // plain terminal.
+    if Paths::discover().load_credentials().is_none() {
+        return Err(NOT_LOGGED_IN.into());
+    }
+    let mut app = live_app(Snapshot::default());
+    app.connecting = true;
+    run(app, true)
 }
+
+const NOT_LOGGED_IN: &str = "还没登录。先运行 yptd login，或用 yptd --mock 看示例数据。";
 
 /// The same path as a normal start, minus the terminal UI, so a broken
 /// setup can be diagnosed over ssh or in a script. With a text argument it
@@ -209,6 +218,9 @@ fn cmd_doctor_frame(size: &str) -> Fallible<()> {
         backend.session.ensure_history(&open, &mut app.snapshot)?;
         backend.session.ensure_members(&open, &mut app.snapshot)?;
         app.jump_to_latest();
+        if !backend.session.has_older(&open) {
+            app.history = HistoryState::Exhausted;
+        }
     }
     let (width, height) = parse_size(size);
     print!("{}", render::to_text(&render::capture_app(width, height, &app)?));
@@ -389,31 +401,42 @@ struct Live {
     snapshot: Snapshot,
 }
 
-/// Credential → token → sidecar → first snapshot.
+/// Credential → token → sidecar → first snapshot, with a progress line on
+/// stderr for the diagnostic commands that run on a plain terminal.
 fn connect() -> Fallible<Live> {
+    connect_with(true)
+}
+
+fn connect_with(progress: bool) -> Fallible<Live> {
     let paths = Paths::discover();
     let config = paths.load_config();
     let Some(creds) = paths.load_credentials() else {
-        return Err("还没登录。先运行 yptd login，或用 yptd --mock 看示例数据。".into());
+        return Err(NOT_LOGGED_IN.into());
     };
 
     // One line, not a running commentary: which parts of the machinery are
     // starting is the client's business, not the reader's.
-    eprint!("连接中…");
+    if progress {
+        eprint!("连接中…");
+    }
     let im_token = auth::login(&config, &creds)
-        .map_err(|e| format!("\n{e}\n如果凭据已被吊销，运行 yptd logout 后重新 yptd login。"))?;
+        .map_err(|e| format!("{e}\n如果凭据已被吊销，运行 yptd logout 后重新 yptd login。"))?;
     let (mut session, events) =
         Session::start(&paths, &config, &creds.user_id, &creds.nickname, &im_token)?;
     let mut snapshot = Snapshot::default();
     // A session taken over from an earlier run has already synced; waiting
     // would only stall the start for a sync that is never going to be
-    // announced again.
+    // announced again. A fresh one gets a short wait for the conversation
+    // list: whatever is still in flight after that is folded in when its
+    // event lands, rather than holding the first frame for it.
     if !session.resumed() {
-        session.wait_for_sync(&events, &mut snapshot, Duration::from_secs(20));
+        session.wait_for_sync(&events, &mut snapshot, Duration::from_secs(3));
     }
     session.bootstrap(&mut snapshot)?;
-    // Erase the line so the terminal is clean when the interface takes over.
-    eprint!("\r          \r");
+    if progress {
+        // Erase the line so the terminal is clean when the interface takes over.
+        eprint!("\r          \r");
+    }
     Ok(Live {
         backend: Backend { session, config, creds },
         events,
@@ -514,6 +537,10 @@ enum Input {
     Image(downloads::Fetched),
     /// A picture finished encoding for the terminal at one size.
     Encoded(media::Encoded),
+    /// A page of older history arrived.
+    History(session::Page),
+    /// The session came up behind the interface, or could not.
+    Connected(Result<Live, String>),
     /// A staged picture finished uploading, carrying the SDK's echo of the
     /// message it became.
     Sent(Result<serde_json::Value, im_sidecar::Error>),
@@ -525,7 +552,7 @@ enum Input {
 /// paints once rather than once per event.
 const COALESCE: Duration = Duration::from_millis(40);
 
-fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>) -> Fallible<()> {
+fn run(mut app: App, connect: bool) -> Fallible<()> {
     let theme = Theme::default();
     let (tx, rx) = mpsc::channel::<Input>();
     let cache = Paths::discover().cache_dir();
@@ -546,6 +573,12 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
     if media.enabled() {
         media.start_encoder(tx.clone(), Input::Encoded);
     }
+    // Syntax highlighting loads its grammars on first use, a few hundred
+    // milliseconds; take that hit here instead of on the first frame that
+    // has a code block in it.
+    let _ = std::thread::Builder::new()
+        .name("syntax-warm".into())
+        .spawn(syntax::warm);
 
     // Terminal input on its own thread: `event::read` blocks, and the loop
     // must also wake for sidecar traffic.
@@ -568,40 +601,28 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
             })?;
     }
 
-    let mut backend = match live {
-        Some((backend, events)) => {
-            let tx = tx.clone();
-            std::thread::Builder::new()
-                .name("sidecar-events".into())
-                .spawn(move || {
-                    for ev in events {
-                        if tx.send(Input::Sidecar(ev)).is_err() {
-                            break;
-                        }
-                    }
-                    let _ = tx.send(Input::Closed("sidecar"));
-                })?;
-            Some(backend)
-        }
-        None => None,
-    };
+    // Logging in, starting the sidecar and syncing take a second or two;
+    // the interface comes up at once and says "connecting" until then.
+    if connect {
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name("connect".into())
+            .spawn(move || {
+                let outcome = connect_with(false).map_err(|e| e.to_string());
+                let _ = tx.send(Input::Connected(outcome));
+            })?;
+    } else {
+        load_fixture_images(&mut media, &app);
+    }
+    let mut backend: Option<Backend> = None;
 
     let mut clicks = mouse::Clicks::default();
     let mut layout_cache = ui::Cache::default();
-    // Nothing to fetch without a server, and nothing to show without a
-    // graphics protocol, so in either case the worker never starts.
-    let mut downloads = if backend.is_some() && media.enabled() {
-        Downloads::start(cache, tx.clone(), Input::Image)
-    } else {
-        Downloads::disabled()
-    };
-    let mut uploads = match backend.as_ref() {
-        Some(b) => b.session.uploads(tx.clone(), Input::Sent),
-        None => Uploads::disabled(),
-    };
-    if backend.is_none() {
-        load_fixture_images(&mut media, &app);
-    }
+    // The workers start with the session; until then there is nothing to
+    // fetch, send or page.
+    let mut downloads = Downloads::disabled();
+    let mut uploads = Uploads::disabled();
+    let mut pager = Pager::disabled();
 
     let mut last_open: Option<ConversationId> = None;
     let mut dirty = true;
@@ -651,30 +672,25 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
             dirty = false;
             deadline = None;
 
-            // Reaching the top is the signal to fetch the page before it.
-            // Doing this after the draw means the frame the reader is looking
-            // at went out first.
-            if let Some(b) = backend.as_mut()
-                && app.at_oldest()
-                && b.session.has_older(&app.open)
-            {
+            // Reaching the top is the signal to fetch the page before it, off
+            // the drawing thread. The notice row at the top changes to say so.
+            if let Some(b) = backend.as_mut() {
                 let open = app.open.clone();
-                let anchor = app.messages().first().map(|m| m.id);
-                match b.session.load_older(&open, &mut app.snapshot) {
-                    Ok(0) => {}
-                    Ok(_) => {
-                        // Keep the reader looking at the same message rather
-                        // than at whatever is now at that scroll position.
-                        if let Some(anchor) = anchor
-                            && let Some(index) =
-                                app.messages().iter().position(|m| m.id == anchor)
-                        {
-                            app.message_scroll = index;
-                            app.message_cursor = app.message_cursor.max(index);
-                        }
-                        dirty = true;
-                    }
-                    Err(e) => app.notice = Some(format!("加载更早的消息失败: {e}")),
+                let state = if !b.session.has_older(&open) {
+                    HistoryState::Exhausted
+                } else if pager.is_loading(&open) {
+                    HistoryState::Loading
+                } else if app.at_oldest()
+                    && let Some(oldest) = b.session.oldest_client_id(&open, &app.snapshot)
+                    && pager.request(&open, oldest)
+                {
+                    HistoryState::Loading
+                } else {
+                    HistoryState::MayHaveMore
+                };
+                if app.history != state {
+                    app.history = state;
+                    dirty = true;
                 }
             }
         }
@@ -783,6 +799,63 @@ fn run(mut app: App, live: Option<(Backend, mpsc::Receiver<im_sidecar::Event>)>)
                         deadline = Some(Instant::now() + COALESCE);
                     }
                 }
+            }
+            Input::Connected(Err(e)) => break Err(e.into()),
+            Input::Connected(Ok(live)) => {
+                let Live { backend: b, events, snapshot } = live;
+                {
+                    let tx = tx.clone();
+                    std::thread::Builder::new()
+                        .name("sidecar-events".into())
+                        .spawn(move || {
+                            for ev in events {
+                                if tx.send(Input::Sidecar(ev)).is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = tx.send(Input::Closed("sidecar"));
+                        })?;
+                }
+                // Nothing to show without a graphics protocol, so the
+                // download worker never starts without one.
+                if media.enabled() {
+                    downloads = Downloads::start(cache.clone(), tx.clone(), Input::Image);
+                }
+                uploads = b.session.uploads(tx.clone(), Input::Sent);
+                pager = b.session.pager(tx.clone(), Input::History);
+                backend = Some(b);
+                app = live_app(snapshot);
+                last_open = None;
+                dirty = true;
+            }
+            Input::History(page) => {
+                match &page.reply {
+                    Ok(_) => pager.finished(&page.conversation),
+                    Err(e) => {
+                        pager.failed(&page.conversation);
+                        app.notice = Some(format!("加载更早的消息失败: {e}"));
+                    }
+                }
+                if let Some(b) = backend.as_mut() {
+                    // Older messages go in above; every index shifts. Keep the
+                    // viewport and the selection on the messages they were on
+                    // by remembering which ones those were.
+                    let anchor = app.messages().get(app.message_scroll).map(|m| m.id);
+                    let selected = app.selected_message().map(|m| m.id);
+                    let added = b.session.absorb_page(&page, &mut app.snapshot);
+                    if added > 0 && page.conversation == app.open {
+                        let ids: Vec<_> = app.messages().iter().map(|m| m.id).collect();
+                        let find = |id| ids.iter().position(|m| *m == id);
+                        if let Some(index) = anchor.and_then(find) {
+                            app.message_scroll = index;
+                        }
+                        if let Some(index) = selected.and_then(find) {
+                            app.message_cursor = index;
+                            app.shown_cursor = Some(index);
+                        }
+                    }
+                }
+                dirty = true;
             }
             Input::Encoded(done) => {
                 media.store_encoded(done);
@@ -1479,8 +1552,8 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyActio
             KeyCode::Char('p') if ctrl => app.select(-1),
             KeyCode::Char('J') => app.scroll(1),
             KeyCode::Char('K') => app.scroll(-1),
-            KeyCode::Char('d') if ctrl => app.scroll(5),
-            KeyCode::Char('u') if ctrl => app.scroll(-5),
+            KeyCode::Char('d') if ctrl => app.scroll_half_page(1),
+            KeyCode::Char('u') if ctrl => app.scroll_half_page(-1),
             KeyCode::Char('G') => app.jump_to_latest(),
             KeyCode::Char('g') => app.jump_to_top(),
             KeyCode::Char('z') => app.toggle_collapsed(),

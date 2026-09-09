@@ -5,10 +5,11 @@
 //! `Snapshot`. That seam is what lets the mock and the real backend drive the
 //! same renderer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use im_model::translate::{self, Interner};
 use im_model::{
@@ -51,6 +52,9 @@ pub struct Session {
     /// Conversations whose history has been read back to the beginning, so
     /// scrolling to the top does not keep asking for a page that is not there.
     exhausted: HashSet<ConversationId>,
+    /// Where the next page starts when the last one held nothing worth
+    /// showing: a page of pure notifications adds no message to page from.
+    page_cursor: HashMap<ConversationId, String>,
     /// OpenIM's reserved id for "@everyone", read from the SDK rather than
     /// hardcoded, since it travels in `atUserList` like a real user id.
     at_all_tag: String,
@@ -139,6 +143,7 @@ impl Session {
                 loaded: HashSet::new(),
                 members_for: None,
                 exhausted: HashSet::new(),
+            page_cursor: HashMap::new(),
                 at_all_tag,
             },
             events,
@@ -209,11 +214,13 @@ impl Session {
         &mut self,
         events: &Receiver<Event>,
         snapshot: &mut Snapshot,
-        limit: std::time::Duration,
+        limit: Duration,
     ) -> bool {
-        use std::time::{Duration, Instant};
         let deadline = Instant::now() + limit;
-        let quiet = Duration::from_millis(1500);
+        // Short: this only decides whether the first frame has yesterday's
+        // conversations or today's. A late sync is caught by the
+        // OnSyncServerFinish event and folded in when it lands.
+        let quiet = Duration::from_millis(600);
         let mut connected = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -273,63 +280,73 @@ impl Session {
             }
         }
         self.loaded.insert(conv.clone());
+        if reply.get("isEnd").and_then(Value::as_bool).unwrap_or(false) {
+            self.exhausted.insert(conv.clone());
+        }
         Ok(added > 0)
     }
 
-    /// Fetches the page of history before what is already loaded.
-    ///
-    /// Called when the reader reaches the top rather than at startup: pulling
-    /// a whole conversation up front costs a long pause on open and most of
-    /// it is never looked at.
-    pub fn load_older(
-        &mut self,
-        conv: &ConversationId,
-        snapshot: &mut Snapshot,
-    ) -> Result<usize, im_sidecar::Error> {
-        if self.exhausted.contains(conv) {
-            return Ok(0);
+    /// The client id of the oldest message loaded for `conv`, which is where
+    /// the next page of history starts.
+    pub fn oldest_client_id(&self, conv: &ConversationId, snapshot: &Snapshot) -> Option<String> {
+        if let Some(cursor) = self.page_cursor.get(conv) {
+            return Some(cursor.clone());
         }
-        let Some(oldest) = snapshot
+        snapshot
             .messages_in(conv)
             .first()
             .and_then(|m| self.interner.client_msg_id(m.id))
             .map(str::to_owned)
-        else {
-            return Ok(0);
+    }
+
+    /// A worker that fetches history pages without blocking the interface.
+    /// The SDK may have to go to the server for a page, and a stall right when
+    /// somebody reaches the top of what they have is the worst place for one.
+    pub fn pager<T, F>(&self, out: Sender<T>, wake: F) -> Pager
+    where
+        T: Send + 'static,
+        F: Fn(Page) -> T + Send + 'static,
+    {
+        Pager::start(Arc::clone(&self.sidecar), out, wake)
+    }
+
+    /// Folds a fetched page into the snapshot. Returns how many were new.
+    pub fn absorb_page(&mut self, page: &Page, snapshot: &mut Snapshot) -> usize {
+        let Ok(reply) = &page.reply else {
+            return 0;
         };
-        let reply = self.sidecar.call(
-            "history",
-            json!({
-                "conversationID": conv.0,
-                "startClientMsgID": oldest,
-                "count": PAGE,
-            }),
-        )?;
+        let conv = &page.conversation;
+        let list = reply.get("messageList").and_then(Value::as_array);
         let mut added = 0;
-        for raw in reply
-            .get("messageList")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        for raw in list.into_iter().flatten() {
             if let Some(m) = translate::message(raw, &self.me, &mut self.interner) {
                 snapshot.upsert_message(m);
                 added += 1;
             }
         }
-        // The SDK says so itself; falling back on "fewer than asked for"
-        // would stop early whenever a page happened to be all notifications.
-        let end = reply
-            .get("isEnd")
-            .and_then(Value::as_bool)
-            .unwrap_or(added == 0);
+        // The SDK says so itself; "fewer than asked for" would stop early
+        // whenever a page happened to be all notifications.
+        let end = reply.get("isEnd").and_then(Value::as_bool).unwrap_or(false);
         if end {
             self.exhausted.insert(conv.clone());
+            self.page_cursor.remove(conv);
+        } else if added > 0 {
+            self.page_cursor.remove(conv);
+        } else {
+            // Nothing to show but not the end either: page on from the oldest
+            // of what came back, or the same request would repeat forever.
+            match list.and_then(|raw| oldest_raw_client_id(raw)) {
+                Some(id) => {
+                    self.page_cursor.insert(conv.clone(), id);
+                }
+                None => {
+                    self.exhausted.insert(conv.clone());
+                }
+            }
         }
-        Ok(added)
+        added
     }
 
-    /// Whether there is any point asking for more of this conversation.
     pub fn has_older(&self, conv: &ConversationId) -> bool {
         !self.exhausted.contains(conv)
     }
@@ -719,6 +736,106 @@ fn upload(
         "send",
         json!({ "message": created, "recv_id": recv_id, "group_id": group_id }),
     )
+}
+
+/// The client id of the earliest message in a raw page, by sequence number.
+fn oldest_raw_client_id(list: &[Value]) -> Option<String> {
+    list.iter()
+        .min_by_key(|raw| {
+            (
+                raw.get("seq").and_then(Value::as_i64).unwrap_or(i64::MAX),
+                raw.get("sendTime").and_then(Value::as_i64).unwrap_or(i64::MAX),
+            )
+        })
+        .and_then(|raw| raw.get("clientMsgID").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+/// One fetched page of history, raw, for the main thread to translate.
+pub struct Page {
+    pub conversation: ConversationId,
+    pub reply: Result<Value, im_sidecar::Error>,
+}
+
+/// Fetches history pages on its own thread.
+pub struct Pager {
+    jobs: Option<Sender<(ConversationId, String)>>,
+    loading: HashSet<ConversationId>,
+    /// When a page last failed, so a broken connection is retried at a
+    /// walking pace rather than on every frame.
+    failed: HashMap<ConversationId, Instant>,
+}
+
+/// How long after a failed page the next attempt waits.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
+
+impl Pager {
+    fn start<T, F>(sidecar: Arc<Sidecar>, out: Sender<T>, wake: F) -> Self
+    where
+        T: Send + 'static,
+        F: Fn(Page) -> T + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel::<(ConversationId, String)>();
+        let spawned = std::thread::Builder::new()
+            .name("history-pager".into())
+            .spawn(move || {
+                for (conversation, oldest) in rx {
+                    let reply = sidecar.call(
+                        "history",
+                        json!({
+                            "conversationID": conversation.0,
+                            "startClientMsgID": oldest,
+                            "count": PAGE,
+                        }),
+                    );
+                    if out.send(wake(Page { conversation, reply })).is_err() {
+                        break;
+                    }
+                }
+            });
+        Self {
+            jobs: spawned.is_ok().then_some(tx),
+            loading: HashSet::new(),
+            failed: HashMap::new(),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self { jobs: None, loading: HashSet::new(), failed: HashMap::new() }
+    }
+
+    /// Asks for the page before `oldest`, unless one is already on its way or
+    /// the last one failed a moment ago.
+    pub fn request(&mut self, conv: &ConversationId, oldest: String) -> bool {
+        if self.loading.contains(conv) {
+            return false;
+        }
+        if self.failed.get(conv).is_some_and(|at| at.elapsed() < RETRY_AFTER) {
+            return false;
+        }
+        let Some(jobs) = self.jobs.as_ref() else {
+            return false;
+        };
+        if jobs.send((conv.clone(), oldest)).is_err() {
+            return false;
+        }
+        self.loading.insert(conv.clone());
+        true
+    }
+
+    pub fn finished(&mut self, conv: &ConversationId) {
+        self.loading.remove(conv);
+        self.failed.remove(conv);
+    }
+
+    pub fn failed(&mut self, conv: &ConversationId) {
+        self.loading.remove(conv);
+        self.failed.insert(conv.clone(), Instant::now());
+    }
+
+    pub fn is_loading(&self, conv: &ConversationId) -> bool {
+        self.loading.contains(conv)
+    }
 }
 
 /// A single worker that sends queued pictures in order.

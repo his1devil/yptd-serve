@@ -16,6 +16,8 @@ use std::time::Duration;
 /// memory.
 const MAX_BYTES: u64 = 24 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// Concurrent fetch-and-decode workers.
+const WORKERS: usize = 3;
 
 /// What the worker sends back: the cache key, and either a picture ready to
 /// hand to the terminal along with its original size, or why there is none.
@@ -38,24 +40,41 @@ impl Downloads {
     pub fn start<T, F>(cache: std::path::PathBuf, results: Sender<T>, wake: F) -> Self
     where
         T: Send + 'static,
-        F: Fn(Fetched) -> T + Send + 'static,
+        F: Fn(Fetched) -> T + Send + Sync + 'static,
     {
         let _ = std::fs::create_dir_all(&cache);
         let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
-        let worker_cache = cache;
-        let spawned = std::thread::Builder::new()
-            .name("image-downloads".into())
-            .spawn(move || {
-                for (key, url) in rx {
-                    let outcome = fetch(&worker_cache, &url)
+        // A few workers, not one: fetching waits on the network while decoding
+        // burns a core, and a conversation opening with eight photos should
+        // not show them one every third of a second.
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let wake = std::sync::Arc::new(wake);
+        let mut started = 0;
+        for n in 0..WORKERS {
+            let rx = std::sync::Arc::clone(&rx);
+            let results = results.clone();
+            let wake = std::sync::Arc::clone(&wake);
+            let cache = cache.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("image-downloads-{n}"))
+                .spawn(move || loop {
+                    let job = match rx.lock() {
+                        Ok(guard) => guard.recv(),
+                        Err(_) => break,
+                    };
+                    let Ok((key, url)) = job else { break };
+                    let outcome = fetch(&cache, &url)
                         .and_then(|bytes| crate::media::decode_for_display(&bytes));
                     if results.send(wake((key, outcome))).is_err() {
                         break;
                     }
-                }
-            });
+                });
+            if spawned.is_ok() {
+                started += 1;
+            }
+        }
         Self {
-            jobs: spawned.is_ok().then_some(tx),
+            jobs: (started > 0).then_some(tx),
             requested: HashSet::new(),
         }
     }
