@@ -23,10 +23,23 @@ server/           Go 服务端 yptd-server：邀请码、设备凭据、换 Open
 OpenIM 的 WebSocket 帧用 Go 的 `encoding/gob` 编码，Rust 没有实现，
 所以 SDK 逻辑留在 Go 里，TUI 通过边车拿数据。边车与 `yptd` 是两个二进制，
 `yptd` 启动时自动拉起并在退出时收掉，用户不需要知道它存在。
+**发布版把边车嵌在 `yptd` 里**，首次运行解到 `~/.yptd/bin/`，所以下载到的
+是单个文件；开发树里不嵌，在同目录或 `PATH` 上找。
 
 ---
 
 ## 安装与登录
+
+拿到邀请码之后，一条命令：
+
+```sh
+curl -fsSL https://im.zhanghuanyang.com/dl/install.sh | sh
+```
+
+装的是一个可执行文件（macOS，arm64 / x86_64 自动选），有 Developer ID 签名并已公证。
+用 `curl` 下载不带 quarantine 属性，不会有"无法验证开发者"的拦截。
+
+### 从源码装
 
 需要 Rust 1.90+、Go 1.24+ 和 C 编译器（边车里的 sqlite 走 CGO）。
 
@@ -57,6 +70,42 @@ yptd                    # 以后每次就这一条
 
 不想装到 PATH 的话，`make` 之后 `./target/debug/yptd` 也行——边车放在同目录即可，
 也可用 `$YPTD_SIDECAR` 指定路径。所有文件都在 `~/.yptd/`（或 `$YPTD_HOME`）。
+
+### 终端选哪个
+
+图片显示走终端的图形协议，差别很大：
+
+| 终端 | 协议 | 效果 |
+| --- | --- | --- |
+| Ghostty / kitty / WezTerm | Kitty | 最好。图片数据只传一次，之后重绘只发摆放指令 |
+| iTerm2 | iTerm2 inline | 清晰，但每次重绘都要重发整张 base64 PNG，滚动带图消息偏沉 |
+| 系统"终端" / Alacritty | 无 | 退化成半块字符，图片是马赛克 |
+
+状态栏右上角写着当前协商到的协议（`kitty 14×30`、`iterm2 …`、`halfblocks 10×20`）。
+
+---
+
+## 打包分发
+
+```sh
+make dist               # 两个架构各一个 tar.gz，边车签名后嵌入，再签 yptd
+make notarize           # 送苹果公证
+```
+
+`make dist` 从钥匙串里取第一个 Developer ID Application 证书，也可以用
+`YPTD_SIGN_ID` 指定。公证要先存一次凭据：
+
+```sh
+xcrun notarytool store-credentials yptd \
+    --apple-id <你的 Apple ID> --team-id <团队 ID> --password <App 专用密码>
+```
+
+命令行二进制**没法 staple**（`stapler` 只认 .app / .dmg / .pkg），所以公证票据
+留在苹果服务器上，Gatekeeper 首次运行时联网查一次。聊天客户端本来就要联网，够用；
+要做到离线也零警告，得补一张 Developer ID Installer 证书、打成 `.pkg` 再 staple。
+
+打好之后把 `dist/` 里的 `*.tar.gz`、`SHA256SUMS`、`install.sh` 传到服务器的
+`/dl/` 下即可，`install.sh` 认 `uname -m` 自己挑包，下载后校验 sha256。
 
 ### 不进界面的自检
 

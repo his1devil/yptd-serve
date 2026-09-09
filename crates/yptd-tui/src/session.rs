@@ -90,7 +90,7 @@ impl Session {
         im_token: &str,
     ) -> Result<(Self, Receiver<Event>), Box<dyn std::error::Error>> {
         let (sidecar, events) = Sidecar::spawn(&im_sidecar::Config {
-            binary: std::env::var_os("YPTD_SIDECAR").map(Into::into),
+            binary: crate::embedded::sidecar_path(paths),
             socket: paths.socket(),
             data_dir: paths.data_dir(),
         })?;

@@ -13,6 +13,7 @@ mod auth;
 mod browser;
 mod config;
 mod downloads;
+mod embedded;
 mod layout;
 mod media;
 mod mouse;
@@ -164,6 +165,14 @@ const NOT_LOGGED_IN: &str = "还没登录。先运行 yptd login，或用 yptd -
 /// setup can be diagnosed over ssh or in a script. With a text argument it
 /// also sends one message to the most recent conversation.
 fn cmd_doctor(text: Option<&str>) -> Fallible<()> {
+    println!(
+        "边车 {}",
+        if embedded::is_embedded() {
+            "内置，首次运行解到 ~/.yptd/bin"
+        } else {
+            "外置，在同目录或 PATH 上找"
+        }
+    );
     let Live { mut backend, events, mut snapshot } = connect()?;
     let session = &mut backend.session;
     println!("会话 {} 个", snapshot.conversations.len());
