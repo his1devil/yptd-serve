@@ -37,12 +37,13 @@ const usage = `yptd-server — yptd 服务端与管理工具
   yptd-server user disable <userID>        停用账号
   yptd-server user enable  <userID>        恢复账号
   yptd-server user revoke  <userID>        吊销该用户全部设备凭据
+  yptd-server user rm      <userID>        删除账号：吊销凭据并从花名册移除
   yptd-server check                        自检：Mongo 与 OpenIM 连通性
 
   yptd-server bot setup                    创建 bot 账号（不占用邀请码）
-  yptd-server bot allow  <userID>          允许这个人使唤 bot
-  yptd-server bot deny   <userID>          取消
-  yptd-server bot list                     谁被允许了
+  yptd-server bot block   <userID>         停用某人对 bot 的使用
+  yptd-server bot unblock <userID>         恢复
+  yptd-server bot list                     谁被停用了
   yptd-server bot check                    自检：opencode 是否可用
 
 配置从环境变量读取：
@@ -243,7 +244,7 @@ func cmdInvite(args []string) error {
 
 func cmdUser(args []string) error {
 	if len(args) == 0 {
-		return errors.New("用法: yptd-server user list|disable|enable|revoke")
+		return errors.New("用法: yptd-server user list|disable|enable|revoke|rm")
 	}
 	ctx := context.Background()
 	_, st, _, err := open(ctx)
@@ -309,6 +310,27 @@ func cmdUser(args []string) error {
 		}
 		fmt.Printf("已吊销 %s 的 %d 个设备凭据\n", args[1], n)
 		return nil
+
+	case "rm":
+		if len(args) < 2 {
+			return errors.New("用法: yptd-server user rm <userID>")
+		}
+		// 先断掉登录，再从花名册拿掉：反过来的话，中间那一刻这个人既看不见
+		// 又还能登录。
+		if _, err := st.RevokeUserCredentials(ctx, args[1]); err != nil {
+			return err
+		}
+		removed, err := st.DeleteUser(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		if !removed {
+			fmt.Printf("没有 %s 这个账号\n", args[1])
+			return nil
+		}
+		fmt.Printf("已删除 %s：凭据吊销，不再出现在花名册里\n", args[1])
+		fmt.Println("OpenIM 侧的账号删不掉（没有这个接口），但客户端读的是花名册，看不到它。")
+		return nil
 	}
 	return fmt.Errorf("未知子命令 %q", args[0])
 }
@@ -344,7 +366,7 @@ func cmdCheck() error {
 
 func cmdBot(args []string) error {
 	if len(args) == 0 {
-		return errors.New("用法: yptd-server bot setup|allow|deny|list|check")
+		return errors.New("用法: yptd-server bot setup|block|unblock|list|check")
 	}
 	ctx := context.Background()
 	cfg, st, im, err := open(ctx)
@@ -359,58 +381,66 @@ func cmdBot(args []string) error {
 		if err != nil {
 			return err
 		}
-		if !exists {
-			if err := im.RegisterUser(ctx, cfg.BotUserID, cfg.BotNickname, ""); err != nil {
+		if exists {
+			// 改过 YPTD_BOT_NICKNAME 的话，OpenIM 那边还留着旧名字，
+			// 群成员列表和私聊标题都会继续显示旧的。
+			if err := im.UpdateUser(ctx, cfg.BotUserID, cfg.BotNickname); err != nil {
 				return err
 			}
+		} else if err := im.RegisterUser(ctx, cfg.BotUserID, cfg.BotNickname, ""); err != nil {
+			return err
 		}
 		// A local row too, so `user list` shows it and nobody wonders where
-		// this account came from.
-		if _, err := st.GetUser(ctx, cfg.BotUserID); err != nil {
+		// this account came from. The roster the clients read is this row,
+		// not OpenIM's copy, so a rename has to land in both.
+		if row, err := st.GetUser(ctx, cfg.BotUserID); err != nil {
 			_ = st.CreateUser(ctx, store.User{
 				UserID:    cfg.BotUserID,
 				Nickname:  cfg.BotNickname,
 				CreatedAt: time.Now(),
 			})
+		} else if row.Nickname != cfg.BotNickname {
+			if err := st.SetUserNickname(ctx, cfg.BotUserID, cfg.BotNickname); err != nil {
+				return err
+			}
 		}
 		fmt.Printf("bot 账号就绪: %s（%s）\n", cfg.BotUserID, cfg.BotNickname)
-		fmt.Println("把它拉进群，然后 @ 它提问。先给自己开权限:")
-		fmt.Printf("  yptd-server bot allow <你的用户名>\n")
+		fmt.Println("把它拉进群，然后 @ 它提问。有账号的人都能用，不用另外开权限。")
 		return nil
 
-	case "allow":
+	case "block":
 		if len(args) < 2 {
-			return errors.New("用法: yptd-server bot allow <userID>")
+			return errors.New("用法: yptd-server bot block <userID>")
 		}
-		if err := st.BotAllow(ctx, args[1]); err != nil {
+		if err := st.BotBlock(ctx, args[1]); err != nil {
 			return err
 		}
-		fmt.Printf("%s 现在可以使唤 bot 了\n", args[1])
+		fmt.Printf("%s 不能再使唤 bot 了\n", args[1])
 		return nil
 
-	case "deny":
+	case "unblock":
 		if len(args) < 2 {
-			return errors.New("用法: yptd-server bot deny <userID>")
+			return errors.New("用法: yptd-server bot unblock <userID>")
 		}
-		removed, err := st.BotDeny(ctx, args[1])
+		removed, err := st.BotUnblock(ctx, args[1])
 		if err != nil {
 			return err
 		}
 		if !removed {
-			fmt.Printf("%s 本来就不在名单里\n", args[1])
+			fmt.Printf("%s 本来就没被停用\n", args[1])
 			return nil
 		}
-		fmt.Printf("已移除 %s\n", args[1])
+		fmt.Printf("已恢复 %s\n", args[1])
 		return nil
 
 	case "list":
-		ids, err := st.BotAllowList(ctx)
+		ids, err := st.BotBlockList(ctx)
 		if err != nil {
 			return err
 		}
 		if len(ids) == 0 {
-			fmt.Println("名单是空的，也就是谁都不能使唤 bot。")
-			fmt.Println("这是故意的默认值：bot 背后是个会执行命令的 agent。")
+			fmt.Println("没有人被停用：有 yptd 账号的人都能使唤 bot。")
+			fmt.Println("注册要邀请码，那一道就是门槛。")
 			return nil
 		}
 		for _, id := range ids {
@@ -434,11 +464,11 @@ func cmdBot(args []string) error {
 			return err
 		}
 		fmt.Printf("bot 账号 %s: %s\n", cfg.BotUserID, map[bool]string{true: "已存在", false: "还没建，跑 bot setup"}[exists])
-		ids, err := st.BotAllowList(ctx)
+		ids, err := st.BotBlockList(ctx)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("白名单 %d 人\n", len(ids))
+		fmt.Printf("停用 %d 人（其余有账号的都能用）\n", len(ids))
 		return nil
 	}
 	return fmt.Errorf("未知子命令 bot %s", args[0])

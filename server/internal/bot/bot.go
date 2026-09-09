@@ -35,7 +35,7 @@ type Sender interface {
 type Sessions interface {
 	BotSession(ctx context.Context, conversationID string) (string, error)
 	SetBotSession(ctx context.Context, conversationID, sessionID string) error
-	BotAllowed(ctx context.Context, userID string) (bool, error)
+	BotBlocked(ctx context.Context, userID string) (bool, error)
 }
 
 // How long to wait for an answer before saying anything, and what to say.
@@ -112,14 +112,17 @@ func (b *Bot) Wants(m Message) bool {
 // Handle answers one message. It blocks, so callers on a webhook thread must
 // run it in a goroutine: OpenIM gives the callback five seconds.
 func (b *Bot) Handle(ctx context.Context, m Message) {
-	allowed, err := b.store.BotAllowed(ctx, m.SenderID)
+	// Anyone with an account may ask: registering already needs an invitation
+	// code, so that is the gate. This list is only the people it was taken
+	// back from.
+	blocked, err := b.store.BotBlocked(ctx, m.SenderID)
 	if err != nil {
-		b.log.Error("bot: whitelist lookup", "err", err)
+		b.log.Error("bot: block list lookup", "err", err)
 		return
 	}
-	if !allowed {
-		b.log.Info("bot: sender not allowed", "user", m.SenderID)
-		b.say(ctx, m, fmt.Sprintf("@%s 你还没有被允许使用这个助手。让管理员执行 yptd-server bot allow %s", m.SenderNickname, m.SenderID), false)
+	if blocked {
+		b.log.Info("bot: sender blocked", "user", m.SenderID)
+		b.say(ctx, m, fmt.Sprintf("@%s 管理员停用了你对这个助手的使用。", m.SenderNickname), false)
 		return
 	}
 

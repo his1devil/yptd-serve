@@ -210,6 +210,32 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	return out, nil
 }
 
+// DeleteUser removes the local row for an account.
+//
+// The roster the client's invite and direct-message pickers read comes from
+// here, so this is what takes a retired test account out of everybody's view.
+// The OpenIM account itself stays: OpenIM has no endpoint for deleting one.
+// SetUserNickname renames an account in the roster.
+func (s *Store) SetUserNickname(ctx context.Context, userID, nickname string) error {
+	res, err := s.db.Collection("users").UpdateOne(ctx,
+		bson.M{"_id": userID}, bson.M{"$set": bson.M{"nickname": nickname}})
+	if err != nil {
+		return fmt.Errorf("store: set nickname: %w", err)
+	}
+	if res.MatchedCount == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteUser(ctx context.Context, userID string) (bool, error) {
+	res, err := s.db.Collection("users").DeleteOne(ctx, bson.M{"_id": userID})
+	if err != nil {
+		return false, fmt.Errorf("store: delete user: %w", err)
+	}
+	return res.DeletedCount > 0, nil
+}
+
 func (s *Store) SetUserDisabled(ctx context.Context, userID string, disabled bool) error {
 	res, err := s.db.Collection("users").UpdateOne(ctx,
 		bson.M{"_id": userID}, bson.M{"$set": bson.M{"disabled": disabled}})
@@ -336,12 +362,13 @@ func (s *Store) SetBotSession(ctx context.Context, conversationID, sessionID str
 	return err
 }
 
-// BotAllowed reports whether this user may make the bot work.
+// BotBlocked reports whether this user has been barred from the bot.
 //
-// An empty list means nobody, not everybody: the bot runs a coding agent on
-// the server, so the default has to fail closed.
-func (s *Store) BotAllowed(ctx context.Context, userID string) (bool, error) {
-	err := s.db.Collection("bot_allow").FindOne(ctx, bson.M{"_id": userID}).Err()
+// Everyone with an account may use it: getting an account already costs an
+// invitation code, so a second list of who is welcome would only be the same
+// gate written twice. This collection holds the exceptions.
+func (s *Store) BotBlocked(ctx context.Context, userID string) (bool, error) {
+	err := s.db.Collection("bot_block").FindOne(ctx, bson.M{"_id": userID}).Err()
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return false, nil
 	}
@@ -351,8 +378,8 @@ func (s *Store) BotAllowed(ctx context.Context, userID string) (bool, error) {
 	return true, nil
 }
 
-func (s *Store) BotAllow(ctx context.Context, userID string) error {
-	_, err := s.db.Collection("bot_allow").UpdateOne(ctx,
+func (s *Store) BotBlock(ctx context.Context, userID string) error {
+	_, err := s.db.Collection("bot_block").UpdateOne(ctx,
 		bson.M{"_id": userID},
 		bson.M{"$set": bson.M{"added_at": time.Now()}},
 		options.Update().SetUpsert(true),
@@ -360,16 +387,16 @@ func (s *Store) BotAllow(ctx context.Context, userID string) error {
 	return err
 }
 
-func (s *Store) BotDeny(ctx context.Context, userID string) (bool, error) {
-	res, err := s.db.Collection("bot_allow").DeleteOne(ctx, bson.M{"_id": userID})
+func (s *Store) BotUnblock(ctx context.Context, userID string) (bool, error) {
+	res, err := s.db.Collection("bot_block").DeleteOne(ctx, bson.M{"_id": userID})
 	if err != nil {
 		return false, err
 	}
 	return res.DeletedCount > 0, nil
 }
 
-func (s *Store) BotAllowList(ctx context.Context) ([]string, error) {
-	cur, err := s.db.Collection("bot_allow").Find(ctx, bson.M{})
+func (s *Store) BotBlockList(ctx context.Context) ([]string, error) {
+	cur, err := s.db.Collection("bot_block").Find(ctx, bson.M{})
 	if err != nil {
 		return nil, err
 	}
