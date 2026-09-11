@@ -31,6 +31,7 @@ type callbackReq struct {
 	ContentType    int32    `json:"contentType"`
 	Content        string   `json:"content"`
 	AtUserList     []string `json:"atUserList"`
+	Ex             string   `json:"ex"`
 }
 
 // handleCallback answers OpenIM's webhook.
@@ -61,6 +62,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		ConversationID: conversationID(req),
 		ContentType:    req.ContentType,
 		Text:           text,
+		Attachments:    bot.ParseAttachments(req.Ex),
 	}
 
 	// One message may call on several agents, and each answers for itself.

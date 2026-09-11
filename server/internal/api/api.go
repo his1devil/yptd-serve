@@ -76,6 +76,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PATCH /v1/me", s.handleMePatch)
 	mux.HandleFunc("GET /v1/invites", s.handleInvites)
 	mux.HandleFunc("POST /v1/invites", s.handleInviteNew)
+	// Unauthenticated: the sign-in form asks before it has an account.
+	mux.HandleFunc("POST /v1/invites/check", s.handleInviteCheck)
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
 	// Agent runs: live stream, record, list, stop.
 	mux.HandleFunc("GET /v1/runs", s.handleRuns)
@@ -197,7 +199,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// Redeem before creating: an invitation consumed by a registration that
 	// then fails is recoverable (issue another code); a code that survives a
 	// successful registration is a second, unearned account.
-	if err := s.store.RedeemInvite(ctx, code, userID); err != nil {
+	inv, err := s.store.RedeemInvite(ctx, code, userID)
+	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			fail(w, http.StatusBadRequest, "unknown_invite", "邀请码不存在")
@@ -255,6 +258,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.issueSession(w, r, userID, nickname, req.DeviceName, req.PlatformID, true)
+	go s.welcomeInviter(inv, userID, nickname)
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {

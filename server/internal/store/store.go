@@ -35,8 +35,11 @@ type Store struct {
 
 // Invite is a one-time registration ticket.
 type Invite struct {
-	Code      string     `bson:"_id"`
-	Note      string     `bson:"note,omitempty"`
+	Code string `bson:"_id"`
+	Note string `bson:"note,omitempty"`
+	// CreatedBy is the account that minted the code; empty for codes made
+	// from the command line. It is who gets told when the guest arrives.
+	CreatedBy string     `bson:"created_by,omitempty"`
 	CreatedAt time.Time  `bson:"created_at"`
 	ExpiresAt time.Time  `bson:"expires_at"`
 	UsedBy    string     `bson:"used_by,omitempty"`
@@ -116,9 +119,9 @@ func (s *Store) Close(ctx context.Context) error { return s.db.Client().Disconne
 
 // ---------------------------------------------------------------- invites ---
 
-func (s *Store) CreateInvite(ctx context.Context, code, note string, ttl time.Duration) (Invite, error) {
+func (s *Store) CreateInvite(ctx context.Context, code, note, createdBy string, ttl time.Duration) (Invite, error) {
 	now := time.Now().UTC()
-	inv := Invite{Code: code, Note: note, CreatedAt: now, ExpiresAt: now.Add(ttl)}
+	inv := Invite{Code: code, Note: note, CreatedBy: createdBy, CreatedAt: now, ExpiresAt: now.Add(ttl)}
 	if _, err := s.db.Collection("invites").InsertOne(ctx, inv); err != nil {
 		return Invite{}, fmt.Errorf("store: create invite: %w", err)
 	}
@@ -145,20 +148,31 @@ func (s *Store) ListInvites(ctx context.Context, includeUsed bool) ([]Invite, er
 // RedeemInvite marks a code used, atomically. Two people pasting the same code
 // at once must not both get in, so the guard is in the update filter rather
 // than a read-then-write.
-func (s *Store) RedeemInvite(ctx context.Context, code, userID string) error {
+// GetInvite reads one code as it stands, used or not.
+func (s *Store) GetInvite(ctx context.Context, code string) (Invite, error) {
 	var inv Invite
 	err := s.db.Collection("invites").FindOne(ctx, bson.M{"_id": code}).Decode(&inv)
 	if errors.Is(err, mongo.ErrNoDocuments) {
-		return ErrNotFound
+		return Invite{}, ErrNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("store: redeem: %w", err)
+		return Invite{}, fmt.Errorf("store: get invite: %w", err)
+	}
+	return inv, nil
+}
+
+// RedeemInvite marks a code as spent by userID and returns it, so the caller
+// knows who minted it.
+func (s *Store) RedeemInvite(ctx context.Context, code, userID string) (Invite, error) {
+	inv, err := s.GetInvite(ctx, code)
+	if err != nil {
+		return Invite{}, err
 	}
 	if inv.Used() {
-		return ErrInviteUsed
+		return Invite{}, ErrInviteUsed
 	}
 	if time.Now().After(inv.ExpiresAt) {
-		return ErrInviteExpired
+		return Invite{}, ErrInviteExpired
 	}
 
 	now := time.Now().UTC()
@@ -166,12 +180,13 @@ func (s *Store) RedeemInvite(ctx context.Context, code, userID string) error {
 		bson.M{"_id": code, "used_by": bson.M{"$exists": false}},
 		bson.M{"$set": bson.M{"used_by": userID, "used_at": now}})
 	if err != nil {
-		return fmt.Errorf("store: redeem: %w", err)
+		return Invite{}, fmt.Errorf("store: redeem: %w", err)
 	}
 	if res.ModifiedCount == 0 {
-		return ErrInviteUsed
+		return Invite{}, ErrInviteUsed
 	}
-	return nil
+	inv.UsedBy, inv.UsedAt = userID, &now
+	return inv, nil
 }
 
 func (s *Store) DeleteInvite(ctx context.Context, code string) error {

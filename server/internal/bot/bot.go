@@ -31,6 +31,48 @@ type Message struct {
 	// addressed to none. One message mentioning two agents becomes two
 	// messages, one per agent.
 	AgentID string
+	// Attachments are the files sent alongside the text, from yptd's `ex`
+	// extension on the message. The model gets their links.
+	Attachments []Attachment
+}
+
+// Attachment is one file a desktop client put in a message next to its text:
+// `ex` = {"yptd":"rich","a":[{"k":"i"|"f","u":url,"n":name,"s":bytes,...}]}.
+type Attachment struct {
+	Kind string // "image" or "file"
+	URL  string
+	Name string
+}
+
+// ParseAttachments reads the attachment list out of a message's `ex`; nil
+// when there is none or it is some other client's extension.
+func ParseAttachments(ex string) []Attachment {
+	if ex == "" {
+		return nil
+	}
+	var p struct {
+		Yptd string `json:"yptd"`
+		A    []struct {
+			K string `json:"k"`
+			U string `json:"u"`
+			N string `json:"n"`
+		} `json:"a"`
+	}
+	if json.Unmarshal([]byte(ex), &p) != nil || p.Yptd != "rich" {
+		return nil
+	}
+	out := make([]Attachment, 0, len(p.A))
+	for _, a := range p.A {
+		if a.U == "" {
+			continue
+		}
+		kind := "file"
+		if a.K == "i" {
+			kind = "image"
+		}
+		out = append(out, Attachment{Kind: kind, URL: a.U, Name: a.N})
+	}
+	return out
 }
 
 // Sender is the slice of OpenIM this package needs. An interface so the
@@ -270,6 +312,18 @@ func (b *Bot) answer(ctx context.Context, m Message) (string, *run.Run) {
 		where = "问你"
 	}
 	prompt := fmt.Sprintf("%s %s：%s", m.SenderNickname, where, m.Text)
+	if len(m.Attachments) > 0 {
+		// Links rather than bytes: the model can fetch what it needs, and a
+		// screenshot pasted next to a question should not be invisible to it.
+		prompt += "\n\n对方随消息附了文件（可以用工具读取链接）："
+		for _, a := range m.Attachments {
+			label := "文件"
+			if a.Kind == "image" {
+				label = "图片"
+			}
+			prompt += fmt.Sprintf("\n- %s %s：%s", label, a.Name, a.URL)
+		}
+	}
 
 	r := b.runs.Start(run.Summary{
 		AgentID: who.UserID, ConversationID: m.ConversationID, RequesterID: m.SenderID, Prompt: m.Text,

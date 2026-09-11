@@ -202,7 +202,7 @@ func cmdInvite(args []string) error {
 			if err != nil {
 				return err
 			}
-			inv, err := st.CreateInvite(ctx, code, note, cfg.InviteTTL)
+			inv, err := st.CreateInvite(ctx, code, note, "", cfg.InviteTTL)
 			if err != nil {
 				return err
 			}

@@ -1,12 +1,16 @@
 package api
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/his1devil/yptd/server/internal/invite"
+	"github.com/his1devil/yptd/server/internal/store"
 )
 
 // What a desktop client needs beyond chat: renaming yourself, inviting a
@@ -78,7 +82,7 @@ func (s *Server) handleInviteNew(w http.ResponseWriter, r *http.Request) {
 			s.fail500(w, "new invite", err)
 			return
 		}
-		inv, err := s.store.CreateInvite(r.Context(), code, note, s.cfg.InviteTTL)
+		inv, err := s.store.CreateInvite(r.Context(), code, note, cred.UserID, s.cfg.InviteTTL)
 		if err != nil {
 			s.fail500(w, "create invite", err)
 			return
@@ -115,6 +119,66 @@ func (s *Server) handleInvites(w http.ResponseWriter, r *http.Request) {
 		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"invites": out})
+}
+
+// handleInviteCheck lets the sign-in form tell a mistyped code from a spent or
+// stale one before it asks for a name. Unauthenticated by necessity; it
+// answers nothing that register would not answer to the same caller. The code
+// travels in the body, as it does for register, so it never lands in an
+// access log.
+func (s *Server) handleInviteCheck(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Code string `json:"code"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	code := invite.Normalize(req.Code)
+	if code == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "reason": "invalid"})
+		return
+	}
+	inv, err := s.store.GetInvite(r.Context(), code)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "reason": "unknown"})
+		return
+	case err != nil:
+		s.fail500(w, "get invite", err)
+		return
+	case inv.Used():
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "reason": "used"})
+		return
+	case time.Now().After(inv.ExpiresAt):
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "reason": "expired"})
+		return
+	}
+	out := map[string]any{"valid": true, "expires_at": inv.ExpiresAt.UnixMilli()}
+	// The inviter's name makes the welcome personal; whoever holds the code
+	// is the person it was handed to, so telling them who handed it over
+	// gives nothing away.
+	if inv.CreatedBy != "" {
+		if u, err := s.store.GetUser(r.Context(), inv.CreatedBy); err == nil {
+			out["invited_by"] = u.Nickname
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// welcomeInviter tells whoever minted the code that their guest has arrived,
+// speaking as the first agent. A newcomer's sidebar is empty until someone
+// pulls them into a channel, and the inviter is the one who knows which.
+func (s *Server) welcomeInviter(inv store.Invite, userID, nickname string) {
+	if inv.CreatedBy == "" || inv.CreatedBy == userID || len(s.cfg.Agents) == 0 {
+		return
+	}
+	a := s.cfg.Agents[0]
+	text := fmt.Sprintf("%s（@%s）用你的邀请码进来了。去打个招呼，或者把 TA 拉进频道吧。", nickname, userID)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := s.openim.SendText(ctx, a.UserID, a.Nickname, inv.CreatedBy, "", text, ""); err != nil {
+		s.log.Warn("welcome inviter", "err", err, "inviter", inv.CreatedBy, "user", userID)
+	}
 }
 
 // handleAgents is the agent roster with what each one is for: identity from
