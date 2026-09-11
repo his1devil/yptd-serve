@@ -265,6 +265,36 @@ func (c *Client) SendText(ctx context.Context, sender, nickname, recvID, groupID
 	return out.ClientMsgID, nil
 }
 
+// SendCustom posts a custom message as `sender`: contentType 110 with yptd's
+// own JSON inside. Reactions travel this way.
+func (c *Client) SendCustom(ctx context.Context, sender, nickname, recvID, groupID, data, description string) (string, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	body := map[string]any{
+		"sendID":           sender,
+		"senderNickname":   nickname,
+		"senderPlatformID": 7,
+		"contentType":      110,
+		"content":          map[string]string{"data": data, "description": description, "extension": ""},
+	}
+	if groupID != "" {
+		body["groupID"] = groupID
+		body["sessionType"] = 3
+	} else {
+		body["recvID"] = recvID
+		body["sessionType"] = 1
+	}
+	var out struct {
+		ClientMsgID string `json:"clientMsgID"`
+	}
+	if err := c.post(ctx, "/msg/send_msg", body, admin, &out); err != nil {
+		return "", err
+	}
+	return out.ClientMsgID, nil
+}
+
 // NewestSeq is the highest sequence number in a conversation, as seen by
 // `userID`. Revoking needs a seq and sending does not return one, so this is
 // how a just-sent message is found again.

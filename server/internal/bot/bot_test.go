@@ -147,3 +147,13 @@ func TestNicknamesFollowTheRoster(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestReactionPayloadMatchesTheClientProtocol(t *testing.T) {
+	// 客户端的 parseReaction 认 {yptd:"reaction", target, emoji}，少一个字段就静默丢弃。
+	got := reactionData("c1", "👌")
+	for _, want := range []string{`"yptd":"reaction"`, `"target":"c1"`, `"emoji":"👌"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("payload %s lacks %s", got, want)
+		}
+	}
+}

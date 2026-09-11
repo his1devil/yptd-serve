@@ -23,6 +23,7 @@ const (
 // callback carries `atUserList` already parsed, which is what decides whether
 // the bot was addressed -- no text matching needed.
 type callbackReq struct {
+	ClientMsgID    string   `json:"clientMsgID"`
 	SendID         string   `json:"sendID"`
 	RecvID         string   `json:"recvID"`
 	GroupID        string   `json:"groupID"`
@@ -53,6 +54,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	text, inContent := bot.ParseContent(req.ContentType, req.Content, s.bot.Nicknames())
 	addressed := addressedAgents(req, inContent, s.bot.Agents(), command)
 	base := bot.Message{
+		ClientMsgID:    req.ClientMsgID,
 		SenderID:       req.SendID,
 		SenderNickname: req.SenderNickname,
 		GroupID:        req.GroupID,

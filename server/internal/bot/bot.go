@@ -16,6 +16,8 @@ import (
 
 // Message is one incoming message, already stripped of OpenIM's shapes.
 type Message struct {
+	// ClientMsgID is what a reaction to this message is addressed by.
+	ClientMsgID    string
 	SenderID       string
 	SenderNickname string
 	GroupID        string
@@ -36,6 +38,8 @@ type Message struct {
 // message's clientMsgID.
 type Sender interface {
 	SendText(ctx context.Context, sender, nickname, recvID, groupID, text, ex string) (string, error)
+	// SendCustom posts a custom message -- in yptd's protocol, a reaction.
+	SendCustom(ctx context.Context, sender, nickname, recvID, groupID, data, description string) (string, error)
 }
 
 // Sessions remembers which opencode conversation belongs to which chat.
@@ -49,10 +53,23 @@ type Sessions interface {
 	BotBlocked(ctx context.Context, userID string) (bool, error)
 }
 
-// The placeholder goes out the moment a run starts. It carries the run id, so
-// a client that knows about runs replaces it with the live answer as it
-// streams; one that does not shows the text and hides it when the answer lands.
+// In a direct chat the placeholder goes out the moment a run starts. It
+// carries the run id, so a client that knows about runs replaces it with the
+// live answer as it streams; one that does not shows the text and hides it
+// when the answer lands.
 const placeholderText = "⏳ 正在处理…"
+
+// In a group the agent reacts to the question instead. A placeholder there
+// makes the stream jump around while everyone else keeps talking; a reaction
+// costs the rendering nothing and still says "seen, on it". The full answer,
+// with the thinking and tool calls folded up behind it, lands once.
+const ackEmoji = "👌"
+
+// reactionData is the payload of a reaction in yptd's client protocol.
+func reactionData(target, emoji string) string {
+	raw, _ := json.Marshal(map[string]string{"yptd": "reaction", "target": target, "emoji": emoji})
+	return string(raw)
+}
 
 // ErrNoRun is Cancel's answer for an id this process does not know.
 var ErrNoRun = errors.New("bot: no such run")
@@ -259,9 +276,15 @@ func (b *Bot) answer(ctx context.Context, m Message) (string, *run.Run) {
 	}, "")
 	b.remember(r, newStream(prompt))
 
-	// The placeholder goes out first and at once: it is how a client learns
-	// the run id, and every second of silence before it looks like a broken bot.
-	if id, err := b.say(ctx, m, placeholderText, pendingEx(r.ID())); err == nil {
+	if m.GroupID != "" {
+		if m.ClientMsgID != "" {
+			if _, err := b.im.SendCustom(ctx, who.UserID, who.Nickname, "", m.GroupID, reactionData(m.ClientMsgID, ackEmoji), "reaction"); err != nil {
+				b.log.Warn("bot: ack reaction", "err", err, "conversation", m.ConversationID)
+			}
+		}
+	} else if id, err := b.say(ctx, m, placeholderText, pendingEx(r.ID())); err == nil {
+		// The placeholder goes out first and at once: it is how a client learns
+		// the run id, and every second of silence before it looks like a broken bot.
 		r.SetPlaceholder(id)
 	}
 
