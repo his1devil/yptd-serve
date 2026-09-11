@@ -72,6 +72,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/login/password", s.handleLoginPassword)
 	mux.HandleFunc("GET /v1/me", s.handleMe)
 	mux.HandleFunc("GET /v1/users", s.handleUsers)
+	// Account and workspace: rename yourself, mint invitations, see who the agents are.
+	mux.HandleFunc("PATCH /v1/me", s.handleMePatch)
+	mux.HandleFunc("GET /v1/invites", s.handleInvites)
+	mux.HandleFunc("POST /v1/invites", s.handleInviteNew)
+	mux.HandleFunc("GET /v1/agents", s.handleAgents)
 	// Agent runs: live stream, record, list, stop.
 	mux.HandleFunc("GET /v1/runs", s.handleRuns)
 	mux.HandleFunc("GET /v1/runs/{id}", s.handleRun)

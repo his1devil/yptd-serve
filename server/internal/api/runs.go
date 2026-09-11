@@ -144,13 +144,17 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.authed(w, r); !ok {
 		return
 	}
+	// Without a conversation: the newest runs anywhere, which is what the
+	// inbox's 「Agent 结果」 lists.
 	conversation := r.URL.Query().Get("conversation")
-	if conversation == "" {
-		fail(w, http.StatusBadRequest, "missing_conversation", "要带 conversation 参数")
-		return
-	}
 	limit, _ := strconv.ParseInt(r.URL.Query().Get("limit"), 10, 64)
-	stored, err := s.store.ListRuns(r.Context(), conversation, limit)
+	var stored []run.Summary
+	var err error
+	if conversation == "" {
+		stored, err = s.store.ListRecentRuns(r.Context(), limit)
+	} else {
+		stored, err = s.store.ListRuns(r.Context(), conversation, limit)
+	}
 	if err != nil {
 		s.fail500(w, "list runs", err)
 		return
@@ -160,7 +164,7 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	if s.bot != nil {
 		for _, live := range s.bot.Runs().Active() {
 			snap := live.Snapshot()
-			if snap.ConversationID == conversation {
+			if conversation == "" || snap.ConversationID == conversation {
 				out = append(out, snap)
 				seen[snap.ID] = true
 			}

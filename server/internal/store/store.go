@@ -104,6 +104,11 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("store: runs index: %w", err)
 	}
+	if _, err := s.db.Collection("runs").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "started_at", Value: -1}},
+	}); err != nil {
+		return fmt.Errorf("store: runs recent index: %w", err)
+	}
 	return nil
 }
 
@@ -465,6 +470,23 @@ func (s *Store) GetRun(ctx context.Context, id string) (run.Summary, error) {
 		return run.Summary{}, fmt.Errorf("store: get run: %w", err)
 	}
 	return sum, nil
+}
+
+// ListRecentRuns is the newest finished runs anywhere, for the inbox.
+func (s *Store) ListRecentRuns(ctx context.Context, limit int64) ([]run.Summary, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	cur, err := s.db.Collection("runs").Find(ctx, bson.M{},
+		options.Find().SetSort(bson.D{{Key: "started_at", Value: -1}}).SetLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("store: recent runs: %w", err)
+	}
+	out := []run.Summary{}
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, fmt.Errorf("store: recent runs: %w", err)
+	}
+	return out, nil
 }
 
 // ListRuns is a conversation's finished runs, newest first.

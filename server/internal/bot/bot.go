@@ -90,6 +90,11 @@ type Bot struct {
 	// streams is the per-run reducer state for opencode's events.
 	smu     sync.Mutex
 	streams map[string]*stream
+	// descriptions caches opencode's agent summaries; they change only when
+	// somebody edits an agent file on the server.
+	dmu     sync.Mutex
+	descs   map[string]string
+	descsAt time.Time
 }
 
 func New(cfg Config, im Sender, store Sessions, agent *Opencode, runs *run.Registry, log *slog.Logger) *Bot {
@@ -126,6 +131,34 @@ func New(cfg Config, im Sender, store Sessions, agent *Opencode, runs *run.Regis
 
 // Runs is the registry, for the HTTP layer to serve from.
 func (b *Bot) Runs() *run.Registry { return b.runs }
+
+// Describe returns each roster agent's one-line persona, keyed by user id,
+// as opencode describes the agent it routes to. Cached for a minute.
+func (b *Bot) Describe(ctx context.Context) map[string]string {
+	b.dmu.Lock()
+	defer b.dmu.Unlock()
+	if b.descs != nil && time.Since(b.descsAt) < time.Minute {
+		return b.descs
+	}
+	out := map[string]string{}
+	if b.agent != nil {
+		if infos, err := b.agent.Agents(ctx); err == nil {
+			byName := make(map[string]string, len(infos))
+			for _, a := range infos {
+				byName[a.Name] = a.Description
+			}
+			for _, a := range b.cfg.Agents {
+				if d, ok := byName[a.Opencode]; ok {
+					out[a.UserID] = d
+				}
+			}
+		} else {
+			b.log.Warn("bot: describe agents", "err", err)
+		}
+	}
+	b.descs, b.descsAt = out, time.Now()
+	return out
+}
 
 // Agents is the roster, for the callback's mention matching and the CLI.
 func (b *Bot) Agents() []config.Agent { return b.cfg.Agents }

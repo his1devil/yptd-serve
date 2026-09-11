@@ -112,6 +112,23 @@ func (o *Opencode) Health(ctx context.Context) (string, error) {
 	return out.Version, nil
 }
 
+// AgentInfo is what opencode says about one of its agents.
+type AgentInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Mode        string `json:"mode"`
+}
+
+// Agents lists opencode's agents with their one-line descriptions -- the
+// persona summary a client shows on an agent's page.
+func (o *Opencode) Agents(ctx context.Context) ([]AgentInfo, error) {
+	var out []AgentInfo
+	if err := o.do(ctx, http.MethodGet, "/agent", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentNames lists the agents opencode knows about.
 //
 // For the self-check: a roster naming an agent opencode has never heard of
