@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -55,13 +56,26 @@ const usage = `yptd-server — yptd 服务端与管理工具
   YPTD_INVITE_TTL     默认 24h
 
 bot 相关（不设 YPTD_BOT_OPENCODE_URL 就整个关闭）：
-  YPTD_BOT_USER            默认 agentbot
-  YPTD_BOT_NICKNAME        默认 助手
   YPTD_BOT_OPENCODE_URL    opencode serve 的地址
   YPTD_BOT_OPENCODE_USER   默认 yptd
   YPTD_BOT_OPENCODE_PASSWORD
-  YPTD_BOT_MODEL           默认 zhipuai/glm-5.3
+  YPTD_BOT_MODEL           默认模型，agent 没写 model 时用它
   YPTD_BOT_TIMEOUT         默认 5m
+  YPTD_BOT_AGENTS          agent 名册文件；不设就只有一个 agent，
+                           身份取 YPTD_BOT_USER（默认 agentbot）和
+                           YPTD_BOT_NICKNAME（默认 HALX）
+
+名册长这样，每个 agent 一个 OpenIM 账号，在群里各自 @：
+  [
+    {"user_id":"agentbot",  "nickname":"HALX", "opencode":"halx",
+     "model":"zhipuai/glm-5.3", "tag":"AGENT"},
+    {"user_id":"agentquant","nickname":"小盘", "opencode":"quant",
+     "model":"zhipuai/glm-4.6", "tag":"行情"}
+  ]
+  opencode  是 opencode 那边的 agent 名（人设和工具范围写在它的定义里），
+            留空就用 opencode 的默认 agent
+  model     不写就继承 YPTD_BOT_MODEL
+  改完跑 bot setup 建账号，再跑 bot check 确认 opencode 认得这些名字
 `
 
 func main() {
@@ -377,35 +391,41 @@ func cmdBot(args []string) error {
 
 	switch args[0] {
 	case "setup":
-		exists, err := im.UserExists(ctx, cfg.BotUserID)
-		if err != nil {
-			return err
-		}
-		if exists {
-			// 改过 YPTD_BOT_NICKNAME 的话，OpenIM 那边还留着旧名字，
-			// 群成员列表和私聊标题都会继续显示旧的。
-			if err := im.UpdateUser(ctx, cfg.BotUserID, cfg.BotNickname); err != nil {
+		for _, a := range cfg.Agents {
+			exists, err := im.UserExists(ctx, a.UserID)
+			if err != nil {
 				return err
 			}
-		} else if err := im.RegisterUser(ctx, cfg.BotUserID, cfg.BotNickname, ""); err != nil {
-			return err
-		}
-		// A local row too, so `user list` shows it and nobody wonders where
-		// this account came from. The roster the clients read is this row,
-		// not OpenIM's copy, so a rename has to land in both.
-		if row, err := st.GetUser(ctx, cfg.BotUserID); err != nil {
-			_ = st.CreateUser(ctx, store.User{
-				UserID:    cfg.BotUserID,
-				Nickname:  cfg.BotNickname,
-				CreatedAt: time.Now(),
-			})
-		} else if row.Nickname != cfg.BotNickname {
-			if err := st.SetUserNickname(ctx, cfg.BotUserID, cfg.BotNickname); err != nil {
+			if exists {
+				// 改过昵称的话，OpenIM 那边还留着旧名字，群成员列表和
+				// 私聊标题都会继续显示旧的。
+				if err := im.UpdateUser(ctx, a.UserID, a.Nickname); err != nil {
+					return err
+				}
+			} else if err := im.RegisterUser(ctx, a.UserID, a.Nickname, ""); err != nil {
 				return err
 			}
+			// A local row too, so `user list` shows it and nobody wonders
+			// where this account came from. The roster the clients read is
+			// this row, not OpenIM's copy, so a rename has to land in both.
+			if row, err := st.GetUser(ctx, a.UserID); err != nil {
+				_ = st.CreateUser(ctx, store.User{
+					UserID:    a.UserID,
+					Nickname:  a.Nickname,
+					CreatedAt: time.Now(),
+				})
+			} else if row.Nickname != a.Nickname {
+				if err := st.SetUserNickname(ctx, a.UserID, a.Nickname); err != nil {
+					return err
+				}
+			}
+			where := a.Opencode
+			if where == "" {
+				where = "（opencode 默认 agent）"
+			}
+			fmt.Printf("就绪: %-14s %-10s → %s  %s\n", a.UserID, a.Nickname, where, a.Model)
 		}
-		fmt.Printf("bot 账号就绪: %s（%s）\n", cfg.BotUserID, cfg.BotNickname)
-		fmt.Println("把它拉进群，然后 @ 它提问。有账号的人都能用，不用另外开权限。")
+		fmt.Println("把它们拉进群，然后 @ 名字提问。有账号的人都能用，不用另外开权限。")
 		return nil
 
 	case "block":
@@ -458,12 +478,35 @@ func cmdBot(args []string) error {
 		if err != nil {
 			return fmt.Errorf("opencode 不可用: %w", err)
 		}
-		fmt.Printf("opencode %s 在 %s，模型 %s\n", version, cfg.BotOpencodeURL, cfg.BotModel)
-		exists, err := im.UserExists(ctx, cfg.BotUserID)
+		fmt.Printf("opencode %s 在 %s，默认模型 %s\n", version, cfg.BotOpencodeURL, cfg.BotModel)
+
+		// opencode 认得哪些 agent。名字对不上就不会按人设回答，
+		// 而是悄悄用默认的那个，从聊天记录里根本看不出来。
+		known, err := agent.AgentNames(ctx)
 		if err != nil {
-			return err
+			return fmt.Errorf("列 opencode agent 失败: %w", err)
 		}
-		fmt.Printf("bot 账号 %s: %s\n", cfg.BotUserID, map[bool]string{true: "已存在", false: "还没建，跑 bot setup"}[exists])
+		fmt.Printf("opencode agent: %s\n", strings.Join(known, "、"))
+
+		for _, a := range cfg.Agents {
+			exists, err := im.UserExists(ctx, a.UserID)
+			if err != nil {
+				return err
+			}
+			account := "已存在"
+			if !exists {
+				account = "还没建，跑 bot setup"
+			}
+			routed := "opencode 默认"
+			if a.Opencode != "" {
+				routed = a.Opencode
+				if !slices.Contains(known, a.Opencode) {
+					routed += "  ← opencode 里没有这个 agent"
+				}
+			}
+			fmt.Printf("  %-14s %-10s %-24s → %s  %s\n",
+				a.UserID, a.Nickname, account, routed, a.Model)
+		}
 		ids, err := st.BotBlockList(ctx)
 		if err != nil {
 			return err

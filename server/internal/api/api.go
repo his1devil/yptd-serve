@@ -22,6 +22,7 @@ import (
 	"github.com/his1devil/yptd/server/internal/config"
 	"github.com/his1devil/yptd/server/internal/invite"
 	"github.com/his1devil/yptd/server/internal/openim"
+	"github.com/his1devil/yptd/server/internal/run"
 	"github.com/his1devil/yptd/server/internal/store"
 )
 
@@ -33,10 +34,8 @@ type Server struct {
 
 	// bot is nil when no agent runtime is configured; the callback routes
 	// then accept and discard, so OpenIM never sees an error.
-	bot         *bot.Bot
-	botUserID   string
-	botNickname string
-	botBudget   time.Duration
+	bot       *bot.Bot
+	botBudget time.Duration
 }
 
 func New(cfg config.Config, st *store.Store, im *openim.Client, log *slog.Logger) *Server {
@@ -46,14 +45,21 @@ func New(cfg config.Config, st *store.Store, im *openim.Client, log *slog.Logger
 			cfg.BotOpencodeURL, cfg.BotOpencodeUser, cfg.BotOpencodePassword,
 			cfg.BotModel, cfg.BotTimeout,
 		)
+		// Finished runs stay in memory for half an hour for late viewers and
+		// go to the record for everyone after.
+		runs := run.NewRegistry(30 * time.Minute)
+		runs.OnFinish = func(sum run.Summary) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := st.SaveRun(ctx, sum); err != nil {
+				log.Error("save run", "err", err, "run", sum.ID)
+			}
+		}
 		s.bot = bot.New(bot.Config{
-			UserID:        cfg.BotUserID,
-			Nickname:      cfg.BotNickname,
+			Agents:        cfg.Agents,
 			Timeout:       cfg.BotTimeout,
 			MaxConcurrent: cfg.BotMaxConcurrent,
-		}, im, st, agent, log)
-		s.botUserID = cfg.BotUserID
-		s.botNickname = cfg.BotNickname
+		}, im, st, agent, runs, log)
 		s.botBudget = botBudget(cfg.BotTimeout)
 	}
 	return s
@@ -66,6 +72,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/login/password", s.handleLoginPassword)
 	mux.HandleFunc("GET /v1/me", s.handleMe)
 	mux.HandleFunc("GET /v1/users", s.handleUsers)
+	// Agent runs: live stream, record, list, stop.
+	mux.HandleFunc("GET /v1/runs", s.handleRuns)
+	mux.HandleFunc("GET /v1/runs/{id}", s.handleRun)
+	mux.HandleFunc("GET /v1/runs/{id}/events", s.handleRunEvents)
+	mux.HandleFunc("POST /v1/runs/{id}/cancel", s.handleRunCancel)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	// OpenIM appends the command name to the configured URL.
 	mux.HandleFunc("POST /callback/", s.handleCallback)
@@ -92,6 +103,11 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap lets http.ResponseController reach the real writer through this
+// wrapper, which the event stream needs for Flush and for lifting the write
+// deadline.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 // ------------------------------------------------------------------ types ---
 
@@ -149,14 +165,33 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		userID = deriveUserID(nickname)
 	}
 	if !validUserID(userID) {
-		fail(w, http.StatusBadRequest, "invalid_user_id", "用户名只能是 3-32 位字母、数字、下划线或连字符")
+		fail(w, http.StatusBadRequest, "invalid_user_id", "用户名只能是 3-32 位字母、数字或下划线")
 		return
 	}
 
 	ctx := r.Context()
-	// Redeem first: an invitation consumed by a registration that then fails
-	// is recoverable (issue another code); a code that survives a successful
-	// registration is a second, unearned account.
+
+	// A name somebody already has is the one failure the caller can fix
+	// themselves, so it must not cost them their invitation: they would be
+	// left holding a spent code and a message telling them to pick another
+	// name they now cannot use. Checked before redeeming rather than relying
+	// on the create below, which happens after the code is gone.
+	//
+	// Two registrations racing for the same name still resolve at the create,
+	// and the loser does lose their code — but that is a collision between
+	// two people in the same second, not the ordinary case of two friends
+	// whose names happen to start the same way.
+	if _, err := s.store.GetUser(ctx, userID); err == nil {
+		fail(w, http.StatusConflict, "user_exists", "这个用户名已经有人用了，换个昵称再试，邀请码还能用")
+		return
+	} else if !errors.Is(err, store.ErrNotFound) {
+		s.fail500(w, "check user", err)
+		return
+	}
+
+	// Redeem before creating: an invitation consumed by a registration that
+	// then fails is recoverable (issue another code); a code that survives a
+	// successful registration is a second, unearned account.
 	if err := s.store.RedeemInvite(ctx, code, userID); err != nil {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
@@ -200,14 +235,17 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.openim.RegisterUser(ctx, userID, nickname, ""); err != nil {
-		// OpenIM may already know this userID from an earlier partial run.
-		// Registering again is the only failure we tolerate here.
+		// OpenIM may already know this userID from an earlier partial run;
+		// that, and only that, is survivable. Treating every API error as
+		// survivable used to leave the caller with a spent invitation, a row
+		// in our store, and no OpenIM account -- the next call for a token
+		// then failed with a bare 500.
 		var apiErr *openim.Error
-		if !errors.As(err, &apiErr) {
+		if !errors.As(err, &apiErr) || apiErr.Code != openim.CodeRegisteredAlready {
 			s.fail500(w, "openim register", err)
 			return
 		}
-		s.log.Warn("openim register returned an error, continuing",
+		s.log.Warn("openim already knows this user, continuing",
 			"user", userID, "code", apiErr.Code, "msg", apiErr.Msg)
 	}
 
@@ -312,12 +350,29 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		s.fail500(w, "list users", err)
 		return
 	}
+	// Which of these are agents, so a client can draw them as agents and
+	// offer them in its @ completion without being told the ids out of band.
+	agents := make(map[string]config.Agent, len(s.cfg.Agents))
+	for _, a := range s.cfg.Agents {
+		agents[a.UserID] = a
+	}
+
 	out := make([]map[string]any, 0, len(users))
 	for _, u := range users {
 		if u.Disabled {
 			continue
 		}
-		out = append(out, map[string]any{"user_id": u.UserID, "nickname": u.Nickname})
+		row := map[string]any{"user_id": u.UserID, "nickname": u.Nickname}
+		if a, ok := agents[u.UserID]; ok {
+			row["is_agent"] = true
+			tag := a.Tag
+			if tag == "" {
+				tag = "AGENT"
+			}
+			row["tag"] = tag
+			row["color"] = a.Color
+		}
+		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
 }
@@ -403,8 +458,12 @@ func validUserID(id string) bool {
 	}
 	for _, r := range id {
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
 		default:
+			// Hyphens are deliberately absent: OpenIM's /user/user_register
+			// rejects any userID containing one with 1001 ArgsError, so
+			// accepting it here only defers the failure to a point where the
+			// invitation has already been spent.
 			return false
 		}
 	}
@@ -417,19 +476,27 @@ func deriveUserID(nickname string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(nickname) {
 		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '-':
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
 			b.WriteRune(r)
-		case r == ' ':
+		case r == ' ', r == '-':
 			b.WriteByte('_')
 		}
 	}
-	id := b.String()
+	// A nickname like "app-联调" leaves "app_" once the CJK is dropped; the
+	// trailing separator carries no meaning and only makes the name uglier.
+	id := strings.Trim(b.String(), "_")
 	if len(id) < 3 {
+		// A nickname with no ASCII in it at all, which is the common case for
+		// a Chinese name. The token is base64url and carries hyphens, and
+		// OpenIM rejects a userID holding one, so they become underscores
+		// here rather than a 500 at registration.
 		plain, _, err := store.NewToken()
 		if err != nil {
 			return ""
 		}
-		return "u_" + strings.ToLower(strings.TrimPrefix(plain, "yptd_"))[:10]
+		token := strings.ToLower(strings.TrimPrefix(plain, "yptd_"))
+		token = strings.ReplaceAll(token, "-", "_")
+		return "u_" + token[:10]
 	}
 	if len(id) > 32 {
 		id = id[:32]

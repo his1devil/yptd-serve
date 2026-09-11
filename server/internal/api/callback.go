@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/his1devil/yptd/server/internal/bot"
+	"github.com/his1devil/yptd/server/internal/config"
 )
 
 // OpenIM posts to <configured url>/<command>, so these paths are the command
@@ -49,33 +50,44 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	text, _ := bot.ParseContent(req.ContentType, req.Content, s.botNickname)
-	message := bot.Message{
+	text, inContent := bot.ParseContent(req.ContentType, req.Content, s.bot.Nicknames())
+	addressed := addressedAgents(req, inContent, s.bot.Agents(), command)
+	base := bot.Message{
 		SenderID:       req.SendID,
 		SenderNickname: req.SenderNickname,
 		GroupID:        req.GroupID,
 		ConversationID: conversationID(req),
 		ContentType:    req.ContentType,
 		Text:           text,
-		Mentioned:      addressedToBot(req, s.botUserID, command),
 	}
-	// One line per addressed-looking message, because the alternative when
-	// the bot stays silent is guessing which of five conditions rejected it.
-	wanted := s.bot.Wants(message)
-	s.log.Info("callback",
-		"command", command, "from", req.SendID, "group", req.GroupID,
-		"recv", req.RecvID, "type", req.ContentType, "at", req.AtUserList,
-		"mentioned", message.Mentioned, "text", trimForLog(message.Text),
-		"handling", wanted)
-	if wanted {
-		go func() {
+
+	// One message may call on several agents, and each answers for itself.
+	// They queue behind one another per conversation rather than talking at
+	// the same time.
+	var handling []string
+	for _, agentID := range addressed {
+		message := base
+		message.AgentID = agentID
+		if !s.bot.Wants(message) {
+			continue
+		}
+		handling = append(handling, agentID)
+		go func(m bot.Message) {
 			// Its own context: the request's is cancelled the moment this
 			// handler returns, and the agent takes far longer than that.
 			ctx, cancel := context.WithTimeout(context.Background(), s.botBudget)
 			defer cancel()
-			s.bot.Handle(ctx, message)
-		}()
+			s.bot.Handle(ctx, m)
+		}(message)
 	}
+
+	// One line per addressed-looking message, because the alternative when
+	// the bot stays silent is guessing which of five conditions rejected it.
+	s.log.Info("callback",
+		"command", command, "from", req.SendID, "group", req.GroupID,
+		"recv", req.RecvID, "type", req.ContentType, "at", req.AtUserList,
+		"addressed", addressed, "text", trimForLog(text),
+		"handling", handling)
 	callbackOK(w)
 }
 
@@ -83,18 +95,39 @@ func callbackOK(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, map[string]any{"errCode": 0, "errMsg": "", "errDlt": ""})
 }
 
-// addressedToBot: in a group the bot must be mentioned; in a direct chat the
-// message being sent to it is the whole of being addressed.
-func addressedToBot(req callbackReq, botUserID, command string) bool {
+// addressedAgents: in a group an agent must be mentioned; in a direct chat
+// the message being sent to it is the whole of being addressed.
+//
+// Returned in roster order rather than mention order, so that when someone
+// calls on two agents at once the group always hears them in the same
+// sequence.
+func addressedAgents(req callbackReq, inContent []string, agents []config.Agent, command string) []string {
 	if command == afterSendSingleMsg || req.GroupID == "" {
-		return req.RecvID == botUserID
+		for _, a := range agents {
+			if a.UserID == req.RecvID {
+				return []string{a.UserID}
+			}
+		}
+		return nil
 	}
+	// Two places carry the mentions and neither is always filled: the
+	// callback's own field is what the SDK sends, and the copy inside the
+	// message element is what the REST API sends. Reading only one means
+	// silently ignoring half the ways a message can arrive.
+	mentioned := make(map[string]bool, len(req.AtUserList)+len(inContent))
 	for _, id := range req.AtUserList {
-		if id == botUserID {
-			return true
+		mentioned[id] = true
+	}
+	for _, id := range inContent {
+		mentioned[id] = true
+	}
+	var out []string
+	for _, a := range agents {
+		if mentioned[a.UserID] {
+			out = append(out, a.UserID)
 		}
 	}
-	return false
+	return out
 }
 
 // conversationID rebuilds the id OpenIM uses, which a revoke needs.

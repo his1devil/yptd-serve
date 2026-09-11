@@ -18,6 +18,8 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+
+	"github.com/his1devil/yptd/server/internal/run"
 )
 
 var (
@@ -94,6 +96,13 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 		Keys: bson.D{{Key: "user_id", Value: 1}},
 	}); err != nil {
 		return fmt.Errorf("store: credentials index: %w", err)
+	}
+	// The runs a conversation has seen, newest first: what the inspector's
+	// 「运行」 tab lists.
+	if _, err := s.db.Collection("runs").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "conversation_id", Value: 1}, {Key: "started_at", Value: -1}},
+	}); err != nil {
+		return fmt.Errorf("store: runs index: %w", err)
 	}
 	return nil
 }
@@ -337,13 +346,29 @@ func (s *Store) ListCredentials(ctx context.Context, userID string) ([]Credentia
 
 // ---------------------------------------------------------------- the bot ---
 
-// BotSession is the opencode session that continues this chat, or "" when
-// the chat has not asked the bot anything yet.
-func (s *Store) BotSession(ctx context.Context, conversationID string) (string, error) {
+// botSessionKey identifies one agent's thread in one chat.
+//
+// A vertical bar cannot appear in either half: OpenIM ids are alphanumeric
+// with underscores, and a conversation id is built from them.
+func botSessionKey(agentID, conversationID string) string {
+	return agentID + "|" + conversationID
+}
+
+// BotSession is the opencode session that continues this chat for this agent,
+// or "" when it has not been asked anything here yet.
+//
+// Strictly per agent. An earlier version fell back to the row a single-bot
+// deployment left behind, to save the running conversations from starting
+// over — but every new agent adopted that same row on its first turn, so all
+// of them ended up talking in one thread and answering in whichever persona
+// had spoken there first. A thread nobody else can join is worth more than a
+// history that carries over once.
+func (s *Store) BotSession(ctx context.Context, agentID, conversationID string) (string, error) {
 	var row struct {
 		SessionID string `bson:"session_id"`
 	}
-	err := s.db.Collection("bot_sessions").FindOne(ctx, bson.M{"_id": conversationID}).Decode(&row)
+	err := s.db.Collection("bot_sessions").
+		FindOne(ctx, bson.M{"_id": botSessionKey(agentID, conversationID)}).Decode(&row)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return "", nil
 	}
@@ -353,10 +378,13 @@ func (s *Store) BotSession(ctx context.Context, conversationID string) (string, 
 	return row.SessionID, nil
 }
 
-func (s *Store) SetBotSession(ctx context.Context, conversationID, sessionID string) error {
+func (s *Store) SetBotSession(ctx context.Context, agentID, conversationID, sessionID string) error {
 	_, err := s.db.Collection("bot_sessions").UpdateOne(ctx,
-		bson.M{"_id": conversationID},
-		bson.M{"$set": bson.M{"session_id": sessionID, "updated_at": time.Now()}},
+		bson.M{"_id": botSessionKey(agentID, conversationID)},
+		bson.M{"$set": bson.M{
+			"session_id": sessionID, "agent_id": agentID,
+			"conversation_id": conversationID, "updated_at": time.Now(),
+		}},
 		options.Update().SetUpsert(true),
 	)
 	return err
@@ -412,4 +440,46 @@ func (s *Store) BotBlockList(ctx context.Context) ([]string, error) {
 		out = append(out, row.UserID)
 	}
 	return out, cur.Err()
+}
+
+// ------------------------------------------------------------------- runs ---
+
+// SaveRun keeps the final snapshot of an agent run, so the thinking and the
+// tool calls behind an answer can be shown long after the process that
+// produced them has forgotten it.
+func (s *Store) SaveRun(ctx context.Context, sum run.Summary) error {
+	_, err := s.db.Collection("runs").ReplaceOne(ctx, bson.M{"_id": sum.ID}, sum, options.Replace().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("store: save run: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetRun(ctx context.Context, id string) (run.Summary, error) {
+	var sum run.Summary
+	err := s.db.Collection("runs").FindOne(ctx, bson.M{"_id": id}).Decode(&sum)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return run.Summary{}, ErrNotFound
+	}
+	if err != nil {
+		return run.Summary{}, fmt.Errorf("store: get run: %w", err)
+	}
+	return sum, nil
+}
+
+// ListRuns is a conversation's finished runs, newest first.
+func (s *Store) ListRuns(ctx context.Context, conversationID string, limit int64) ([]run.Summary, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	cur, err := s.db.Collection("runs").Find(ctx, bson.M{"conversation_id": conversationID},
+		options.Find().SetSort(bson.D{{Key: "started_at", Value: -1}}).SetLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("store: list runs: %w", err)
+	}
+	out := []run.Summary{}
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, fmt.Errorf("store: list runs: %w", err)
+	}
+	return out, nil
 }

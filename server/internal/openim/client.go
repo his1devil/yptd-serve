@@ -37,6 +37,14 @@ func New(base, secret, adminUserID string) *Client {
 	}
 }
 
+// OpenIM error codes we branch on. The rest stay anonymous: a caller that
+// cannot do anything specific about a code should not pretend to know it.
+const (
+	// CodeRegisteredAlready is /user/user_register's answer when the userID
+	// exists. It is the one register failure a caller can safely continue past.
+	CodeRegisteredAlready = 1102
+)
+
 // Error is a non-zero errCode from OpenIM, kept structured so callers can
 // distinguish "already registered" from "server is down".
 type Error struct {
@@ -220,15 +228,16 @@ func (c *Client) Ping(ctx context.Context) error {
 	return err
 }
 
-// SendText posts a text message as `sender`. Exactly one of recvID (a direct
+// SendText posts a text message as `sender` and returns its clientMsgID, the
+// id every client addresses the message by. Exactly one of recvID (a direct
 // chat) or groupID must be set.
 //
 // The admin token lets this service speak as any user, which is what makes a
 // bot possible without the bot ever holding a connection.
-func (c *Client) SendText(ctx context.Context, sender, nickname, recvID, groupID, text, ex string) error {
+func (c *Client) SendText(ctx context.Context, sender, nickname, recvID, groupID, text, ex string) (string, error) {
 	admin, err := c.AdminToken(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	body := map[string]any{
 		"sendID":           sender,
@@ -247,7 +256,13 @@ func (c *Client) SendText(ctx context.Context, sender, nickname, recvID, groupID
 		body["recvID"] = recvID
 		body["sessionType"] = 1
 	}
-	return c.post(ctx, "/msg/send_msg", body, admin, nil)
+	var out struct {
+		ClientMsgID string `json:"clientMsgID"`
+	}
+	if err := c.post(ctx, "/msg/send_msg", body, admin, &out); err != nil {
+		return "", err
+	}
+	return out.ClientMsgID, nil
 }
 
 // NewestSeq is the highest sequence number in a conversation, as seen by

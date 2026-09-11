@@ -3,11 +3,15 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/his1devil/yptd/server/internal/config"
+	"github.com/his1devil/yptd/server/internal/run"
 )
 
 // Message is one incoming message, already stripped of OpenIM's shapes.
@@ -18,37 +22,48 @@ type Message struct {
 	// ConversationID is what a revoke needs: `sg_<group>` or `si_<a>_<b>`.
 	ConversationID string
 	ContentType    int32
-	// Text is what the person actually typed, with the leading @mention of
-	// the bot removed.
+	// Text is what the person actually typed, with the @mentions of the
+	// agents removed.
 	Text string
-	// Mentioned is true when this message was addressed to the bot.
-	Mentioned bool
+	// AgentID is the agent this message was addressed to, empty when it was
+	// addressed to none. One message mentioning two agents becomes two
+	// messages, one per agent.
+	AgentID string
 }
 
 // Sender is the slice of OpenIM this package needs. An interface so the
-// decision logic can be tested without a server.
+// decision logic can be tested without a server. SendText returns the new
+// message's clientMsgID.
 type Sender interface {
-	SendText(ctx context.Context, sender, nickname, recvID, groupID, text, ex string) error
+	SendText(ctx context.Context, sender, nickname, recvID, groupID, text, ex string) (string, error)
 }
 
 // Sessions remembers which opencode conversation belongs to which chat.
+//
+// Keyed by agent as well as by chat: two agents in one group are two separate
+// conversations, and threading them together would let each read the other's
+// context as if it were its own.
 type Sessions interface {
-	BotSession(ctx context.Context, conversationID string) (string, error)
-	SetBotSession(ctx context.Context, conversationID, sessionID string) error
+	BotSession(ctx context.Context, agentID, conversationID string) (string, error)
+	SetBotSession(ctx context.Context, agentID, conversationID, sessionID string) error
 	BotBlocked(ctx context.Context, userID string) (bool, error)
 }
 
-// How long to wait for an answer before saying anything, and what to say.
-const (
-	placeholderAfter = 3 * time.Second
-	placeholderText  = "⏳ 正在处理…"
-	// Marks a message its sender means to replace.
-	pendingMarker = `{"yptd":"pending"}`
-)
+// The placeholder goes out the moment a run starts. It carries the run id, so
+// a client that knows about runs replaces it with the live answer as it
+// streams; one that does not shows the text and hides it when the answer lands.
+const placeholderText = "⏳ 正在处理…"
+
+// ErrNoRun is Cancel's answer for an id this process does not know.
+var ErrNoRun = errors.New("bot: no such run")
+
+// Markers ride in OpenIM's free-form `ex`.
+func pendingEx(runID string) string { return fmt.Sprintf(`{"yptd":"pending","run":%q}`, runID) }
+func runEx(runID string) string     { return fmt.Sprintf(`{"yptd":"run","run":%q}`, runID) }
 
 type Config struct {
-	UserID   string
-	Nickname string
+	// Agents are the accounts this bot answers as, in roster order.
+	Agents []config.Agent
 	// Timeout bounds one question. A coding agent left alone can grind for a
 	// very long time, and a group chat is not the place to find out.
 	Timeout time.Duration
@@ -56,36 +71,79 @@ type Config struct {
 	MaxConcurrent int
 }
 
-// Bot turns messages into answers.
+// Bot turns messages into answers, as whichever agent was addressed.
 type Bot struct {
 	cfg   Config
+	byID  map[string]config.Agent
 	im    Sender
 	store Sessions
 	agent *Opencode
+	runs  *run.Registry
 	log   *slog.Logger
 	slots chan struct{}
 	mu    sync.Mutex
 	// busy holds one lock per conversation, so two questions in the same
-	// group queue instead of interleaving their answers.
+	// group queue instead of interleaving their answers. Deliberately per
+	// conversation and not per agent: two agents answering the same group at
+	// once would talk over each other.
 	busy map[string]*sync.Mutex
+	// streams is the per-run reducer state for opencode's events.
+	smu     sync.Mutex
+	streams map[string]*stream
 }
 
-func New(cfg Config, im Sender, store Sessions, agent *Opencode, log *slog.Logger) *Bot {
+func New(cfg Config, im Sender, store Sessions, agent *Opencode, runs *run.Registry, log *slog.Logger) *Bot {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 5 * time.Minute
 	}
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 2
 	}
-	return &Bot{
-		cfg:   cfg,
-		im:    im,
-		store: store,
-		agent: agent,
-		log:   log,
-		slots: make(chan struct{}, cfg.MaxConcurrent),
-		busy:  map[string]*sync.Mutex{},
+	if runs == nil {
+		runs = run.NewRegistry(0)
 	}
+	byID := make(map[string]config.Agent, len(cfg.Agents))
+	for _, a := range cfg.Agents {
+		byID[a.UserID] = a
+	}
+	b := &Bot{
+		cfg:     cfg,
+		byID:    byID,
+		im:      im,
+		store:   store,
+		agent:   agent,
+		runs:    runs,
+		log:     log,
+		slots:   make(chan struct{}, cfg.MaxConcurrent),
+		busy:    map[string]*sync.Mutex{},
+		streams: map[string]*stream{},
+	}
+	if agent != nil {
+		go b.eventLoop(context.Background())
+	}
+	return b
+}
+
+// Runs is the registry, for the HTTP layer to serve from.
+func (b *Bot) Runs() *run.Registry { return b.runs }
+
+// Agents is the roster, for the callback's mention matching and the CLI.
+func (b *Bot) Agents() []config.Agent { return b.cfg.Agents }
+
+// IsAgent reports whether this account is one of ours.
+func (b *Bot) IsAgent(userID string) bool {
+	_, ok := b.byID[userID]
+	return ok
+}
+
+// Nicknames is every agent's display name, for stripping mentions out of the
+// text before it reaches the model.
+func (b *Bot) Nicknames() []string {
+	out := make([]string, 0, len(b.cfg.Agents))
+	for _, a := range b.cfg.Agents {
+		out = append(out, a.Nickname)
+	}
+	return out
 }
 
 // Wants reports whether this message is the bot's to answer.
@@ -95,11 +153,11 @@ func New(cfg Config, im Sender, store Sessions, agent *Opencode, log *slog.Logge
 // one that was.
 func (b *Bot) Wants(m Message) bool {
 	switch {
-	case m.SenderID == b.cfg.UserID:
-		// Its own replies come back through the same webhook. Answering them
-		// is an infinite loop that costs money.
+	case b.IsAgent(m.SenderID):
+		// Their own replies come back through the same webhook, and one agent
+		// answering another is an infinite loop that costs money.
 		return false
-	case !m.Mentioned:
+	case m.AgentID == "" || !b.IsAgent(m.AgentID):
 		return false
 	case m.ContentType != 101 && m.ContentType != 106:
 		return false
@@ -122,7 +180,7 @@ func (b *Bot) Handle(ctx context.Context, m Message) {
 	}
 	if blocked {
 		b.log.Info("bot: sender blocked", "user", m.SenderID)
-		b.say(ctx, m, fmt.Sprintf("@%s 管理员停用了你对这个助手的使用。", m.SenderNickname), false)
+		b.say(ctx, m, fmt.Sprintf("@%s 管理员停用了你对这个助手的使用。", m.SenderNickname), "")
 		return
 	}
 
@@ -137,90 +195,230 @@ func (b *Bot) Handle(ctx context.Context, m Message) {
 		return
 	}
 
-	// Answer first, placeholder only if the answer is slow. A reasoning
-	// model usually takes tens of seconds, and silence looks like a broken
-	// bot -- but a quick answer should not be preceded by noise.
-	type result struct {
-		text string
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		text, err := b.ask(ctx, m)
-		done <- result{text, err}
-	}()
-
-	var answer string
-	select {
-	case r := <-done:
-		answer, err = r.text, r.err
-	case <-time.After(placeholderAfter):
-		b.say(ctx, m, placeholderText, true)
-		r := <-done
-		answer, err = r.text, r.err
-	}
-
+	text, r := b.answer(ctx, m)
+	id, err := b.say(ctx, m, text, runEx(r.ID()))
 	if err != nil {
-		b.log.Error("bot: ask", "err", err, "conversation", m.ConversationID)
-		answer = "我这边出错了：" + oneLine(err.Error())
+		b.log.Error("bot: send answer", "err", err, "conversation", m.ConversationID, "run", r.ID())
 	}
-	if strings.TrimSpace(answer) == "" {
-		answer = "（模型没有给出内容，可以换个说法再问一次）"
-	}
-	b.say(ctx, m, answer, false)
+	sum := b.runs.Finish(r, id)
+	b.forget(r)
+	b.log.Info("bot: run finished", "run", sum.ID, "agent", sum.AgentID, "status", sum.Status,
+		"ms", sum.EndedAt-sum.StartedAt, "steps", sum.Usage.Steps, "tools", len(sum.Tools), "chars", len(sum.Text))
 }
 
-func (b *Bot) ask(ctx context.Context, m Message) (string, error) {
+// answer runs one question through opencode and returns what to post. The
+// run it returns is still open; the caller finishes it once the answer has a
+// message id.
+func (b *Bot) answer(ctx context.Context, m Message) (string, *run.Run) {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.Timeout)
 	defer cancel()
 
-	session, err := b.store.BotSession(ctx, m.ConversationID)
+	who := b.byID[m.AgentID]
+	title := fmt.Sprintf("yptd %s %s", who.UserID, m.ConversationID)
+	where := "在群聊里问你"
+	if m.GroupID == "" {
+		where = "问你"
+	}
+	prompt := fmt.Sprintf("%s %s：%s", m.SenderNickname, where, m.Text)
+
+	r := b.runs.Start(run.Summary{
+		AgentID: who.UserID, ConversationID: m.ConversationID, RequesterID: m.SenderID, Prompt: m.Text,
+	}, "")
+	b.remember(r, newStream(prompt))
+
+	// The placeholder goes out first and at once: it is how a client learns
+	// the run id, and every second of silence before it looks like a broken bot.
+	if id, err := b.say(ctx, m, placeholderText, pendingEx(r.ID())); err == nil {
+		r.SetPlaceholder(id)
+	}
+
+	fail := func(err error) (string, *run.Run) {
+		b.log.Error("bot: ask", "err", err, "conversation", m.ConversationID, "run", r.ID())
+		r.Fail(err.Error())
+		return "我这边出错了：" + oneLine(err.Error()), r
+	}
+
+	session, err := b.store.BotSession(ctx, who.UserID, m.ConversationID)
+	if err != nil {
+		return fail(err)
+	}
+	if session == "" {
+		if session, err = b.newSession(ctx, who, m.ConversationID, title); err != nil {
+			return fail(err)
+		}
+	}
+	// Bind before prompting: the first events can arrive before the request
+	// has even returned, and events for an unbound session are dropped.
+	b.runs.Rebind(r, session)
+	if err := b.agent.PromptAsync(ctx, session, who.Opencode, who.Model, prompt); err != nil {
+		// A session the agent has forgotten (restarted, database cleared) must
+		// not wedge this conversation forever.
+		fresh, newErr := b.newSession(ctx, who, m.ConversationID, title)
+		if newErr != nil {
+			return fail(err)
+		}
+		session = fresh
+		b.runs.Rebind(r, session)
+		if err := b.agent.PromptAsync(ctx, session, who.Opencode, who.Model, prompt); err != nil {
+			return fail(err)
+		}
+	}
+
+	b.waitIdle(ctx, r, session)
+
+	snap := r.Snapshot()
+	text := strings.TrimSpace(snap.Text)
+	switch snap.Status {
+	case run.StatusError:
+		return "我这边出错了：" + oneLine(snap.Error), r
+	case run.StatusCancelled:
+		if text == "" {
+			return "（已停止）", r
+		}
+		return text + "\n\n（已停止）", r
+	}
+	if text == "" {
+		// The stream may have been down for the whole answer; the answer is
+		// still in opencode.
+		if got, err := b.agent.LastAnswerSince(ctx, session, snap.StartedAt); err == nil {
+			text = strings.TrimSpace(got)
+			if text != "" {
+				r.Text(text)
+			}
+		}
+	}
+	if text == "" {
+		text = "（模型没有给出内容，可以换个说法再问一次）"
+	}
+	return text, r
+}
+
+func (b *Bot) newSession(ctx context.Context, who config.Agent, conversationID, title string) (string, error) {
+	session, err := b.agent.NewSession(ctx, title)
 	if err != nil {
 		return "", err
 	}
-	if session == "" {
-		session, err = b.agent.NewSession(ctx, "yptd "+m.ConversationID)
-		if err != nil {
-			return "", err
-		}
-		if err := b.store.SetBotSession(ctx, m.ConversationID, session); err != nil {
-			return "", err
-		}
-	}
-	prompt := fmt.Sprintf("%s 在群聊里问你：%s", m.SenderNickname, m.Text)
-	answer, err := b.agent.Ask(ctx, session, prompt)
-	if err == nil {
-		return answer, nil
-	}
-	// A session the agent has forgotten (restarted, database cleared) must
-	// not wedge this conversation forever.
-	fresh, newErr := b.agent.NewSession(ctx, "yptd "+m.ConversationID)
-	if newErr != nil {
+	if err := b.store.SetBotSession(ctx, who.UserID, conversationID, session); err != nil {
 		return "", err
 	}
-	if err := b.store.SetBotSession(ctx, m.ConversationID, fresh); err != nil {
-		return "", err
-	}
-	return b.agent.Ask(ctx, fresh, prompt)
+	return session, nil
 }
 
-func (b *Bot) say(ctx context.Context, m Message, text string, pending bool) {
+// waitIdle blocks until the model has stopped. The event stream normally says
+// so; if it was down at the wrong moment, a periodic status check catches the
+// end instead of waiting out the whole timeout.
+func (b *Bot) waitIdle(ctx context.Context, r *run.Run, session string) {
+	poll := time.NewTicker(10 * time.Second)
+	defer poll.Stop()
+	started := time.Now()
+	for {
+		select {
+		case <-r.Idle():
+			return
+		case <-ctx.Done():
+			// Out of time. Stop the model too, or it keeps spending in the dark.
+			actx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = b.agent.Abort(actx, session)
+			cancel()
+			r.Fail("等了太久，已经停止")
+			return
+		case <-poll.C:
+			if time.Since(started) < 15*time.Second {
+				continue
+			}
+			if busy, err := b.agent.Busy(ctx, session); err == nil && !busy {
+				r.MarkIdle()
+				return
+			}
+		}
+	}
+}
+
+// Cancel stops a run somebody asked to stop. The answer so far is still posted.
+func (b *Bot) Cancel(ctx context.Context, runID string) error {
+	r, ok := b.runs.Get(runID)
+	if !ok {
+		return ErrNoRun
+	}
+	if sid := r.SessionID(); sid != "" {
+		if err := b.agent.Abort(ctx, sid); err != nil {
+			b.log.Warn("bot: abort", "err", err, "run", runID)
+		}
+	}
+	r.Cancel()
+	return nil
+}
+
+// eventLoop keeps one subscription to opencode's event stream open and
+// routes each event to the run bound to its session.
+func (b *Bot) eventLoop(ctx context.Context) {
+	backoff := time.Second
+	for {
+		started := time.Now()
+		err := b.agent.Events(ctx, func(ev Event) {
+			sid := sessionOf(ev.Properties)
+			if sid == "" {
+				return
+			}
+			r, ok := b.runs.BySession(sid)
+			if !ok {
+				return
+			}
+			if st := b.streamFor(r); st != nil {
+				st.apply(r, ev)
+			}
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Since(started) > time.Minute {
+			backoff = time.Second
+		}
+		b.log.Warn("bot: opencode event stream dropped, reconnecting", "err", err, "in", backoff)
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func sessionOf(props json.RawMessage) string {
+	var p struct {
+		SessionID string `json:"sessionID"`
+	}
+	_ = json.Unmarshal(props, &p)
+	return p.SessionID
+}
+
+func (b *Bot) remember(r *run.Run, st *stream) {
+	b.smu.Lock()
+	defer b.smu.Unlock()
+	b.streams[r.ID()] = st
+}
+
+func (b *Bot) streamFor(r *run.Run) *stream {
+	b.smu.Lock()
+	defer b.smu.Unlock()
+	return b.streams[r.ID()]
+}
+
+func (b *Bot) forget(r *run.Run) {
+	b.smu.Lock()
+	defer b.smu.Unlock()
+	delete(b.streams, r.ID())
+}
+
+func (b *Bot) say(ctx context.Context, m Message, text, ex string) (string, error) {
+	who := b.byID[m.AgentID]
 	recv := ""
 	if m.GroupID == "" {
 		recv = m.SenderID
 	}
-	// The marker rides in OpenIM's free-form `ex`, which lets a client hide
-	// the placeholder once the answer lands. Withdrawing it instead is not
-	// available: a revoke is addressed by sequence number, and the number of
-	// a message is not readable until after it has propagated, so a revoke
-	// fired straight after sending takes back whatever came before it.
-	ex := ""
-	if pending {
-		ex = pendingMarker
+	id, err := b.im.SendText(ctx, who.UserID, who.Nickname, recv, m.GroupID, text, ex)
+	if err != nil {
+		b.log.Error("bot: send", "err", err, "conversation", m.ConversationID, "agent", who.UserID)
 	}
-	if err := b.im.SendText(ctx, b.cfg.UserID, b.cfg.Nickname, recv, m.GroupID, text, ex); err != nil {
-		b.log.Error("bot: send", "err", err, "conversation", m.ConversationID)
-	}
+	return id, err
 }
 
 func (b *Bot) lockFor(conversationID string) *sync.Mutex {
@@ -245,7 +443,7 @@ func oneLine(value string) string {
 // ParseContent pulls the typed text out of OpenIM's content JSON and strips
 // the mention that addressed the bot, so the model is asked the question
 // rather than the message.
-func ParseContent(contentType int32, content, botNickname string) (string, []string) {
+func ParseContent(contentType int32, content string, botNicknames []string) (string, []string) {
 	var mentions []string
 	text := ""
 	switch contentType {
@@ -271,8 +469,10 @@ func ParseContent(contentType int32, content, botNickname string) (string, []str
 			text = strings.ReplaceAll(text, "@"+info.GroupNickname, "")
 		}
 	}
-	if botNickname != "" {
-		text = strings.ReplaceAll(text, "@"+botNickname, "")
+	for _, nickname := range botNicknames {
+		if nickname != "" {
+			text = strings.ReplaceAll(text, "@"+nickname, "")
+		}
 	}
 	return strings.TrimSpace(text), mentions
 }
