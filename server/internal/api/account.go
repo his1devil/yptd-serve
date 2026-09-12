@@ -9,6 +9,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/his1devil/yptd/server/internal/invite"
 	"github.com/his1devil/yptd/server/internal/store"
 )
@@ -119,6 +121,53 @@ func (s *Server) handleInvites(w http.ResponseWriter, r *http.Request) {
 		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"invites": out})
+}
+
+// handleMePassword sets or changes this account's password.
+//
+// A password is what lets you sign in on a machine that has no device
+// credential -- without one, signing out of the only machine you have means
+// asking for a fresh invitation, which is why this endpoint exists.
+//
+// The device credential is the proof of identity. Knowing the old password is
+// required on top of it only when one is already set, so that someone who
+// walks up to an unlocked machine cannot silently take the account over by
+// changing a password they never knew.
+func (s *Server) handleMePassword(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.authed(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		OldPassword string `json:"old_password"`
+		Password    string `json:"password"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if len(req.Password) < 8 {
+		fail(w, http.StatusBadRequest, "weak_password", "密码至少 8 位")
+		return
+	}
+	user, err := s.store.GetUser(r.Context(), cred.UserID)
+	if err != nil {
+		s.fail500(w, "get user", err)
+		return
+	}
+	if user.PasswordHash != "" && bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.OldPassword)) != nil {
+		fail(w, http.StatusForbidden, "bad_old_password", "原密码不对")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		s.fail500(w, "hash password", err)
+		return
+	}
+	if err := s.store.SetPasswordHash(r.Context(), cred.UserID, string(hash)); err != nil {
+		s.fail500(w, "set password", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"has_password": true})
 }
 
 // handleInviteCheck lets the sign-in form tell a mistyped code from a spent or

@@ -74,6 +74,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/users", s.handleUsers)
 	// Account and workspace: rename yourself, mint invitations, see who the agents are.
 	mux.HandleFunc("PATCH /v1/me", s.handleMePatch)
+	mux.HandleFunc("PUT /v1/me/password", s.handleMePassword)
 	mux.HandleFunc("GET /v1/invites", s.handleInvites)
 	mux.HandleFunc("POST /v1/invites", s.handleInviteNew)
 	// Unauthenticated: the sign-in form asks before it has an account.
@@ -335,9 +336,10 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user_id":  user.UserID,
-		"nickname": user.Nickname,
-		"disabled": user.Disabled,
+		"user_id":      user.UserID,
+		"nickname":     user.Nickname,
+		"disabled":     user.Disabled,
+		"has_password": user.PasswordHash != "",
 	})
 }
 
