@@ -258,3 +258,37 @@ func TestNewsTunedHasFloors(t *testing.T) {
 		t.Fatal("no feed means off")
 	}
 }
+
+func TestNewsDoesNotThinkWhenThereIsNowhereToSayIt(t *testing.T) {
+	// agent 还没被拉进任何群的时候，判断是白花的——说给没人听。
+	think := &fakeThinker{answer: "1 | 判断。"}
+	w := NewNewsWatcher(config.Agent{UserID: "agentjomo", Nickname: "JOMO",
+		News: config.News{Feed: "aihot", Batch: 1}},
+		&fakeFeed{rounds: [][]NewsItem{{feedItem("1")}}}, think, &fakeSender{},
+		fakeGroups{ids: nil}, nil)
+	w.poll(context.Background())
+	if len(think.prompts) != 0 {
+		t.Fatalf("no rooms means no model call, got %d", len(think.prompts))
+	}
+	if len(w.pending) != 0 {
+		t.Fatal("an undeliverable batch should be dropped, not queued forever")
+	}
+}
+
+func TestNewsRetriesWhenTheGroupLookupFails(t *testing.T) {
+	feed := &fakeFeed{rounds: [][]NewsItem{{feedItem("1")}, {}}}
+	think := &fakeThinker{answer: "1 | 判断。"}
+	send := &fakeSender{}
+	w := NewNewsWatcher(config.Agent{UserID: "agentjomo", Nickname: "JOMO",
+		News: config.News{Feed: "aihot", Batch: 1}},
+		feed, think, send, fakeGroups{err: context.DeadlineExceeded}, nil)
+	w.poll(context.Background())
+	if len(send.sent) != 0 {
+		t.Fatal("a failed lookup should post nothing")
+	}
+	w.groups = fakeGroups{ids: []string{"g1"}}
+	w.poll(context.Background())
+	if len(send.sent) != 1 {
+		t.Fatalf("the batch should survive a failed lookup, got %d", len(send.sent))
+	}
+}

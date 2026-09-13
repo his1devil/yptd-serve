@@ -155,6 +155,17 @@ func (w *NewsWatcher) putBack(batch []NewsItem) {
 }
 
 func (w *NewsWatcher) push(ctx context.Context, batch []NewsItem) error {
+	// 先问有没有地方可说，再花钱判断。agent 刚建出来还没被拉进任何群时，
+	// 否则每一批都要白烧一次模型调用，说给没人听。
+	joined, err := w.groups.JoinedGroups(ctx, w.agent.UserID)
+	if err != nil {
+		return fmt.Errorf("joined groups: %w", err)
+	}
+	rooms := w.news.Rooms(joined)
+	if len(rooms) == 0 {
+		w.log.Info("news: nowhere to say it", "agent", w.agent.UserID, "dropped", len(batch))
+		return nil
+	}
 	takes, err := w.judge(ctx, batch)
 	if err != nil {
 		return err
@@ -173,14 +184,6 @@ func (w *NewsWatcher) push(ctx context.Context, batch []NewsItem) error {
 	}
 	text := Digest(keep, time.Now())
 	if text == "" {
-		return nil
-	}
-	joined, err := w.groups.JoinedGroups(ctx, w.agent.UserID)
-	if err != nil {
-		return fmt.Errorf("joined groups: %w", err)
-	}
-	rooms := w.news.Rooms(joined)
-	if len(rooms) == 0 {
 		return nil
 	}
 	for _, g := range rooms {
