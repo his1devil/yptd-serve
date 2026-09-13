@@ -327,3 +327,36 @@ func (c *Client) RevokeMsg(ctx context.Context, userID, conversationID string, s
 	body := map[string]any{"userID": userID, "conversationID": conversationID, "seq": seq}
 	return c.post(ctx, "/msg/revoke_msg", body, admin, nil)
 }
+
+// JoinedGroups lists the group ids a user belongs to.
+//
+// The watch needs it to know where to post: an agent is reachable in exactly
+// the rooms someone has invited it into, and that set changes without this
+// service being told.
+func (c *Client) JoinedGroups(ctx context.Context, userID string) ([]string, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// One page of 500 is every group an agent will plausibly be in; a bot
+	// that somehow passes it would only miss the tail, not break.
+	body := map[string]any{
+		"fromUserID": userID,
+		"pagination": map[string]int{"pageNumber": 1, "showNumber": 500},
+	}
+	var out struct {
+		Groups []struct {
+			GroupID string `json:"groupID"`
+		} `json:"groups"`
+	}
+	if err := c.post(ctx, "/group/get_joined_group_list", body, admin, &out); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(out.Groups))
+	for _, g := range out.Groups {
+		if g.GroupID != "" {
+			ids = append(ids, g.GroupID)
+		}
+	}
+	return ids, nil
+}

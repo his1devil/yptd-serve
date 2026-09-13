@@ -128,6 +128,15 @@ type Config struct {
 	Timeout time.Duration
 	// MaxConcurrent caps how many questions run at once across all chats.
 	MaxConcurrent int
+	// Quotes backs the market watch. Nil disables every agent's watch, which
+	// is the right default for a deployment without the Longbridge CLI.
+	Quotes Quotes
+	// Groups answers where an agent can speak, for the watch and the news
+	// push. Nil disables both for the same reason.
+	Groups Groups
+	// Feed builds the news reader an agent asks for by name. Nil disables
+	// every agent's news push.
+	Feed FeedMaker
 }
 
 // Bot turns messages into answers, as whichever agent was addressed.
@@ -185,7 +194,45 @@ func New(cfg Config, im Sender, store Sessions, agent *Opencode, runs *run.Regis
 	if agent != nil {
 		go b.eventLoop(context.Background())
 	}
+	b.startWatches(context.Background())
+	b.startNews(context.Background())
 	return b
+}
+
+// startWatches launches one poller per agent that has a watchlist. Separate
+// from the answering path on purpose: a watch neither takes a concurrency
+// slot nor touches the opencode session, so a busy room cannot delay an
+// alert and an alert cannot pollute a room's agent context.
+func (b *Bot) startWatches(ctx context.Context) {
+	if b.cfg.Quotes == nil || b.cfg.Groups == nil {
+		return
+	}
+	for _, a := range b.cfg.Agents {
+		if !a.Watch.On() {
+			continue
+		}
+		go NewWatcher(a, b.cfg.Quotes, b.im, b.cfg.Groups, b.log).Run(ctx)
+	}
+}
+
+// startNews launches one poller per agent that has a news feed. Each gets its
+// own reader: the feed carries a cursor, and a shared one would let whichever
+// agent polled first eat the other's changes.
+func (b *Bot) startNews(ctx context.Context) {
+	if b.cfg.Feed == nil || b.cfg.Groups == nil || b.agent == nil {
+		return
+	}
+	for _, a := range b.cfg.Agents {
+		if !a.News.On() {
+			continue
+		}
+		feed := b.cfg.Feed(a.News.Feed)
+		if feed == nil {
+			b.log.Warn("news: unknown feed", "agent", a.UserID, "feed", a.News.Feed)
+			continue
+		}
+		go NewNewsWatcher(a, feed, b.agent, b.im, b.cfg.Groups, b.log).Run(ctx)
+	}
 }
 
 // Runs is the registry, for the HTTP layer to serve from.
@@ -542,10 +589,13 @@ func (b *Bot) lockFor(conversationID string) *sync.Mutex {
 	return lock
 }
 
+// oneLine flattens text onto a single line and caps it. The cap counts runes,
+// not bytes: slicing a Chinese string at byte 300 lands in the middle of a
+// character and prints a replacement glyph.
 func oneLine(value string) string {
-	value = strings.TrimSpace(strings.ReplaceAll(value, "\n", " "))
-	if len(value) > 300 {
-		return value[:300] + "…"
+	value = strings.Join(strings.Fields(strings.ReplaceAll(value, "\n", " ")), " ")
+	if r := []rune(value); len(r) > 300 {
+		return string(r[:300]) + "…"
 	}
 	return value
 }

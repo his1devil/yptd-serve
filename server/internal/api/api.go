@@ -59,6 +59,18 @@ func New(cfg config.Config, st *store.Store, im *openim.Client, log *slog.Logger
 			Agents:        cfg.Agents,
 			Timeout:       cfg.BotTimeout,
 			MaxConcurrent: cfg.BotMaxConcurrent,
+			// The watch only starts for agents that declare a watchlist; the
+			// rest of the roster never spawns a poller.
+			Quotes: bot.Longbridge{Bin: cfg.QuoteCLI, Home: cfg.QuoteHome},
+			Groups: im,
+			// One reader per agent, so two agents on the same feed do not
+			// race for the same cursor.
+			Feed: func(name string) bot.Feed {
+				if name == "aihot" {
+					return &bot.AIHOT{Base: cfg.NewsBase}
+				}
+				return nil
+			},
 		}, im, st, agent, runs, log)
 		s.botBudget = botBudget(cfg.BotTimeout)
 	}

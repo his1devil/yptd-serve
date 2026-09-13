@@ -48,6 +48,18 @@ type Config struct {
 	BotModel            string
 	BotTimeout          time.Duration
 	BotMaxConcurrent    int
+	// QuoteCLI is the `longbridge` executable the market watch shells out to.
+	// Empty falls back to PATH; set it when the service runs as a user whose
+	// PATH does not carry it. The CLI holds its own Longbridge credentials in
+	// that user's home — this service never sees them.
+	QuoteCLI string
+	// QuoteHome is the HOME the quote CLI reads its Longbridge login from.
+	// Needed because the CLI is logged in as the opencode user while this
+	// service runs as another.
+	QuoteHome string
+	// NewsBase overrides the news feed's origin. Empty uses the real one;
+	// this exists so a test or a staging box can point somewhere else.
+	NewsBase string
 }
 
 // Agent is one bot account: an OpenIM identity, plus how to answer as it.
@@ -71,6 +83,169 @@ type Agent struct {
 	// roster position when the file does not say, so several agents never
 	// collide the way hashing their ids would.
 	Color string `json:"color"`
+	// Watch turns on unprompted market pushes for this agent. Zero value is
+	// off, which is what every agent but the quotes one wants.
+	Watch Watch `json:"watch"`
+	// News turns on unprompted news pushes for this agent. Zero value is off.
+	News News `json:"news"`
+}
+
+// Watch is one agent's standing interest in a set of symbols: poll them, and
+// when one moves past Threshold, say so in every group the agent belongs to.
+//
+// Deliberately agent-level rather than per-group. An agent is in a group
+// because someone wanted its subject there, so its whole watchlist is in
+// scope; per-group lists would need an editor nobody has asked for yet.
+type Watch struct {
+	// Symbols in Longbridge's <CODE>.<MARKET> form, e.g. 700.HK NVDA.US.
+	// Empty disables the watch however the other fields are set.
+	Symbols []string `json:"symbols"`
+	// Threshold is the move, in percent away from the previous close, that
+	// makes a symbol worth interrupting a room over. Defaults to 3.
+	Threshold float64 `json:"threshold"`
+	// Every is the poll interval as a Go duration, e.g. "2m". Defaults to
+	// two minutes; anything under thirty seconds is raised to it, since the
+	// quote CLI is a process spawn and the data is not tick-by-tick anyway.
+	Every string `json:"every"`
+	// Groups limits which rooms hear the watch. Empty means every group the
+	// agent belongs to, which is the steady state; a list is how a new
+	// watchlist gets tried in one room before it starts interrupting all of
+	// them.
+	Groups []string `json:"groups"`
+}
+
+// Rooms narrows the agent's joined groups to the ones this watch may post in.
+func (w Watch) Rooms(joined []string) []string { return rooms(w.Groups, joined) }
+
+// rooms narrows a joined-group list to an allowlist. An empty allowlist means
+// everywhere — that is the steady state, and a list is how a new watchlist
+// gets tried in one room before it starts interrupting all of them.
+func rooms(allow, joined []string) []string {
+	if len(allow) == 0 {
+		return joined
+	}
+	ok := make(map[string]bool, len(allow))
+	for _, g := range allow {
+		ok[g] = true
+	}
+	out := make([]string, 0, len(joined))
+	for _, g := range joined {
+		if ok[g] {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// On reports whether this watch should run at all.
+func (w Watch) On() bool { return len(w.Symbols) > 0 }
+
+// Tuned returns the watch with defaults and floors applied.
+func (w Watch) Tuned() Watch {
+	if w.Threshold <= 0 {
+		w.Threshold = 3
+	}
+	d, err := time.ParseDuration(w.Every)
+	switch {
+	case err != nil || d <= 0:
+		d = 2 * time.Minute
+	case d < 30*time.Second:
+		d = 30 * time.Second
+	}
+	w.Every = d.String()
+	return w
+}
+
+// Interval is Every already parsed; Tuned guarantees it parses.
+func (w Watch) Interval() time.Duration {
+	d, err := time.ParseDuration(w.Tuned().Every)
+	if err != nil {
+		return 2 * time.Minute
+	}
+	return d
+}
+
+// News turns on unprompted news pushes for one agent.
+//
+// There is no hotness threshold here on purpose. The upstream stream is
+// already the curated one, and the second cut — is this worth interrupting a
+// room over — is the agent's own judgement, which is the whole reason a news
+// push goes through a model at all. A number in a config file cannot tell
+// "台积电 2nm 提前量产" from the fourth funding round of the week.
+type News struct {
+	// Feed names the upstream. Empty disables the push however the other
+	// fields are set. Today the only value is "aihot".
+	Feed string `json:"feed"`
+	// Categories keeps only these upstream categories. Empty takes the lot.
+	Categories []string `json:"categories"`
+	// Batch is how many stories make a push worth sending. Defaults to 3.
+	Batch int `json:"batch"`
+	// Within is the longest a story waits for company before going out on its
+	// own, as a Go duration. Defaults to 30m. This is the other half of the
+	// batch rule: without it a slow day never reaches Batch and the room
+	// hears nothing at all.
+	Within string `json:"within"`
+	// Every is the poll interval. Defaults to five minutes; anything under a
+	// minute is raised to it, because a minute is the upstream cache's own
+	// floor and polling faster only burns its rate limit for the same bytes.
+	Every string `json:"every"`
+	// Groups limits which rooms hear the push. Empty means every group the
+	// agent belongs to.
+	Groups []string `json:"groups"`
+}
+
+func (n News) On() bool { return n.Feed != "" }
+
+func (n News) Rooms(joined []string) []string { return rooms(n.Groups, joined) }
+
+// Tuned returns the news config with defaults and floors applied.
+func (n News) Tuned() News {
+	if n.Batch <= 0 {
+		n.Batch = 3
+	}
+	if d, err := time.ParseDuration(n.Within); err != nil || d <= 0 {
+		n.Within = (30 * time.Minute).String()
+	}
+	d, err := time.ParseDuration(n.Every)
+	switch {
+	case err != nil || d <= 0:
+		d = 5 * time.Minute
+	case d < time.Minute:
+		d = time.Minute
+	}
+	n.Every = d.String()
+	return n
+}
+
+// Interval is how often to poll the feed.
+func (n News) Interval() time.Duration {
+	d, err := time.ParseDuration(n.Tuned().Every)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
+}
+
+// Patience is how long a lone story waits for company.
+func (n News) Patience() time.Duration {
+	d, err := time.ParseDuration(n.Tuned().Within)
+	if err != nil {
+		return 30 * time.Minute
+	}
+	return d
+}
+
+// Wants reports whether a category passes the filter.
+func (n News) Wants(category string) bool {
+	if len(n.Categories) == 0 {
+		return true
+	}
+	for _, c := range n.Categories {
+		if strings.EqualFold(c, category) {
+			return true
+		}
+	}
+	return false
 }
 
 // identityColors are the design's agent colours. A client maps them to
@@ -146,6 +321,9 @@ func Load() (Config, error) {
 		PlatformID:        7, // Linux; the TUI overrides per OS at login.
 
 		BotOpencodeURL:      strings.TrimRight(os.Getenv("YPTD_BOT_OPENCODE_URL"), "/"),
+		QuoteCLI:            os.Getenv("YPTD_QUOTE_CLI"),
+		QuoteHome:           os.Getenv("YPTD_QUOTE_HOME"),
+		NewsBase:            os.Getenv("YPTD_NEWS_BASE"),
 		BotOpencodeUser:     env("YPTD_BOT_OPENCODE_USER", "yptd"),
 		BotOpencodePassword: os.Getenv("YPTD_BOT_OPENCODE_PASSWORD"),
 		BotModel:            env("YPTD_BOT_MODEL", "zhipuai/glm-5.3"),
