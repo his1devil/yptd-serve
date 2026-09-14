@@ -137,3 +137,24 @@ func TestDenyCarriesWhatOpenIMActuallyReads(t *testing.T) {
 		t.Fatalf("errDlt 该留空，否则文案重一遍：%v", out)
 	}
 }
+
+// beforeMembersJoinGroup 的第一个人永远是「自己把自己放进去的那个」——建群时是群主，
+// 自助入群时是申请人。别人把你放进去走的是另一个回调。这两件事必须分得开：
+// 「我不希望被别人拉进群」不该变成「我不能自己走进一个公开频道」。
+func TestSelfJoinIsNotBeingAdded(t *testing.T) {
+	var self joinReq
+	if err := json.Unmarshal([]byte(`{"groupID":"g","memberList":[{"userID":"shy"}]}`), &self); err != nil {
+		t.Fatal(err)
+	}
+	if got := self.userIDs(beforeMembersAdd); len(got) != 0 {
+		t.Fatalf("自助入群的那一个人就是申请人，不该被这个开关审：%v", got)
+	}
+	// 同一批人由别人发起就要审
+	var invited joinReq
+	if err := json.Unmarshal([]byte(`{"groupID":"g","invitedUserIDs":["shy"]}`), &invited); err != nil {
+		t.Fatal(err)
+	}
+	if got := refusedBy(invited.userIDs(beforeInvite), none, people.lookup); len(got) != 1 {
+		t.Fatalf("别人拉他就要按他的开关拦住：%v", got)
+	}
+}

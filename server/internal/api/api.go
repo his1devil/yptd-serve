@@ -85,6 +85,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/me", s.handleMe)
 	mux.HandleFunc("GET /v1/users", s.handleUsers)
 	mux.HandleFunc("GET /v1/users/{id}", s.handleUser)
+	// 频道目录：客户端 SDK 的 searchGroups 只搜本地库，找没加入的频道只能走这里
+	mux.HandleFunc("GET /v1/channels", s.handleChannels)
 	// Account and workspace: rename yourself, mint invitations, see who the agents are.
 	mux.HandleFunc("PATCH /v1/me", s.handleMePatch)
 	mux.HandleFunc("PUT /v1/me/password", s.handleMePassword)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/his1devil/yptd/server/internal/bot"
+	"github.com/his1devil/yptd/server/internal/channel"
 	"github.com/his1devil/yptd/server/internal/config"
 )
 
@@ -21,6 +22,8 @@ const (
 	// 一样能把人拖进来。
 	beforeInvite     = "callbackBeforeInviteJoinGroupCommand"
 	beforeMembersAdd = "callbackBeforeMembersJoinGroupCommand"
+	// 自己申请加入一个频道，走的是另一条路，也要看频道自己的开关
+	beforeSelfJoin = "callbackBeforeJoinGroupCommand"
 )
 
 // callbackReq is the part of OpenIM's payload this service reads. The
@@ -50,6 +53,10 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// 也必须在下面 bot == nil 那道门之前——没有 agent 运行时的部署，隐私开关照样得管用。
 	if command == beforeInvite || command == beforeMembersAdd {
 		s.guardJoin(w, r, command)
+		return
+	}
+	if command == beforeSelfJoin {
+		s.guardSelfJoin(w, r)
 		return
 	}
 
@@ -144,15 +151,22 @@ type joinReq struct {
 // userIDs is who this request would put in the group, minus anyone who is not
 // being put there by someone else.
 //
-// For the create-group callback that means dropping the first entry: OpenIM
-// builds the list owner-first (rpc/group CreateGroup calls joinGroupFunc with
-// OwnerUserID before admins and members), and the payload carries no role or
-// operator id to tell them apart by. Without this, nobody could create a group
-// until they had allowed other people to add them to groups — you would be
-// refused entry to your own room.
+// For the create-group callback that means dropping the first entry, and the
+// rule behind that is worth stating plainly because it is not a special case:
 //
-// If upstream ever reorders that list the failure is loud, not silent: group
-// creation starts getting refused for the creator.
+//	在 beforeMembersJoinGroup 这个回调里，列表第一个永远是「自己把自己放进去的
+//	那个人」——建群时是群主，自助入群时是申请人（那种情况列表就他一个）。
+//	别人把你放进去走的是 beforeInviteUserToGroup，是另一条路。
+//
+// So the first entry is never someone being added by somebody else, and this
+// switch has nothing to say about them. Without the skip, nobody could create
+// a group until they had allowed other people to add them to groups — refused
+// entry to your own room — and nobody could walk into an open channel because
+// they had declined to be dragged into other ones. Those are different things.
+//
+// The payload carries no role or operator id, so the position is all there is
+// to go on. If upstream ever reorders that list the failure is loud, not
+// silent: group creation starts getting refused for the creator.
 func (j joinReq) userIDs(command string) []string {
 	if len(j.InvitedUserIDs) > 0 {
 		return j.InvitedUserIDs
@@ -168,6 +182,43 @@ func (j joinReq) userIDs(command string) []string {
 		}
 	}
 	return out
+}
+
+// guardSelfJoin refuses a join request to a channel that is not open.
+//
+// Hiding the join button is a request; this is the rule. OpenIM asks before it
+// looks at anything else about the request, so a client that calls join_group
+// on a closed channel is turned away here whatever it believes.
+//
+// It reads the channel's own switch, which lives in the group's `ex`. The
+// person's own "don't add me to groups" switch is deliberately NOT consulted:
+// walking into a room yourself is not the same as being dragged into one.
+func (s *Server) guardSelfJoin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		GroupID string `json:"groupID"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil || req.GroupID == "" {
+		s.log.Warn("callback: bad self-join body", "err", err)
+		callbackOK(w)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	g, err := s.openim.GroupInfo(ctx, req.GroupID)
+	if err != nil {
+		// 查不到就放行，和上面那道门同一个理由：这是用来挡「明确说了不开放」的，
+		// 不是用来挡所有查不清的情况。
+		s.log.Warn("callback: self-join lookup", "err", err, "group", req.GroupID)
+		callbackOK(w)
+		return
+	}
+	if channel.Parse(g.Ex).Joinable {
+		callbackOK(w)
+		return
+	}
+	s.log.Info("callback: self-join refused", "group", req.GroupID, "name", g.GroupName)
+	callbackDeny(w, "这个频道没有开放自由加入，请让频道里的人邀请你")
 }
 
 // refusedBy names the people in ids who have not opened themselves to being

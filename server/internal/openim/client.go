@@ -333,6 +333,75 @@ func (c *Client) RevokeMsg(ctx context.Context, userID, conversationID string, s
 // The watch needs it to know where to post: an agent is reachable in exactly
 // the rooms someone has invited it into, and that set changes without this
 // service being told.
+// Group is the part of an OpenIM group this service reads.
+type Group struct {
+	GroupID     string `json:"groupID"`
+	GroupName   string `json:"groupName"`
+	MemberCount int    `json:"memberCount"`
+	Ex          string `json:"ex"`
+	Status      int    `json:"status"`
+	OwnerUserID string `json:"ownerUserID"`
+}
+
+// Dismissed reports whether this group is gone. OpenIM keeps dismissed groups
+// in the table and search still returns them, so a directory that does not
+// check this lists rooms nobody can enter.
+func (g Group) Dismissed() bool { return g.Status == 2 }
+
+// GroupInfo reads one group.
+func (c *Client) GroupInfo(ctx context.Context, groupID string) (Group, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return Group{}, err
+	}
+	var out struct {
+		GroupInfos []Group `json:"groupInfos"`
+	}
+	if err := c.post(ctx, "/group/get_groups_info", map[string]any{"groupIDs": []string{groupID}}, admin, &out); err != nil {
+		return Group{}, err
+	}
+	if len(out.GroupInfos) == 0 {
+		return Group{}, fmt.Errorf("openim: no such group %s", groupID)
+	}
+	return out.GroupInfos[0], nil
+}
+
+// SearchGroups finds groups by name.
+//
+// This is OpenIM's management route and needs the admin token, which is why a
+// client cannot do it itself: the SDK's own searchGroups only reads the local
+// database, so it can only ever find groups you have already joined. Finding
+// a room you are not in has to come through here.
+func (c *Client) SearchGroups(ctx context.Context, name string, limit int) ([]Group, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	}
+	body := map[string]any{
+		"groupName":  name,
+		"pagination": map[string]int{"pageNumber": 1, "showNumber": limit},
+	}
+	// 注意外面还包了一层：groups[].groupInfo，不是 groups[] 直接就是群
+	var out struct {
+		Groups []struct {
+			GroupInfo Group `json:"groupInfo"`
+		} `json:"groups"`
+	}
+	if err := c.post(ctx, "/group/get_groups", body, admin, &out); err != nil {
+		return nil, err
+	}
+	groups := make([]Group, 0, len(out.Groups))
+	for _, g := range out.Groups {
+		if g.GroupInfo.GroupID != "" {
+			groups = append(groups, g.GroupInfo)
+		}
+	}
+	return groups, nil
+}
+
 func (c *Client) JoinedGroups(ctx context.Context, userID string) ([]string, error) {
 	admin, err := c.AdminToken(ctx)
 	if err != nil {
