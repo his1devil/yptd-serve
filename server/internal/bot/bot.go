@@ -137,6 +137,9 @@ type Config struct {
 	// Feed builds the news reader an agent asks for by name. Nil disables
 	// every agent's news push.
 	Feed FeedMaker
+	// Rooms answers what each agent should be doing in each group, read fresh
+	// every round so a change made in the app takes effect without a restart.
+	Rooms Rooms
 }
 
 // Bot turns messages into answers, as whichever agent was addressed.
@@ -204,14 +207,13 @@ func New(cfg Config, im Sender, store Sessions, agent *Opencode, runs *run.Regis
 // slot nor touches the opencode session, so a busy room cannot delay an
 // alert and an alert cannot pollute a room's agent context.
 func (b *Bot) startWatches(ctx context.Context) {
-	if b.cfg.Quotes == nil || b.cfg.Groups == nil {
+	if b.cfg.Quotes == nil || b.cfg.Groups == nil || b.cfg.Rooms == nil {
 		return
 	}
 	for _, a := range b.cfg.Agents {
-		if !a.Watch.On() {
-			continue
-		}
-		go NewWatcher(a, b.cfg.Quotes, b.im, b.cfg.Groups, b.log).Run(ctx)
+		// 每个 agent 都起一个：清单现在按群配在库里，启动时 agents.json 里空着
+		// 不代表以后也空着——watcher 每轮都会重读。
+		go NewWatcher(a, b.cfg.Rooms, b.cfg.Quotes, b.im, b.cfg.Groups, b.log).Run(ctx)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/his1devil/yptd/server/internal/config"
 )
@@ -160,11 +161,15 @@ func (f fakeGroups) JoinedGroups(context.Context, string) ([]string, error) { re
 type fakeSender struct {
 	mu   sync.Mutex
 	sent []string
+	fail bool
 }
 
 func (f *fakeSender) SendText(_ context.Context, _, _, _, groupID, text, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.fail {
+		return "", context.DeadlineExceeded
+	}
 	f.sent = append(f.sent, groupID+"|"+text)
 	return "m1", nil
 }
@@ -173,26 +178,85 @@ func (f *fakeSender) SendCustom(context.Context, string, string, string, string,
 	return "", nil
 }
 
-func watcherFor(q Quotes, g Groups, s Sender) *Watcher {
-	return NewWatcher(config.Agent{
-		UserID: "agentcharlie", Nickname: "Charlie",
-		Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3, Every: "1m"},
-	}, q, s, g, nil)
+type fakeRooms struct {
+	byGroup map[string]config.Watch
+	err     error
 }
 
-func TestPollPostsToEveryGroupOnce(t *testing.T) {
-	q := &fakeQuotes{rounds: [][]Quote{{{Symbol: "700.HK", ChangePct: 4.2, Last: 400}}}}
-	s := &fakeSender{}
-	w := watcherFor(q, fakeGroups{ids: []string{"g1", "g2"}}, s)
-	w.poll(context.Background())
-	if len(s.sent) != 2 {
-		t.Fatalf("one move, two groups, want 2 messages, got %d", len(s.sent))
+func (f fakeRooms) WatchFor(context.Context, string) (map[string]config.Watch, error) {
+	return f.byGroup, f.err
+}
+
+func watcherFor(q Quotes, g Groups, s Sender, rooms ...RoomWatch) *Watcher {
+	if len(rooms) == 0 {
+		rooms = []RoomWatch{{GroupID: "g1", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}}}
 	}
-	// Second poll with the same number says nothing.
-	q.rounds = append(q.rounds, []Quote{{Symbol: "700.HK", ChangePct: 4.3, Last: 400}})
+	byGroup := map[string]config.Watch{}
+	for _, r := range rooms {
+		byGroup[r.GroupID] = r.Watch
+	}
+	return NewWatcher(config.Agent{UserID: "agentcharlie", Nickname: "Charlie"},
+		fakeRooms{byGroup: byGroup}, q, s, g, nil)
+}
+
+func TestEachRoomKeepsItsOwnMemory(t *testing.T) {
+	// 这是按群配置之后最容易错的一处：A 群报过 NVDA，B 群不该因此哑掉。
+	// seen 合成一张表的话，谁先轮到谁说话，剩下的群永远慢一步。
+	q := &fakeQuotes{rounds: [][]Quote{{{Symbol: "700.HK", ChangePct: 5, Last: 400}}}}
+	s := &fakeSender{}
+	w := watcherFor(q, fakeGroups{ids: []string{"g1", "g2"}}, s,
+		RoomWatch{GroupID: "g1", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}},
+		RoomWatch{GroupID: "g2", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}})
 	w.poll(context.Background())
 	if len(s.sent) != 2 {
-		t.Fatalf("an unchanged move should not repeat, got %d messages", len(s.sent))
+		t.Fatalf("同一个标的在两个群里各报一次，拿到 %d 条", len(s.sent))
+	}
+}
+
+func TestRoomsCanHaveDifferentThresholds(t *testing.T) {
+	// A9 群 3% 就叫，炼丹群要 10% 才叫——这正是「每个群一份」的意义
+	q := &fakeQuotes{rounds: [][]Quote{{{Symbol: "700.HK", ChangePct: 5, Last: 400}}}}
+	s := &fakeSender{}
+	w := watcherFor(q, fakeGroups{ids: []string{"loud", "quiet"}}, s,
+		RoomWatch{GroupID: "loud", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}},
+		RoomWatch{GroupID: "quiet", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 10}})
+	w.poll(context.Background())
+	if len(s.sent) != 1 || !strings.HasPrefix(s.sent[0], "loud|") {
+		t.Fatalf("只有阈值低的那个群该收到：%v", s.sent)
+	}
+}
+
+func TestSymbolsAreFetchedOnce(t *testing.T) {
+	// 几个群盯同一个标的时，行情 CLI 是一次进程启动，不该按群数翻倍
+	q := &fakeQuotes{rounds: [][]Quote{{{Symbol: "700.HK", ChangePct: 5, Last: 400}}}}
+	w := watcherFor(q, fakeGroups{ids: []string{"a", "b", "c"}}, &fakeSender{},
+		RoomWatch{GroupID: "a", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}},
+		RoomWatch{GroupID: "b", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}},
+		RoomWatch{GroupID: "c", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}})
+	w.poll(context.Background())
+	if q.n != 1 {
+		t.Fatalf("三个群盯同一个标的，行情只该拉一次，拉了 %d 次", q.n)
+	}
+}
+
+func TestPollPostsToEveryConfiguredRoom(t *testing.T) {
+	q := &fakeQuotes{rounds: [][]Quote{
+		{{Symbol: "700.HK", ChangePct: 4.2, Last: 400}},
+		{{Symbol: "700.HK", ChangePct: 4.3, Last: 400}},
+	}}
+	s := &fakeSender{}
+	w := watcherFor(q, fakeGroups{ids: []string{"g1", "g2"}}, s,
+		RoomWatch{GroupID: "g1", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}},
+		RoomWatch{GroupID: "g2", Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}})
+	w.poll(context.Background())
+	if len(s.sent) != 2 {
+		t.Fatalf("一次异动两个群，想要 2 条，拿到 %d", len(s.sent))
+	}
+	// 同一个数字不重复说
+	w.lastPoll = map[string]time.Time{}
+	w.poll(context.Background())
+	if len(s.sent) != 2 {
+		t.Fatalf("没变化就不该再说，拿到 %d 条", len(s.sent))
 	}
 }
 
@@ -202,45 +266,46 @@ func TestPollSkipsHaltedSymbols(t *testing.T) {
 		fakeGroups{ids: []string{"g1"}}, s)
 	w.poll(context.Background())
 	if len(s.sent) != 0 {
-		t.Fatalf("a halted symbol cannot move; want silence, got %v", s.sent)
+		t.Fatalf("停牌的标的动不了，该沉默，拿到 %v", s.sent)
 	}
 }
 
-func TestPollRetriesWhenTheGroupLookupFails(t *testing.T) {
-	// A move consumed by a failed send must not be swallowed: the same move
-	// on the next poll should still go out.
+func TestSendFailureIsRetried(t *testing.T) {
+	// 发失败的那条不能被当成「说过了」吞掉
 	q := &fakeQuotes{rounds: [][]Quote{
 		{{Symbol: "700.HK", ChangePct: 4.2, Last: 400}},
 		{{Symbol: "700.HK", ChangePct: 4.2, Last: 400}},
 	}}
-	s := &fakeSender{}
-	w := watcherFor(q, fakeGroups{err: context.DeadlineExceeded}, s)
+	s := &fakeSender{fail: true}
+	w := watcherFor(q, fakeGroups{ids: []string{"g1"}}, s)
 	w.poll(context.Background())
-	w.groups = fakeGroups{ids: []string{"g1"}}
+	s.fail = false
+	w.lastPoll = map[string]time.Time{}
 	w.poll(context.Background())
 	if len(s.sent) != 1 {
-		t.Fatalf("the alert should survive a failed group lookup, got %d messages", len(s.sent))
+		t.Fatalf("上一轮发失败的，这一轮该重发，拿到 %d 条", len(s.sent))
 	}
 }
 
-func TestWatchOffIsOff(t *testing.T) {
+func TestNoRoomsNoWork(t *testing.T) {
+	q := &fakeQuotes{rounds: [][]Quote{{{Symbol: "700.HK", ChangePct: 9, Last: 400}}}}
 	s := &fakeSender{}
-	w := NewWatcher(config.Agent{UserID: "agentbot"}, &fakeQuotes{}, s, fakeGroups{ids: []string{"g1"}}, nil)
-	w.Run(context.Background())
-	if len(s.sent) != 0 {
-		t.Fatalf("an agent with no symbols should never post, got %v", s.sent)
+	w := watcherFor(q, fakeGroups{ids: []string{"g1"}}, s, RoomWatch{GroupID: "g1", Watch: config.Watch{}})
+	w.poll(context.Background())
+	if len(s.sent) != 0 || q.n != 0 {
+		t.Fatalf("没有群配过清单就什么都不做：发了 %d 条，拉了 %d 次行情", len(s.sent), q.n)
 	}
 }
 
 func TestTunedFloorsTheInterval(t *testing.T) {
 	if got := (config.Watch{Symbols: []string{"x"}, Every: "1s"}).Interval(); got.Seconds() != 30 {
-		t.Fatalf("a one-second poll should be floored to 30s, got %v", got)
+		t.Fatalf("一秒的轮询要抬到 30 秒，得到 %v", got)
 	}
 	if got := (config.Watch{Symbols: []string{"x"}}).Interval(); got.Minutes() != 2 {
-		t.Fatalf("an unset interval should default to 2m, got %v", got)
+		t.Fatalf("没设间隔该默认两分钟，得到 %v", got)
 	}
 	if got := (config.Watch{Symbols: []string{"x"}}).Tuned().Threshold; got != 3 {
-		t.Fatalf("an unset threshold should default to 3, got %v", got)
+		t.Fatalf("没设阈值该默认 3，得到 %v", got)
 	}
 }
 
@@ -254,29 +319,40 @@ func TestParseQuotesDropsUnusableRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got[0].Symbol != "700.HK" || got[0].Last != 428.4 || got[0].ChangePct != 0.66 {
-		t.Fatalf("only the usable row should survive: %+v", got)
+		t.Fatalf("只有能用的那行该活下来：%+v", got)
 	}
 }
 
-func TestWatchCanBeLimitedToOneRoom(t *testing.T) {
-	s := &fakeSender{}
-	w := NewWatcher(config.Agent{
-		UserID: "agentcharlie", Nickname: "Charlie",
-		Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3, Groups: []string{"g2"}},
-	}, &fakeQuotes{rounds: [][]Quote{{{Symbol: "700.HK", ChangePct: 5, Last: 400}}}},
-		s, fakeGroups{ids: []string{"g1", "g2", "g3"}}, nil)
+func TestAgentWithNothingConfiguredAsksNothing(t *testing.T) {
+	// 名册里五个 agent，只有一两个盯盘。其余的不该每 30 秒去问一次「我在哪些群」——
+	// 那是纯浪费，而且会让看日志的人以为它在干活。
+	g := &countingGroups{}
+	w := NewWatcher(config.Agent{UserID: "agentlinus"}, fakeRooms{byGroup: map[string]config.Watch{}},
+		&fakeQuotes{}, &fakeSender{}, g, nil)
 	w.poll(context.Background())
-	if len(s.sent) != 1 || !strings.HasPrefix(s.sent[0], "g2|") {
-		t.Fatalf("only the allowed room should hear it, got %v", s.sent)
+	if g.n != 0 {
+		t.Fatalf("没有任何配置时不该问 OpenIM，问了 %d 次", g.n)
 	}
 }
 
-func TestEmptyGroupListMeansEverywhere(t *testing.T) {
+func TestDefaultFromRosterStillWorks(t *testing.T) {
+	// agents.json 里那份降级成默认值：群里没配过就用它，现有部署一行迁移都不用写
 	s := &fakeSender{}
-	w := watcherFor(&fakeQuotes{rounds: [][]Quote{{{Symbol: "700.HK", ChangePct: 5, Last: 400}}}},
-		fakeGroups{ids: []string{"g1", "g2"}}, s)
+	w := NewWatcher(
+		config.Agent{UserID: "agentcharlie", Nickname: "Charlie",
+			Watch: config.Watch{Symbols: []string{"700.HK"}, Threshold: 3}},
+		fakeRooms{byGroup: map[string]config.Watch{}},
+		&fakeQuotes{rounds: [][]Quote{{{Symbol: "700.HK", ChangePct: 5, Last: 400}}}},
+		s, fakeGroups{ids: []string{"g1"}}, nil)
 	w.poll(context.Background())
-	if len(s.sent) != 2 {
-		t.Fatalf("no allowlist means every joined group, got %d", len(s.sent))
+	if len(s.sent) != 1 {
+		t.Fatalf("没配过的群该用名册里的默认清单，拿到 %d 条", len(s.sent))
 	}
+}
+
+type countingGroups struct{ n int }
+
+func (c *countingGroups) JoinedGroups(context.Context, string) ([]string, error) {
+	c.n++
+	return nil, nil
 }

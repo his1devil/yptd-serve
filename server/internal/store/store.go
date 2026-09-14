@@ -19,6 +19,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"github.com/his1devil/yptd/server/internal/config"
 	"github.com/his1devil/yptd/server/internal/run"
 )
 
@@ -277,6 +278,99 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) (bool, error) {
 
 // SetPrivacy writes the two visibility switches. A nil leaves that one alone,
 // so the caller can change one without reading the other first.
+// GroupAgent is what one agent does inside one group.
+//
+// 配置从 agents.json 搬到这里，是为了三件 agents.json 做不到的事：每个群一份、
+// 在 app 里改、不重启就生效。agents.json 留着当默认值——群里没配过就用它，
+// 现有部署不用迁移，新建的群也有个合理的起点。
+type GroupAgent struct {
+	// ID is "<agentID>:<groupID>"，一个群里一个 agent 只有一份配置
+	ID      string `bson:"_id"`
+	AgentID string `bson:"agent_id"`
+	GroupID string `bson:"group_id"`
+	// Watch 和 News 各自可空：一个 agent 通常只有其中一种能力
+	Watch *config.Watch `bson:"watch,omitempty"`
+	News  *config.News  `bson:"news,omitempty"`
+	// 谁改的、什么时候。谁都能改的东西，最怕的不是有人捣乱，是改了没人知道。
+	UpdatedBy string    `bson:"updated_by,omitempty"`
+	UpdatedAt time.Time `bson:"updated_at"`
+}
+
+func agentConfigID(agentID, groupID string) string { return agentID + ":" + groupID }
+
+// AgentConfigs is every group this agent has been configured in. The watcher
+// asks for this each round, so a change takes effect on the next poll without
+// anything being restarted.
+func (s *Store) AgentConfigs(ctx context.Context, agentID string) ([]GroupAgent, error) {
+	cur, err := s.db.Collection("agent_configs").Find(ctx, bson.M{"agent_id": agentID})
+	if err != nil {
+		return nil, fmt.Errorf("store: agent configs: %w", err)
+	}
+	var out []GroupAgent
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, fmt.Errorf("store: agent configs: %w", err)
+	}
+	return out, nil
+}
+
+// AgentConfig reads one agent's settings in one group. Missing is not an
+// error: it means "this group has never configured it", and the caller falls
+// back to the roster file's defaults.
+func (s *Store) AgentConfig(ctx context.Context, agentID, groupID string) (GroupAgent, bool, error) {
+	var ga GroupAgent
+	err := s.db.Collection("agent_configs").FindOne(ctx, bson.M{"_id": agentConfigID(agentID, groupID)}).Decode(&ga)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return GroupAgent{}, false, nil
+	}
+	if err != nil {
+		return GroupAgent{}, false, fmt.Errorf("store: agent config: %w", err)
+	}
+	return ga, true, nil
+}
+
+// AgentWatch is every group's watchlist for one agent, keyed by groupID.
+// Shaped for the watcher, which asks once per round and looks up by group.
+func (s *Store) AgentWatch(ctx context.Context, agentID string) (map[string]config.Watch, error) {
+	rows, err := s.AgentConfigs(ctx, agentID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]config.Watch, len(rows))
+	for _, r := range rows {
+		if r.Watch != nil {
+			out[r.GroupID] = *r.Watch
+		}
+	}
+	return out, nil
+}
+
+// AgentNews is the same for the news push.
+func (s *Store) AgentNews(ctx context.Context, agentID string) (map[string]config.News, error) {
+	rows, err := s.AgentConfigs(ctx, agentID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]config.News, len(rows))
+	for _, r := range rows {
+		if r.News != nil {
+			out[r.GroupID] = *r.News
+		}
+	}
+	return out, nil
+}
+
+// SetAgentConfig writes one agent's settings in one group.
+func (s *Store) SetAgentConfig(ctx context.Context, ga GroupAgent) error {
+	ga.ID = agentConfigID(ga.AgentID, ga.GroupID)
+	ga.UpdatedAt = time.Now()
+	_, err := s.db.Collection("agent_configs").ReplaceOne(ctx,
+		bson.M{"_id": ga.ID}, ga, options.Replace().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("store: set agent config: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) SetPrivacy(ctx context.Context, userID string, discoverable, joinable *bool) error {
 	set := bson.M{}
 	if discoverable != nil {

@@ -25,16 +25,39 @@ import (
 // Interpretation is what the agent is for, and people ask for it by name.
 type Watcher struct {
 	agent  config.Agent
-	watch  config.Watch
+	rooms  Rooms
 	quotes Quotes
 	send   Sender
 	groups Groups
 	log    *slog.Logger
 
 	mu sync.Mutex
-	// seen is the last percentage this watcher actually announced per
-	// symbol. Absent means "nothing outstanding".
+	// seen is the last percentage actually announced, **per room per symbol**.
+	// 按群分是必须的：A 群报过 NVDA 之后，B 群不该因此哑掉——两个群各看各的，
+	// 阈值也可能不一样。合成一张表的话，谁先轮到谁说话，剩下的群永远慢一步。
 	seen map[string]float64
+	// lastPoll is when each room was last actually asked about. Rooms carry
+	// their own interval, so a room set to 30s must not drag every other
+	// room's polling up to 30s with it.
+	lastPoll map[string]time.Time
+}
+
+// Rooms answers what this agent has been configured to watch, per group.
+//
+// 每轮重读，而不是启动时读一次：配置是在 app 里改的，改完下一轮就生效，不用重启，
+// 也不用管 goroutine 的生死。
+//
+// 只返回「配过的」，默认值的回退交给调用方：这样 poll 能先花一次便宜的库查询问出
+// 「这个 agent 到底有没有事做」，没事做就连 OpenIM 都不用问——名册里五个 agent，
+// 只有一两个会盯盘，其余的不该每 30 秒去问一次自己在哪些群。
+type Rooms interface {
+	WatchFor(ctx context.Context, agentID string) (map[string]config.Watch, error)
+}
+
+// RoomWatch is one group's watchlist.
+type RoomWatch struct {
+	GroupID string
+	Watch   config.Watch
 }
 
 // Groups answers where an agent can currently speak. Read every poll rather
@@ -43,35 +66,37 @@ type Groups interface {
 	JoinedGroups(ctx context.Context, userID string) ([]string, error)
 }
 
-func NewWatcher(agent config.Agent, quotes Quotes, send Sender, groups Groups, log *slog.Logger) *Watcher {
+func NewWatcher(agent config.Agent, rooms Rooms, quotes Quotes, send Sender, groups Groups, log *slog.Logger) *Watcher {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Watcher{
-		agent:  agent,
-		watch:  agent.Watch.Tuned(),
-		quotes: quotes,
-		send:   send,
-		groups: groups,
-		log:    log,
-		seen:   map[string]float64{},
+		agent:    agent,
+		rooms:    rooms,
+		quotes:   quotes,
+		send:     send,
+		groups:   groups,
+		log:      log,
+		seen:     map[string]float64{},
+		lastPoll: map[string]time.Time{},
 	}
 }
 
-// Run polls until ctx is done. Returns immediately when the watch is off.
+/** 一条 seen 记录的键：群 + 标的 */
+func seenKey(groupID, symbol string) string { return groupID + "\x00" + symbol }
+
+// Run polls until ctx is done.
+//
+// 固定节拍转，每轮再按各群自己的间隔决定要不要真去问。用「所有群里最短的间隔」当
+// 节拍的话，一个群配了 30 秒就会把整个 agent 的频率拖上去。
 func (w *Watcher) Run(ctx context.Context) {
-	if !w.watch.On() {
+	if w.rooms == nil {
 		return
 	}
-	every := w.watch.Interval()
-	w.log.Info("watch: started", "agent", w.agent.UserID,
-		"symbols", strings.Join(w.watch.Symbols, " "), "threshold", w.watch.Threshold, "every", every)
-	t := time.NewTicker(every)
+	w.log.Info("watch: started", "agent", w.agent.UserID, "tick", TICK)
+	t := time.NewTicker(TICK)
 	defer t.Stop()
 	for {
-		// First pass runs immediately so a restart does not sit quiet for a
-		// whole interval; nothing is announced unless a symbol is already
-		// past the threshold, which is the same condition as any other pass.
 		w.poll(ctx)
 		select {
 		case <-ctx.Done():
@@ -81,43 +106,106 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 }
 
+// TICK 是轮询的节拍。各群自己的 every 决定它这一轮要不要真被问，所以这个值只需要
+// 比最短的 every 更细就行。
+const TICK = 30 * time.Second
+
 func (w *Watcher) poll(ctx context.Context) {
-	quotes, err := w.quotes.Quotes(ctx, w.watch.Symbols)
+	byGroup, err := w.rooms.WatchFor(ctx, w.agent.UserID)
 	if err != nil {
-		// Every poll failing the same way is the signature of an expired CLI
-		// login. Log it rather than pushing anything: silence is the correct
-		// output when the numbers are unknown.
-		w.log.Warn("watch: quotes", "err", err, "agent", w.agent.UserID)
+		w.log.Warn("watch: rooms", "err", err, "agent", w.agent.UserID)
 		return
 	}
-	due := w.decide(quotes)
+	// 一个群都没配过、名册里也没有默认清单：这个 agent 没有盯盘这回事，
+	// 到此为止，连「我在哪些群」都不用问。
+	if len(byGroup) == 0 && !w.agent.Watch.On() {
+		return
+	}
+	joined, err := w.groups.JoinedGroups(ctx, w.agent.UserID)
+	if err != nil {
+		w.log.Warn("watch: joined groups", "err", err, "agent", w.agent.UserID)
+		return
+	}
+	rooms := make([]RoomWatch, 0, len(joined))
+	for _, g := range joined {
+		cfg, configured := byGroup[g]
+		if !configured {
+			// 这个群没配过：用名册里的默认值，但要尊重它自己的 Groups 白名单
+			if len(w.agent.Watch.Rooms([]string{g})) == 0 {
+				continue
+			}
+			cfg = w.agent.Watch
+		}
+		rooms = append(rooms, RoomWatch{GroupID: g, Watch: cfg})
+	}
+
+	// 只问这一轮真正到点的群
+	now := time.Now()
+	due := make([]RoomWatch, 0, len(rooms))
+	for _, r := range rooms {
+		if !r.Watch.On() {
+			continue
+		}
+		last, ok := w.lastPoll[r.GroupID]
+		if ok && now.Sub(last) < r.Watch.Interval() {
+			continue
+		}
+		due = append(due, r)
+	}
 	if len(due) == 0 {
 		return
 	}
-	groups, err := w.groups.JoinedGroups(ctx, w.agent.UserID)
-	if err != nil {
-		w.log.Warn("watch: joined groups", "err", err, "agent", w.agent.UserID)
-		// The decision already consumed these moves. Put them back so the
-		// next poll retries instead of swallowing the alert.
-		w.forget(due)
-		return
-	}
-	groups = w.watch.Rooms(groups)
-	if len(groups) == 0 {
-		w.forget(due)
-		return
-	}
-	text := Announce(due)
-	for _, g := range groups {
-		if _, err := w.send.SendText(ctx, w.agent.UserID, w.agent.Nickname, "", g, text, ""); err != nil {
-			w.log.Error("watch: send", "err", err, "agent", w.agent.UserID, "group", g)
+
+	// 几个群盯同一个标的时只拉一次：行情 CLI 是一次进程启动，不该按群数翻倍
+	wanted := map[string]bool{}
+	for _, r := range due {
+		for _, sym := range r.Watch.Tuned().Symbols {
+			wanted[sym] = true
 		}
 	}
-	w.log.Info("watch: announced", "agent", w.agent.UserID, "symbols", len(due), "groups", len(groups))
+	symbols := make([]string, 0, len(wanted))
+	for sym := range wanted {
+		symbols = append(symbols, sym)
+	}
+	sort.Strings(symbols)
+
+	quotes, err := w.quotes.Quotes(ctx, symbols)
+	if err != nil {
+		// 每轮都同样失败是 CLI 登录过期的样子。记一条，不推任何东西：
+		// 数字不知道的时候，沉默才是对的输出。
+		w.log.Warn("watch: quotes", "err", err, "agent", w.agent.UserID)
+		return
+	}
+	byID := make(map[string]Quote, len(quotes))
+	for _, q := range quotes {
+		byID[q.Symbol] = q
+	}
+
+	for _, r := range due {
+		w.lastPoll[r.GroupID] = now
+		tuned := r.Watch.Tuned()
+		mine := make([]Quote, 0, len(tuned.Symbols))
+		for _, sym := range tuned.Symbols {
+			if q, ok := byID[sym]; ok {
+				mine = append(mine, q)
+			}
+		}
+		moves := w.decide(r.GroupID, tuned.Threshold, mine)
+		if len(moves) == 0 {
+			continue
+		}
+		text := Announce(moves)
+		if _, err := w.send.SendText(ctx, w.agent.UserID, w.agent.Nickname, "", r.GroupID, text, ""); err != nil {
+			w.log.Error("watch: send", "err", err, "agent", w.agent.UserID, "group", r.GroupID)
+			w.forget(r.GroupID, moves)
+			continue
+		}
+		w.log.Info("watch: announced", "agent", w.agent.UserID, "group", r.GroupID, "symbols", len(moves))
+	}
 }
 
-// decide picks the quotes worth announcing and records them as announced.
-func (w *Watcher) decide(quotes []Quote) []Moved {
+// decide picks the quotes worth announcing in one room and records them.
+func (w *Watcher) decide(groupID string, threshold float64, quotes []Quote) []Moved {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var due []Moved
@@ -125,12 +213,13 @@ func (w *Watcher) decide(quotes []Quote) []Moved {
 		if q.Halted() {
 			continue
 		}
-		prev, had := w.seen[q.Symbol]
-		m := Worth(q.ChangePct, prev, had, w.watch.Threshold)
+		key := seenKey(groupID, q.Symbol)
+		prev, had := w.seen[key]
+		m := Worth(q.ChangePct, prev, had, threshold)
 		if m.Keep() {
-			w.seen[q.Symbol] = q.ChangePct
+			w.seen[key] = q.ChangePct
 		} else {
-			delete(w.seen, q.Symbol)
+			delete(w.seen, key)
 		}
 		if m.Say() {
 			due = append(due, Moved{Quote: q, Move: m})
@@ -140,11 +229,11 @@ func (w *Watcher) decide(quotes []Quote) []Moved {
 }
 
 // forget undoes decide's bookkeeping for moves that never made it out.
-func (w *Watcher) forget(moves []Moved) {
+func (w *Watcher) forget(groupID string, moves []Moved) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, m := range moves {
-		delete(w.seen, m.Symbol)
+		delete(w.seen, seenKey(groupID, m.Symbol))
 	}
 }
 
@@ -170,6 +259,21 @@ func (m Move) Say() bool { return m >= Fresh }
 
 // Keep reports whether the symbol stays on the outstanding list.
 func (m Move) Keep() bool { return m >= Steady }
+
+// Worth classifies a move, given the last percentage announced for this symbol.
+//
+//   - Under the threshold it is Calm: nothing is said and the symbol is
+//     forgotten, so a move that comes back and goes again alerts again.
+//   - Over the threshold with nothing outstanding it is Fresh.
+//   - Over the threshold with something outstanding it only speaks again once
+//     the move has grown by another whole threshold (Wider) or flipped sign
+//     (Turned). A stock running from 3% to 9% is worth three sentences, not
+//     one every two minutes.
+//
+// This is also why the watch needs no trading calendar. After the close the
+// percentage stops changing, so it stops clearing the threshold gap and the
+// room goes quiet on its own — no holiday table to keep current, and no
+// market that silently drops out because its table was wrong.
 
 // Worth classifies a move, given the last percentage announced for this symbol.
 //

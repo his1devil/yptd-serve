@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,6 +20,9 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/term"
 
 	"github.com/his1devil/yptd/server/internal/api"
 	"github.com/his1devil/yptd/server/internal/bot"
@@ -37,6 +41,7 @@ const usage = `yptd-server — yptd 服务端与管理工具
   yptd-server user list                    列出用户
   yptd-server user disable <userID>        停用账号
   yptd-server user enable  <userID>        恢复账号
+  yptd-server user password <userID>       重设密码（从标准输入读，不回显、不进历史）
   yptd-server user revoke  <userID>        吊销该用户全部设备凭据
   yptd-server user rm      <userID>        删除账号：吊销凭据并从花名册移除
   yptd-server check                        自检：Mongo 与 OpenIM 连通性
@@ -256,9 +261,53 @@ func cmdInvite(args []string) error {
 	return fmt.Errorf("未知子命令 %q", args[0])
 }
 
+// setPassword resets an account's password from standard input.
+//
+// 密码只从 stdin 读，不做成命令行参数：参数会进 shell 历史，也会在这台机器上被
+// 任何人用 ps 看见。终端是 tty 时关掉回显，管道进来就直接读——脚本里用得上。
+//
+// 这条命令存在的理由是 PUT /v1/me/password 要验原密码，忘了就走不通，而这里是
+// 唯一还进得去的地方。它不打印密码，也不写日志。
+func setPassword(ctx context.Context, st *store.Store, userID string) error {
+	if _, err := st.GetUser(ctx, userID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("没有这个账号：%s", userID)
+		}
+		return err
+	}
+	fd := int(os.Stdin.Fd())
+	var raw []byte
+	var err error
+	if term.IsTerminal(fd) {
+		fmt.Fprintf(os.Stderr, "给 %s 设新密码（不回显）: ", userID)
+		raw, err = term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+	} else {
+		raw, err = io.ReadAll(os.Stdin)
+	}
+	if err != nil {
+		return fmt.Errorf("读密码: %w", err)
+	}
+	// 管道进来的那一行会带换行，两端的空白都不算密码的一部分
+	password := strings.TrimSpace(string(raw))
+	if len([]rune(password)) < 8 {
+		return errors.New("密码至少 8 位")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("加密: %w", err)
+	}
+	if err := st.SetPasswordHash(ctx, userID, string(hash)); err != nil {
+		return err
+	}
+	// 只说改好了，不回显密码本身
+	fmt.Printf("%s 的密码已重设。原有的设备凭据不受影响，仍然能免密登录。\n", userID)
+	return nil
+}
+
 func cmdUser(args []string) error {
 	if len(args) == 0 {
-		return errors.New("用法: yptd-server user list|disable|enable|revoke|rm")
+		return errors.New("用法: yptd-server user list|password|disable|enable|revoke|rm")
 	}
 	ctx := context.Background()
 	_, st, _, err := open(ctx)
@@ -292,6 +341,12 @@ func cmdUser(args []string) error {
 				len(creds), u.CreatedAt.Local().Format("01-02 15:04"))
 		}
 		return tw.Flush()
+
+	case "password":
+		if len(args) < 2 {
+			return fmt.Errorf("用法: yptd-server user password <userID>（密码从标准输入读）")
+		}
+		return setPassword(ctx, st, args[1])
 
 	case "disable", "enable":
 		if len(args) < 2 {

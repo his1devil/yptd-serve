@@ -65,6 +65,8 @@ func New(cfg config.Config, st *store.Store, im *openim.Client, log *slog.Logger
 			Groups: im,
 			// One reader per agent, so two agents on the same feed do not
 			// race for the same cursor.
+			// 每轮重读：配置在 app 里改，改完下一轮生效，不用重启
+			Rooms: bot.StoredRooms{Store: st},
 			Feed: func(name string) bot.Feed {
 				if name == "aihot" {
 					return &bot.AIHOT{Base: cfg.NewsBase}
@@ -96,6 +98,9 @@ func (s *Server) Routes() http.Handler {
 	// Unauthenticated: the sign-in form asks before it has an account.
 	mux.HandleFunc("POST /v1/invites/check", s.handleInviteCheck)
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
+	// agent 在某个频道里怎么表现。表单由服务端描述，客户端通用渲染。
+	mux.HandleFunc("GET /v1/agents/{id}/config", s.handleAgentConfig)
+	mux.HandleFunc("PUT /v1/agents/{id}/config", s.handleAgentConfig)
 	// Agent runs: live stream, record, list, stop.
 	mux.HandleFunc("GET /v1/runs", s.handleRuns)
 	mux.HandleFunc("GET /v1/runs/{id}", s.handleRun)

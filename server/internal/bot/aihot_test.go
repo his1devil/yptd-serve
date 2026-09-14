@@ -153,7 +153,7 @@ func TestFeedDropsUnusableRows(t *testing.T) {
 		}
 		w.Write([]byte(`{"changes":[
 		  {"op":"upsert","item":{"id":"a","title":"  ","summary":"没标题就不是一条新闻"}},
-		  {"op":"delete","item":{"id":"gone","title":"撤稿了"}},
+		  {"op":"remove","item":{"id":"gone","title":"撤稿了"}},
 		  {"op":"upsert","item":{"id":"b","title":"真的一条","summary":" 摘要 ","category":"ai",
 		   "publishedAt":"2026-09-14T07:02:00.000Z","score":63,"selected":true,"originalTitle":null,
 		   "links":{"original":"https://r.example/x","aihot":"https://aihot.news/items/b"},
@@ -212,13 +212,15 @@ func TestFeedBaselineMustNotPinMinimalFields(t *testing.T) {
 	}
 }
 
+// 线上真实的撤稿是 op:"remove"（不是 delete）。代码本来就是「不是 upsert 一律跳过」，
+// 但测试如果断言一个现实里不存在的值，过了也说明不了什么。
 func TestFeedSkipsRetractions(t *testing.T) {
 	a, _ := feedServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/snapshot") {
 			w.Write([]byte(`{"cursor":"c1"}`))
 			return
 		}
-		w.Write([]byte(`{"changes":[{"op":"delete","item":{"id":"x","title":"撤稿了"}}],"cursor":"c2"}`))
+		w.Write([]byte(`{"changes":[{"op":"remove","item":{"id":"x","title":"撤稿了"}}],"cursor":"c2"}`))
 	})
 	a.Fresh(context.Background())
 	got, err := a.Fresh(context.Background())

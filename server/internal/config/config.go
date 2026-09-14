@@ -99,19 +99,19 @@ type Agent struct {
 type Watch struct {
 	// Symbols in Longbridge's <CODE>.<MARKET> form, e.g. 700.HK NVDA.US.
 	// Empty disables the watch however the other fields are set.
-	Symbols []string `json:"symbols"`
+	Symbols []string `json:"symbols" bson:"symbols,omitempty"`
 	// Threshold is the move, in percent away from the previous close, that
 	// makes a symbol worth interrupting a room over. Defaults to 3.
-	Threshold float64 `json:"threshold"`
+	Threshold float64 `json:"threshold" bson:"threshold,omitempty"`
 	// Every is the poll interval as a Go duration, e.g. "2m". Defaults to
 	// two minutes; anything under thirty seconds is raised to it, since the
 	// quote CLI is a process spawn and the data is not tick-by-tick anyway.
-	Every string `json:"every"`
+	Every string `json:"every" bson:"every,omitempty"`
 	// Groups limits which rooms hear the watch. Empty means every group the
 	// agent belongs to, which is the steady state; a list is how a new
 	// watchlist gets tried in one room before it starts interrupting all of
 	// them.
-	Groups []string `json:"groups"`
+	Groups []string `json:"groups" bson:"groups,omitempty"`
 }
 
 // Rooms narrows the agent's joined groups to the ones this watch may post in.
@@ -175,23 +175,23 @@ func (w Watch) Interval() time.Duration {
 type News struct {
 	// Feed names the upstream. Empty disables the push however the other
 	// fields are set. Today the only value is "aihot".
-	Feed string `json:"feed"`
+	Feed string `json:"feed" bson:"feed,omitempty"`
 	// Categories keeps only these upstream categories. Empty takes the lot.
-	Categories []string `json:"categories"`
+	Categories []string `json:"categories" bson:"categories,omitempty"`
 	// Batch is how many stories make a push worth sending. Defaults to 3.
-	Batch int `json:"batch"`
+	Batch int `json:"batch" bson:"batch,omitempty"`
 	// Within is the longest a story waits for company before going out on its
 	// own, as a Go duration. Defaults to 30m. This is the other half of the
 	// batch rule: without it a slow day never reaches Batch and the room
 	// hears nothing at all.
-	Within string `json:"within"`
+	Within string `json:"within" bson:"within,omitempty"`
 	// Every is the poll interval. Defaults to five minutes; anything under a
 	// minute is raised to it, because a minute is the upstream cache's own
 	// floor and polling faster only burns its rate limit for the same bytes.
-	Every string `json:"every"`
+	Every string `json:"every" bson:"every,omitempty"`
 	// Groups limits which rooms hear the push. Empty means every group the
 	// agent belongs to.
-	Groups []string `json:"groups"`
+	Groups []string `json:"groups" bson:"groups,omitempty"`
 }
 
 func (n News) On() bool { return n.Feed != "" }
