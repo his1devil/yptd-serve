@@ -84,9 +84,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/login/password", s.handleLoginPassword)
 	mux.HandleFunc("GET /v1/me", s.handleMe)
 	mux.HandleFunc("GET /v1/users", s.handleUsers)
+	mux.HandleFunc("GET /v1/users/{id}", s.handleUser)
 	// Account and workspace: rename yourself, mint invitations, see who the agents are.
 	mux.HandleFunc("PATCH /v1/me", s.handleMePatch)
 	mux.HandleFunc("PUT /v1/me/password", s.handleMePassword)
+	mux.HandleFunc("PUT /v1/me/privacy", s.handlePrivacy)
 	mux.HandleFunc("GET /v1/invites", s.handleInvites)
 	mux.HandleFunc("POST /v1/invites", s.handleInviteNew)
 	// Unauthenticated: the sign-in form asks before it has an account.
@@ -352,19 +354,30 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"nickname":     user.Nickname,
 		"disabled":     user.Disabled,
 		"has_password": user.PasswordHash != "",
+		"discoverable": user.Discoverable,
+		"joinable":     user.Joinable,
 	})
 }
 
-// handleUsers lists everyone on this server, for the invite picker. yptd is
-// a small private server where everybody may see everybody; the roster is
-// the right unit, and it needs a valid device credential like /v1/me.
+// handleUsers lists the accounts this caller is allowed to see.
+//
+// Not everyone: an account is private until it says otherwise. What gets
+// through is the caller themselves, the agents (they are not people and
+// cannot be bothered), anyone who turned discovery on, and the people on
+// either end of an invitation the caller was part of — being let in by
+// someone, or letting someone in, already is the introduction.
+//
+// Sharing a group needs no rule here: group member lists come from OpenIM,
+// not from this endpoint, so people already in a room with you keep showing
+// up in it whatever their switch says.
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 	token := bearer(r)
 	if token == "" {
 		fail(w, http.StatusUnauthorized, "missing_token", "缺少设备凭据")
 		return
 	}
-	if _, err := s.store.LookupCredential(r.Context(), token); err != nil {
+	cred, err := s.store.LookupCredential(r.Context(), token)
+	if err != nil {
 		fail(w, http.StatusUnauthorized, "bad_token", "凭据无效")
 		return
 	}
@@ -372,6 +385,12 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.fail500(w, "list users", err)
 		return
+	}
+	known, err := s.store.Acquaintances(r.Context(), cred.UserID)
+	if err != nil {
+		// 认识的人算不出来不该让整张名册挂掉，退一步只少给几行
+		s.log.Warn("users: acquaintances", "err", err, "user", cred.UserID)
+		known = map[string]bool{}
 	}
 	// Which of these are agents, so a client can draw them as agents and
 	// offer them in its @ completion without being told the ids out of band.
@@ -385,19 +404,62 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		if u.Disabled {
 			continue
 		}
-		row := map[string]any{"user_id": u.UserID, "nickname": u.Nickname}
-		if a, ok := agents[u.UserID]; ok {
-			row["is_agent"] = true
-			tag := a.Tag
-			if tag == "" {
-				tag = "AGENT"
-			}
-			row["tag"] = tag
-			row["color"] = a.Color
+		_, isAgent := agents[u.UserID]
+		if !(isAgent || u.UserID == cred.UserID || u.Discoverable || known[u.UserID]) {
+			continue
 		}
-		out = append(out, row)
+		out = append(out, userRow(u, agents))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
+}
+
+func userRow(u store.User, agents map[string]config.Agent) map[string]any {
+	row := map[string]any{"user_id": u.UserID, "nickname": u.Nickname}
+	if a, ok := agents[u.UserID]; ok {
+		// agent 不受被拉群的开关管，对客户端就直说可以拉
+		row["joinable"] = true
+		row["is_agent"] = true
+		tag := a.Tag
+		if tag == "" {
+			tag = "AGENT"
+		}
+		row["tag"] = tag
+		row["color"] = a.Color
+		return row
+	}
+	// 让客户端能把拉不动的人先排除掉。OpenIM 不支持部分拒绝，一个不允许就整批失败，
+	// 所以「点了才知道」在这里特别难受——不如一开始就画成不能选。
+	row["joinable"] = u.Joinable
+	return row
+}
+
+// handleUser looks one account up by its exact id.
+//
+// This is the way to reach someone who is not listed: you have to already
+// know who you are looking for. It deliberately ignores the discovery switch
+// — that switch is about not being browsed, not about being unreachable —
+// and deliberately does not accept a prefix or a name, which would turn it
+// back into the directory it exists to avoid.
+func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
+	token := bearer(r)
+	if token == "" {
+		fail(w, http.StatusUnauthorized, "missing_token", "缺少设备凭据")
+		return
+	}
+	if _, err := s.store.LookupCredential(r.Context(), token); err != nil {
+		fail(w, http.StatusUnauthorized, "bad_token", "凭据无效")
+		return
+	}
+	u, err := s.store.GetUser(r.Context(), strings.TrimSpace(r.PathValue("id")))
+	if err != nil || u.Disabled {
+		fail(w, http.StatusNotFound, "no_such_user", "没有这个账号")
+		return
+	}
+	agents := make(map[string]config.Agent, len(s.cfg.Agents))
+	for _, a := range s.cfg.Agents {
+		agents[a.UserID] = a
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user": userRow(u, agents)})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

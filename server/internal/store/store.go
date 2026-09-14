@@ -58,6 +58,16 @@ type User struct {
 	// the password fallback. Invite-only accounts have none.
 	PasswordHash string `bson:"password_hash,omitempty"`
 	InviteCode   string `bson:"invite_code,omitempty"`
+	// Discoverable lets other people see this account in the roster, and
+	// Joinable lets them add it to a group. Both default to false — an absent
+	// field decodes to false, which is the closed setting, so a new account
+	// starts private without a migration writing anything.
+	//
+	// Joinable is enforced by OpenIM's before-invite webhooks, not here: the
+	// clients invite through OpenIM directly, so a flag this service merely
+	// knows about would be a suggestion. See api.callback.
+	Discoverable bool `bson:"discoverable,omitempty"`
+	Joinable     bool `bson:"joinable,omitempty"`
 }
 
 // Credential is a long-lived device token. Only its hash is stored, so a
@@ -263,6 +273,65 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) (bool, error) {
 		return false, fmt.Errorf("store: delete user: %w", err)
 	}
 	return res.DeletedCount > 0, nil
+}
+
+// SetPrivacy writes the two visibility switches. A nil leaves that one alone,
+// so the caller can change one without reading the other first.
+func (s *Store) SetPrivacy(ctx context.Context, userID string, discoverable, joinable *bool) error {
+	set := bson.M{}
+	if discoverable != nil {
+		set["discoverable"] = *discoverable
+	}
+	if joinable != nil {
+		set["joinable"] = *joinable
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	res, err := s.db.Collection("users").UpdateByID(ctx, userID, bson.M{"$set": set})
+	if err != nil {
+		return fmt.Errorf("store: set privacy: %w", err)
+	}
+	if res.MatchedCount == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Acquaintances is who this account may see regardless of their own switch:
+// the person whose invitation it used, and everyone who used an invitation it
+// minted. Being let in by someone, or letting someone in, is a relationship
+// already — it should not also need a directory listing to survive.
+func (s *Store) Acquaintances(ctx context.Context, userID string) (map[string]bool, error) {
+	out := map[string]bool{}
+
+	// 谁把我放进来的
+	me, err := s.GetUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if me.InviteCode != "" {
+		if inv, err := s.GetInvite(ctx, me.InviteCode); err == nil && inv.CreatedBy != "" {
+			out[inv.CreatedBy] = true
+		}
+	}
+
+	// 我放进来的人
+	cur, err := s.db.Collection("invites").Find(ctx, bson.M{"created_by": userID, "used_by": bson.M{"$ne": ""}})
+	if err != nil {
+		return nil, fmt.Errorf("store: acquaintances: %w", err)
+	}
+	var invites []Invite
+	if err := cur.All(ctx, &invites); err != nil {
+		return nil, fmt.Errorf("store: acquaintances: %w", err)
+	}
+	for _, inv := range invites {
+		if inv.UsedBy != "" {
+			out[inv.UsedBy] = true
+		}
+	}
+	delete(out, userID)
+	return out, nil
 }
 
 func (s *Store) SetUserDisabled(ctx context.Context, userID string, disabled bool) error {

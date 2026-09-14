@@ -48,6 +48,45 @@ func (s *Server) handleMePatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"user_id": cred.UserID, "nickname": nickname})
 }
 
+// handlePrivacy sets the two visibility switches.
+//
+// A separate route rather than more fields on PATCH /v1/me: that one exists to
+// rename you and validates a nickname on every call, and privacy has no
+// business failing because the name it was not changing is too long.
+//
+// Both fields are optional, so a client may flip one without knowing or
+// resending the other.
+func (s *Server) handlePrivacy(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.authed(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Discoverable *bool `json:"discoverable"`
+		Joinable     *bool `json:"joinable"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Discoverable == nil && req.Joinable == nil {
+		fail(w, http.StatusBadRequest, "nothing_to_set", "没有要改的设置")
+		return
+	}
+	if err := s.store.SetPrivacy(r.Context(), cred.UserID, req.Discoverable, req.Joinable); err != nil {
+		s.fail500(w, "set privacy", err)
+		return
+	}
+	user, err := s.store.GetUser(r.Context(), cred.UserID)
+	if err != nil {
+		s.fail500(w, "get user", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"discoverable": user.Discoverable,
+		"joinable":     user.Joinable,
+	})
+}
+
 // handleInviteNew mints invitation codes. Anyone with an account may: this
 // is a friends-sized server where getting in already took an invitation, and
 // the note records who vouched for whom.
