@@ -18,7 +18,12 @@
 crates/yptd-tui   Rust 终端客户端（本仓库主体）
 sidecar/          Go 边车：把 openim-sdk-core 包成本地 Unix socket 上的 NDJSON 服务
 server/           Go 服务端 yptd-server：邀请码、设备凭据、换 OpenIM token；自带管理 CLI
+docs/             接口文档
 ```
+
+要写新客户端（iOS、Apple Watch、别的什么）看 **[docs/client-api.md](docs/client-api.md)**：
+地址、登录三个 token 的关系、yptd-server 全部接口、OpenIM SDK 的接入顺序，
+以及会话 ID、`ex` 字段、表情回应这些 yptd 自己的约定——不实现那些，消息能收发但显示会不对。
 
 OpenIM 的 WebSocket 帧用 Go 的 `encoding/gob` 编码，Rust 没有实现，
 所以 SDK 逻辑留在 Go 里，TUI 通过边车拿数据。边车与 `yptd` 是两个二进制，
