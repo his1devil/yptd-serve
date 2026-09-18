@@ -46,38 +46,62 @@ func TestDirectMessageIsPushedWithSenderAndPreview(t *testing.T) {
 	}
 }
 
-func TestGroupMessagePushesOnlyTheMentioned(t *testing.T) {
-	req := Request{
-		UserIDs: []string{"asen", "lina", "bob", "agentbot"}, SendID: "lina", GroupID: "g1", SessionType: 3,
-		ContentType: AtText, AtUserIDs: []string{"asen", "agentbot"},
-		Content: `{"text":"@阿森 看一下这个","atUserList":["asen","agentbot"]}`,
-	}
-	d := Decide(req, fakeNames{}, placeholder)
-	if d.Skip {
-		t.Fatalf("mentioned people get pushed: %s", d.Reason)
-	}
-	if len(d.UserIDs) != 1 || d.UserIDs[0] != "asen" {
-		t.Fatalf("only the mentioned human: %v", d.UserIDs)
-	}
-	if d.Info.Title != "#Skywalker" || d.Info.Desc != "Lina：@阿森 看一下这个" {
-		t.Fatalf("title/desc = %q / %q", d.Info.Title, d.Info.Desc)
-	}
-	if !strings.Contains(d.Info.Ex, `"conversation_id":"sg_g1"`) {
-		t.Fatalf("ex = %s", d.Info.Ex)
-	}
-}
-
-func TestGroupMessageWithNoMentionIsNotPushed(t *testing.T) {
+func TestOrdinaryGroupChatterIsPushedWithNoAtList(t *testing.T) {
+	// 2026-09-19 起群里普通发言也推。
 	d := Decide(Request{
 		UserIDs: []string{"asen", "bob"}, SendID: "lina", GroupID: "g1", SessionType: 3,
 		ContentType: Text, Content: text("大家早"),
 	}, fakeNames{}, placeholder)
-	if !d.Skip {
-		t.Fatal("ordinary group chatter must not ring phones")
+	if d.Skip {
+		t.Fatalf("ordinary group chatter is pushed now: %s", d.Reason)
+	}
+	if d.Info.Title != "#Skywalker" || d.Info.Desc != "Lina：大家早" {
+		t.Fatalf("title/desc = %q / %q", d.Info.Title, d.Info.Desc)
+	}
+	if strings.Contains(d.Info.Ex, `"at"`) {
+		t.Fatalf("nobody was mentioned, ex should carry no at: %s", d.Info.Ex)
 	}
 }
 
-func TestAtAllPushesEveryoneButAgentsAndSender(t *testing.T) {
+func TestEveryoneIsPushedAndTheMentionedGoIntoEx(t *testing.T) {
+	// 一条群消息只有一份文案，没法对被 @ 的人单独说「提到了你」，所以 @ 到谁写进 ex，
+	// 手机端知道自己是谁，展示时自己加重。
+	d := Decide(Request{
+		UserIDs: []string{"asen", "lina", "bob", "agentbot"}, SendID: "lina", GroupID: "g1", SessionType: 3,
+		ContentType: AtText, AtUserIDs: []string{"asen", "agentbot"},
+		Content: `{"text":"@阿森 看一下这个","atUserList":["asen","agentbot"]}`,
+	}, fakeNames{}, placeholder)
+	if d.Skip {
+		t.Fatalf("group messages are pushed now: %s", d.Reason)
+	}
+	if strings.Join(d.UserIDs, ",") != "asen,bob" {
+		t.Fatalf("everyone but the sender and the agents: %v", d.UserIDs)
+	}
+	if d.Info.Desc != "Lina：@阿森 看一下这个" {
+		t.Fatalf("desc = %q", d.Info.Desc)
+	}
+	// agentbot 被 @ 了但收不到通知，不进 at；bob 收得到但没被 @，也不进。
+	if !strings.Contains(d.Info.Ex, `"at":["asen"]`) {
+		t.Fatalf("ex = %s", d.Info.Ex)
+	}
+}
+
+func TestMentionsInsideTheElementCountToo(t *testing.T) {
+	// 管理接口发的 @ 消息，头上的 atUserIDList 是空的，名单只在元素里。
+	d := Decide(Request{
+		UserIDs: []string{"asen", "bob"}, SendID: "lina", GroupID: "g1", SessionType: 3,
+		ContentType: AtText, AtUserIDs: nil,
+		Content: `{"text":"@阿森 看一下","atUserList":["asen"]}`,
+	}, fakeNames{}, placeholder)
+	if d.Skip {
+		t.Fatalf("%s", d.Reason)
+	}
+	if !strings.Contains(d.Info.Ex, `"at":["asen"]`) {
+		t.Fatalf("mention inside the element must count: %s", d.Info.Ex)
+	}
+}
+
+func TestAtAllMarksEveryoneInEx(t *testing.T) {
 	d := Decide(Request{
 		UserIDs: []string{"asen", "lina", "bob", "agentbot"}, SendID: "lina", GroupID: "g1", SessionType: 3,
 		ContentType: AtText, AtUserIDs: []string{AtAll}, Content: `{"text":"@所有人 开会"}`,
@@ -87,6 +111,42 @@ func TestAtAllPushesEveryoneButAgentsAndSender(t *testing.T) {
 	}
 	if strings.Join(d.UserIDs, ",") != "asen,bob" {
 		t.Fatalf("got %v", d.UserIDs)
+	}
+	if !strings.Contains(d.Info.Ex, `"at":["*"]`) {
+		t.Fatalf("@所有人 should mark everyone: %s", d.Info.Ex)
+	}
+}
+
+func TestAgentAnswersArePushedButBroadcastsAreNot(t *testing.T) {
+	// agent 在群里说话分两种。回答（有人 @ 它问了）带 run_result 标记，该响手机；
+	// 行情、新闻、配置变更是定时发的，不该响——每天几十条会让人把整个 app 静音。
+	answer := Request{
+		UserIDs: []string{"asen", "bob"}, SendID: "agentbot", GroupID: "g1", SessionType: 3,
+		ContentType: Text, Content: text("NVDA 今天 -3.2%，因为…"),
+		Ex: `{"v":1,"conversation_id":"sg_g1","kind":"run_result","run_id":"run_x"}`,
+	}
+	d := Decide(answer, fakeNames{}, placeholder)
+	if d.Skip {
+		t.Fatalf("an agent answering a question must be pushed: %s", d.Reason)
+	}
+	if d.Info.Desc != "HALX：NVDA 今天 -3.2%，因为…" {
+		t.Fatalf("desc = %q", d.Info.Desc)
+	}
+	if !strings.Contains(d.Info.Ex, `"kind":"run_result"`) || !strings.Contains(d.Info.Ex, `"run_id":"run_x"`) {
+		t.Fatalf("ex = %s", d.Info.Ex)
+	}
+
+	broadcast := answer
+	broadcast.Ex = ""
+	broadcast.Content = text("📈 NVDA 涨了 3%")
+	if got := Decide(broadcast, fakeNames{}, placeholder); !got.Skip || got.Reason != "agent broadcast" {
+		t.Fatalf("an unprompted agent broadcast must not ring phones: skip=%v %s", got.Skip, got.Reason)
+	}
+	// 私聊里 agent 说什么都是在回答，照推
+	direct := broadcast
+	direct.GroupID, direct.SessionType, direct.UserIDs = "", 1, []string{"asen"}
+	if got := Decide(direct, fakeNames{}, placeholder); got.Skip {
+		t.Fatalf("an agent in a direct chat is always answering: %s", got.Reason)
 	}
 }
 
@@ -108,6 +168,7 @@ func TestThingsThatNeverPush(t *testing.T) {
 		"notification": {UserIDs: []string{"asen"}, SendID: "lina", SessionType: 1, ContentType: 1201},
 		"placeholder":  {UserIDs: []string{"asen"}, SendID: "agentbot", SessionType: 1, ContentType: Text, Content: text(placeholder)},
 		"only agents":  {UserIDs: []string{"agentbot"}, SendID: "lina", SessionType: 1, ContentType: Text, Content: text("hi")},
+		"only sender":  {UserIDs: []string{"lina"}, SendID: "lina", GroupID: "g1", SessionType: 3, ContentType: Text, Content: text("自言自语")},
 	}
 	for name, req := range cases {
 		if d := Decide(req, fakeNames{}, placeholder); !d.Skip {
@@ -167,17 +228,68 @@ func TestUnknownNamesFallBack(t *testing.T) {
 	}
 }
 
-func TestMentionsInsideTheElementCountToo(t *testing.T) {
-	// 管理接口发的 @ 消息，头上的 atUserIDList 是空的，名单只在元素里。
-	d := Decide(Request{
-		UserIDs: []string{"asen", "bob"}, SendID: "lina", GroupID: "g1", SessionType: 3,
-		ContentType: AtText, AtUserIDs: nil,
-		Content: `{"text":"@阿森 看一下","atUserList":["asen"]}`,
-	}, fakeNames{}, placeholder)
-	if d.Skip {
-		t.Fatalf("mention inside the element must count: %s", d.Reason)
+func TestPreviewStripsMarkdown(t *testing.T) {
+	// agent 的回答几乎都是 markdown。不剥的话锁屏上全是表格分隔线和星号，
+	// 80 个字符里没几个是有效内容。
+	cases := []struct{ in, want string }{
+		{"## 结论\n\n**NVDA.US** 今天 `-3.2%`", "结论 NVDA.US 今天 -3.2%"},
+		{"| 标的 | 涨跌 |\n|---|---|\n| NVDA | +3.2% |", "标的 涨跌 NVDA +3.2%"},
+		{"看这段：\n```go\nfunc main() {}\n```\n就是它", "看这段： [代码] 就是它"},
+		{"- 第一条\n- 第二条", "第一条 第二条"},
+		{"> 他说过\n\n---\n\n我同意", "他说过 我同意"},
+		{"见 [文档](https://x.com/a_b) 第三节", "见 文档 第三节"},
+		{"![截图](https://x/a.png) 你看", "[图片] 你看"},
+		{"~~算了~~ 改主意了", "算了 改主意了"},
+		{"user_id 和 order_id 对不上", "user_id 和 order_id 对不上"}, // 单下划线不能动
+		{"2 * 3 = 6", "2 * 3 = 6"},                           // 落单的星号不是强调
 	}
-	if len(d.UserIDs) != 1 || d.UserIDs[0] != "asen" {
-		t.Fatalf("got %v", d.UserIDs)
+	for _, c := range cases {
+		if got := Preview(Text, text(c.in)); got != c.want {
+			t.Errorf("Preview(%q)\n  = %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestNamesAreCleanedBeforeTheyReachTheTitle(t *testing.T) {
+	// 昵称中间的换行躲得过注册时的 TrimSpace；群名服务端根本没校验过。
+	// 原样拼进标题就是断成两行的名字，真正的内容被挤没。
+	if got := name("阿\n森"); got != "阿 森" {
+		t.Errorf("name = %q", got)
+	}
+	if got := name(strings.Repeat("长", 40)); len([]rune(got)) != 16 {
+		t.Errorf("长昵称要截断，得到 %d 个字", len([]rune(got)))
+	}
+}
+
+func TestCutDoesNotSliceEmojiApart(t *testing.T) {
+	// 一个看得见的 emoji 常常不止一个 rune，切在中间会留下色块或字母方框。
+	for _, e := range []string{"👨‍👩‍👧‍👦", "🇨🇳", "👍🏻", "é"} {
+		s := strings.Repeat("字", 79) + e + "尾巴"
+		got := cut(s, 80)
+		if strings.HasSuffix(strings.TrimSuffix(got, "…"), "‍") {
+			t.Errorf("%q: 结尾留了零宽连接符", e)
+		}
+		r := []rune(strings.TrimSuffix(got, "…"))
+		if n := len(r); n > 0 && r[n-1] >= 0x1F1E6 && r[n-1] <= 0x1F1FF {
+			t.Errorf("%q: 结尾留了半面国旗", e)
+		}
+		if n := len(r); n > 0 && r[n-1] >= 0x1F3FB && r[n-1] <= 0x1F3FF {
+			t.Errorf("%q: 结尾留了孤立的肤色", e)
+		}
+	}
+}
+
+func TestExCarriesTheMessageID(t *testing.T) {
+	// 手机靠 msg_id 精确等待并高亮那一条；没有它，从通知进会话只能看到旧消息，
+	// 新的那条 0.5 秒后才追加进来（2026-09-18 真机观测到）。
+	d := Decide(Request{
+		UserIDs: []string{"asen"}, RecvID: "asen", SendID: "lina", SessionType: 1,
+		ContentType: Text, Content: text("在吗"), ClientMsgID: "cmid-7",
+	}, fakeNames{}, placeholder)
+	if !strings.Contains(d.Info.Ex, `"msg_id":"cmid-7"`) {
+		t.Fatalf("ex = %s", d.Info.Ex)
+	}
+	if !strings.Contains(d.Info.Ex, `"conversation_id":"si_asen_lina"`) {
+		t.Fatalf("会话 id 该用 recvID 算：%s", d.Info.Ex)
 	}
 }

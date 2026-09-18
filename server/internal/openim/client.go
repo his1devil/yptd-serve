@@ -263,9 +263,10 @@ func (c *Client) SendText(ctx context.Context, sender, nickname, recvID, groupID
 	if groupID == "" {
 		conversation = push.DirectID(sender, recvID)
 	}
+	kind, runID := pushKind(ex)
 	body["offlinePushInfo"] = map[string]any{
 		"title": nickname, "desc": push.Preview(101, mustJSON(map[string]string{"content": text})),
-		"ex": push.Ex(conversation, "", ""), "iOSPushSound": "default", "iOSBadgeCount": true,
+		"ex": push.Ex(push.Route{Conversation: conversation, Kind: kind, RunID: runID}), "iOSPushSound": "default", "iOSBadgeCount": true,
 	}
 	if groupID != "" {
 		body["groupID"] = groupID
@@ -453,4 +454,20 @@ func (c *Client) JoinedGroups(ctx context.Context, userID string) ([]string, err
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// pushKind 从消息的 ex 里认出「这是一次 run 的回答」。推送规则靠它把 agent 的回答
+// 和行情、新闻这类主动播报分开：回答推，播报不推。ex 的形状见 bot.runEx。
+func pushKind(ex string) (kind, runID string) {
+	if ex == "" {
+		return "", ""
+	}
+	var p struct {
+		Yptd string `json:"yptd"`
+		Run  string `json:"run"`
+	}
+	if json.Unmarshal([]byte(ex), &p) != nil || p.Yptd != "run" {
+		return "", ""
+	}
+	return push.Answer, p.Run
 }
