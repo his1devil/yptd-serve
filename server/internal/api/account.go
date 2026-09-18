@@ -40,7 +40,7 @@ func (s *Server) handleMePatch(w http.ResponseWriter, r *http.Request) {
 		s.fail500(w, "set nickname", err)
 		return
 	}
-	if err := s.openim.UpdateUser(r.Context(), cred.UserID, nickname); err != nil {
+	if err := s.openim.UpdateUser(r.Context(), cred.UserID, nickname, ""); err != nil {
 		// The roster already says the new name; OpenIM catching up later is
 		// a cosmetic lag, not a failed rename.
 		s.log.Warn("openim rename", "err", err, "user", cred.UserID)

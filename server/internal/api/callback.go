@@ -72,6 +72,9 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	text, inContent := bot.ParseContent(req.ContentType, req.Content, s.bot.Nicknames())
+	if bot.Textless(req.Ex) {
+		text = ""
+	}
 	addressed := addressedAgents(req, inContent, s.bot.Agents(), command)
 	base := bot.Message{
 		ClientMsgID:    req.ClientMsgID,

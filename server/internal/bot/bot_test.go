@@ -157,3 +157,19 @@ func TestReactionPayloadMatchesTheClientProtocol(t *testing.T) {
 		}
 	}
 }
+
+func TestWantsAScreenshotWithNoWords(t *testing.T) {
+	// 「@Dummy」加一张截图：去掉 @ 之后文字是空的，但截图就是内容。以前这条
+	// 会被当成空消息丢掉，发的人以为记上了。
+	b := testBot()
+	shot := Message{SenderID: "lina", AgentID: "agentbot", ContentType: 106, Text: "",
+		Attachments: []Attachment{{Kind: "image", URL: "https://x/a.png", Name: "a.png"}}}
+	if !b.Wants(shot) {
+		t.Fatal("an attachment-only message addressed to the bot is content")
+	}
+	empty := shot
+	empty.Attachments = nil
+	if b.Wants(empty) {
+		t.Fatal("no words and no attachments is nothing to answer")
+	}
+}

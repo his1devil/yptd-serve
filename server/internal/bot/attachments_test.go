@@ -20,3 +20,20 @@ func TestParseAttachmentsReadsYptdRichExAndIgnoresTheRest(t *testing.T) {
 		}
 	}
 }
+
+func TestTextlessOnlyWhenRichSaysSoAndThereAreAttachments(t *testing.T) {
+	// 客户端没打字时会把正文填成「[图片]」给老客户端看；t:0 说明那不是发送者说的话。
+	if !Textless(`{"yptd":"rich","a":[{"k":"i","u":"https://x/a.png","n":"a.png"}],"t":0}`) {
+		t.Error("t:0 with attachments is textless")
+	}
+	for _, ex := range []string{
+		`{"yptd":"rich","a":[{"k":"i","u":"https://x/a.png","n":"a.png"}],"t":1}`, // 打了字
+		`{"yptd":"rich","a":[],"t":0}`,                                            // 没附件也没字：不该清掉正文
+		`{"yptd":"rich","a":[{"k":"i","u":"https://x/a.png","n":"a.png"}]}`,       // 老客户端没有 t
+		``, `{"yptd":"run","run":"r1"}`,
+	} {
+		if Textless(ex) {
+			t.Errorf("%q should not be textless", ex)
+		}
+	}
+}

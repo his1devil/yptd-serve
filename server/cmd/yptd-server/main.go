@@ -454,10 +454,10 @@ func cmdBot(args []string) error {
 			if exists {
 				// 改过昵称的话，OpenIM 那边还留着旧名字，群成员列表和
 				// 私聊标题都会继续显示旧的。
-				if err := im.UpdateUser(ctx, a.UserID, a.Nickname); err != nil {
+				if err := im.UpdateUser(ctx, a.UserID, a.Nickname, a.Avatar); err != nil {
 					return err
 				}
-			} else if err := im.RegisterUser(ctx, a.UserID, a.Nickname, ""); err != nil {
+			} else if err := im.RegisterUser(ctx, a.UserID, a.Nickname, a.Avatar); err != nil {
 				return err
 			}
 			// A local row too, so `user list` shows it and nobody wonders

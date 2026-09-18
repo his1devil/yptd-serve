@@ -47,11 +47,25 @@ type Attachment struct {
 // ParseAttachments reads the attachment list out of a message's `ex`; nil
 // when there is none or it is some other client's extension.
 func ParseAttachments(ex string) []Attachment {
+	a, _ := parseRich(ex)
+	return a
+}
+
+// Textless reports whether the message carried attachments and no typed text.
+// The client fills the text with "[图片]" so older clients show something;
+// that placeholder is not what the sender said and should not reach the model.
+func Textless(ex string) bool {
+	_, textless := parseRich(ex)
+	return textless
+}
+
+func parseRich(ex string) ([]Attachment, bool) {
 	if ex == "" {
-		return nil
+		return nil, false
 	}
 	var p struct {
 		Yptd string `json:"yptd"`
+		T    *int   `json:"t"`
 		A    []struct {
 			K string `json:"k"`
 			U string `json:"u"`
@@ -59,7 +73,7 @@ func ParseAttachments(ex string) []Attachment {
 		} `json:"a"`
 	}
 	if json.Unmarshal([]byte(ex), &p) != nil || p.Yptd != "rich" {
-		return nil
+		return nil, false
 	}
 	out := make([]Attachment, 0, len(p.A))
 	for _, a := range p.A {
@@ -72,7 +86,7 @@ func ParseAttachments(ex string) []Attachment {
 		}
 		out = append(out, Attachment{Kind: kind, URL: a.U, Name: a.N})
 	}
-	return out
+	return out, p.T != nil && *p.T == 0 && len(out) > 0
 }
 
 // Sender is the slice of OpenIM this package needs. An interface so the
@@ -302,7 +316,9 @@ func (b *Bot) Wants(m Message) bool {
 		return false
 	case m.ContentType != 101 && m.ContentType != 106:
 		return false
-	case strings.TrimSpace(m.Text) == "":
+	case strings.TrimSpace(m.Text) == "" && len(m.Attachments) == 0:
+		// 「@Dummy」加一张截图，去掉 @ 之后文字是空的，但截图就是内容。
+		// 真正的空消息是既没字也没附件。
 		return false
 	}
 	return true
@@ -361,6 +377,10 @@ func (b *Bot) answer(ctx context.Context, m Message) (string, *run.Run) {
 		where = "问你"
 	}
 	prompt := fmt.Sprintf("%s %s：%s", m.SenderNickname, where, m.Text)
+	if strings.TrimSpace(m.Text) == "" {
+		// 只发了附件。别让模型对着一个冒号猜问题是什么。
+		prompt = fmt.Sprintf("%s %s发来了附件，没有写文字。", m.SenderNickname, strings.TrimSuffix(where, "问你"))
+	}
 	if len(m.Attachments) > 0 {
 		// Links rather than bytes: the model can fetch what it needs, and a
 		// screenshot pasted next to a question should not be invisible to it.

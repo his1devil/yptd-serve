@@ -83,6 +83,10 @@ type Agent struct {
 	// roster position when the file does not say, so several agents never
 	// collide the way hashing their ids would.
 	Color string `json:"color"`
+	// Avatar 是头像的公网 URL，setup 时写进 OpenIM 的 faceURL。留空的 agent
+	// 由客户端画 yptd 的标记。客户端认不认 faceURL 是客户端的事——桌面端目前
+	// 对 agent 一律画标记，所以填了也可能看不到。
+	Avatar string `json:"avatar"`
 	// Watch turns on unprompted market pushes for this agent. Zero value is
 	// off, which is what every agent but the quotes one wants.
 	Watch Watch `json:"watch"`

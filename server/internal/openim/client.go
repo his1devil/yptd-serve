@@ -174,13 +174,18 @@ func (c *Client) RegisterUser(ctx context.Context, userID, nickname, faceURL str
 // OpenIM has no endpoint for deleting a user, so an account that outlives its
 // purpose can only be renamed or left alone; this is also how the bot's
 // nickname is kept in step with the configured one.
-func (c *Client) UpdateUser(ctx context.Context, userID, nickname string) error {
+func (c *Client) UpdateUser(ctx context.Context, userID, nickname, faceURL string) error {
 	token, err := c.AdminToken(ctx)
 	if err != nil {
 		return err
 	}
 	// OpenIM wants the fields nested; a flat body comes back as "UserInfo is empty".
-	body := map[string]any{"userInfo": map[string]any{"userID": userID, "nickname": nickname}}
+	info := map[string]any{"userID": userID, "nickname": nickname}
+	// 空串不发：update_user_info 是按字段覆盖的，发空会把已有头像抹掉。
+	if faceURL != "" {
+		info["faceURL"] = faceURL
+	}
+	body := map[string]any{"userInfo": info}
 	return c.post(ctx, "/user/update_user_info", body, token, nil)
 }
 
