@@ -166,3 +166,18 @@ func TestUnknownNamesFallBack(t *testing.T) {
 		t.Fatalf("title/desc = %q / %q", d.Info.Title, d.Info.Desc)
 	}
 }
+
+func TestMentionsInsideTheElementCountToo(t *testing.T) {
+	// 管理接口发的 @ 消息，头上的 atUserIDList 是空的，名单只在元素里。
+	d := Decide(Request{
+		UserIDs: []string{"asen", "bob"}, SendID: "lina", GroupID: "g1", SessionType: 3,
+		ContentType: AtText, AtUserIDs: nil,
+		Content: `{"text":"@阿森 看一下","atUserList":["asen"]}`,
+	}, fakeNames{}, placeholder)
+	if d.Skip {
+		t.Fatalf("mention inside the element must count: %s", d.Reason)
+	}
+	if len(d.UserIDs) != 1 || d.UserIDs[0] != "asen" {
+		t.Fatalf("got %v", d.UserIDs)
+	}
+}

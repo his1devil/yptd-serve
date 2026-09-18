@@ -102,7 +102,7 @@ func Decide(req Request, names Names, placeholder string) Decision {
 	group := req.SessionType == 3 || req.GroupID != ""
 	recipients := req.UserIDs
 	if group {
-		recipients = mentioned(req.UserIDs, req.AtUserIDs)
+		recipients = mentioned(req.UserIDs, mentions(req))
 	}
 	recipients = without(recipients, req.SendID, names.IsAgent)
 	if len(recipients) == 0 {
@@ -226,6 +226,22 @@ func cut(s string, n int) string {
 	}
 	r := []rune(s)
 	return string(r[:n-1]) + "…"
+}
+
+// mentions 合并两处的 @ 名单：消息头上的 atUserIDList 是 SDK 发消息时填的，管理接口
+// （REST /msg/send_msg，Go 服务和脚本走这条）只填元素里面那份。只看一处就会漏掉一半
+// 的来路——测试时用管理接口 @ 人，回调里 atUserIDList 是空的，整条被判成「没 @ 任何人」。
+func mentions(req Request) []string {
+	out := append([]string(nil), req.AtUserIDs...)
+	if req.ContentType == AtText {
+		var e struct {
+			AtUserList []string `json:"atUserList"`
+		}
+		if json.Unmarshal([]byte(req.Content), &e) == nil {
+			out = append(out, e.AtUserList...)
+		}
+	}
+	return out
 }
 
 // mentioned 是名单里被 @ 到的那部分；@所有人 就是整个名单。
