@@ -36,10 +36,13 @@ type Server struct {
 	// then accept and discard, so OpenIM never sees an error.
 	bot       *bot.Bot
 	botBudget time.Duration
+
+	// groupNames caches group names for offline push titles; see offlinepush.go.
+	groupNames *nameCache
 }
 
 func New(cfg config.Config, st *store.Store, im *openim.Client, log *slog.Logger) *Server {
-	s := &Server{cfg: cfg, store: st, openim: im, log: log}
+	s := &Server{cfg: cfg, store: st, openim: im, log: log, groupNames: newNameCache(time.Minute)}
 	if cfg.BotEnabled() {
 		agent := bot.NewOpencode(
 			cfg.BotOpencodeURL, cfg.BotOpencodeUser, cfg.BotOpencodePassword,

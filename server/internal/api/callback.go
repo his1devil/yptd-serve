@@ -24,6 +24,8 @@ const (
 	beforeMembersAdd = "callbackBeforeMembersJoinGroupCommand"
 	// 自己申请加入一个频道，走的是另一条路，也要看频道自己的开关
 	beforeSelfJoin = "callbackBeforeJoinGroupCommand"
+	// 离线推送之前问一声：推不推、推给谁、说什么。见 offlinepush.go
+	beforeOfflinePush = "callbackBeforeOfflinePushCommand"
 )
 
 // callbackReq is the part of OpenIM's payload this service reads. The
@@ -57,6 +59,10 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if command == beforeSelfJoin {
 		s.guardSelfJoin(w, r)
+		return
+	}
+	if command == beforeOfflinePush {
+		s.guardOfflinePush(w, r)
 		return
 	}
 

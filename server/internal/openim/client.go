@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/his1devil/yptd/server/internal/push"
 )
 
 type Client struct {
@@ -254,6 +256,17 @@ func (c *Client) SendText(ctx context.Context, sender, nickname, recvID, groupID
 	if ex != "" {
 		body["ex"] = ex
 	}
+	// 兜底的离线推送文案（做法 A）。正式的文案由 beforeOfflinePush 回调集中生成
+	// （做法 B）；这份只在回调没开、或者回调挂了的时候用。声音必须自己带：适配器
+	// 回补到 3.8.3 之后不再写死 default，不带就是无声通知。
+	conversation := "sg_" + groupID
+	if groupID == "" {
+		conversation = push.DirectID(sender, recvID)
+	}
+	body["offlinePushInfo"] = map[string]any{
+		"title": nickname, "desc": push.Preview(101, mustJSON(map[string]string{"content": text})),
+		"ex": push.Ex(conversation, "", ""), "iOSPushSound": "default", "iOSBadgeCount": true,
+	}
 	if groupID != "" {
 		body["groupID"] = groupID
 		body["sessionType"] = 3
@@ -283,6 +296,8 @@ func (c *Client) SendCustom(ctx context.Context, sender, nickname, recvID, group
 		"senderPlatformID": 7,
 		"contentType":      110,
 		"content":          map[string]string{"data": data, "description": description, "extension": ""},
+		// yptd 的自定义消息是 reaction 和信号，不是给人看的，手机上不该响
+		"notOfflinePush": true,
 	}
 	if groupID != "" {
 		body["groupID"] = groupID
@@ -433,4 +448,9 @@ func (c *Client) JoinedGroups(ctx context.Context, userID string) ([]string, err
 		}
 	}
 	return ids, nil
+}
+
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }

@@ -352,48 +352,65 @@ PUT /v1/me/privacy
 
 ---
 
-## 9. 离线推送（APNs）
+## 9. 离线推送（极光 → APNs）
 
-**现状：没配过。** 服务器上的 `config/openim-push.yml` 和上游默认值一字未改
-（`git status` 干净），里面的 geTui / jpns 凭据都是 OpenIM 自带的示例值。
-目前的表现就是：app 不在前台时收不到任何推送。
-
-### 关键事实：OpenIM 不直连 APNs
-
-这一点会决定你的方案。OpenIM 的离线推送只支持三个中转服务商：
-
-```yaml
-enable: geTui     # 或 fcm / jpns
-```
-
-- **geTui（个推）** — 国内常用，当前配置文件里选的就是它
-- **jpns（极光 JPush）** — 国内常用
-- **fcm（Firebase）** — iOS 上 FCM 也是转 APNs，但国内不通
-
-也就是说 **APNs 证书要传到中转服务商的后台**，不是填进 OpenIM。链路是：
+**2026-09-18 起接入极光（JPush）。** 链路：
 
 ```
-OpenIM ──HTTP──► 个推/极光 ──► APNs ──► iPhone
+发消息方 → OpenIM 判定接收方离线 → beforeOfflinePush 回调（yptd-server 定文案和名单）
+        → OpenIM 极光适配器 → 极光 → APNs → iPhone
 ```
 
-### 要做的事
+OpenIM 不直连 APNs；APNs 的 `.p8` 鉴权密钥传在极光控制台，不在服务器上。
+极光 **alias = OpenIM userID**，不加前缀、不哈希。
 
-1. 在个推或极光开一个应用，拿到 AppKey / MasterSecret。
-2. 在 Apple Developer 后台生成 APNs 鉴权密钥（`.p8`，比证书省事，不会过期），
-   连同 Key ID、Team ID、Bundle ID 一起传到服务商后台。
-3. 把 AppKey / MasterSecret 填进 `config/openim-push.yml` 对应的段，重启 OpenIM。
-4. iOS 端集成服务商的 SDK，把它给的 push token 通过 OpenIM SDK 上报
-   （`setAppBadge` / 各家 SDK 的注册接口，具体看服务商文档）。
-5. `iosPush` 那一段现在是默认值，上线前要改：
+### 客户端要做的
 
-```yaml
-iosPush:
-  pushSound: xxx        # 占位符，改成真的声音文件名
-  badgeCount: true      # 角标，保持开
-  production: false     # 上 App Store 前必须改成 true，否则走沙盒 APNs
+1. 集成极光 SDK，把 APNs 设备令牌交给它。
+2. 登录成功后 `setAlias(userID)`；退出、被踢、切账号时 `deleteAlias`。
+   不需要向 yptd-server 上报任何令牌。
+3. 发消息时 `offlinePushInfo` 填一份**兜底**（回调挂了才会用到）：
+   `title` 自己的昵称、`desc` 消息预览、`ex` 见下、`iOSPushSound: "default"`、
+   `iOSBadgeCount: true`。**声音一定要带**：适配器不再写死 default，不带就是无声通知。
+4. 发 reaction 一类自定义消息时带 `notOfflinePush: true`。
+5. 点通知后按 `ex.conversation_id` 跳会话。通知只是导航请求，不是访问授权——
+   会话不在列表里或无权访问，给明确提示。
+
+### `ex` 约定（三端共用）
+
+通知负载里 `extras.ex` 是一个 JSON 字符串：
+
+```json
+{"v": 1, "conversation_id": "sg_<groupID> 或 si_<a>_<b>", "kind": "message"}
 ```
 
-`production: false` 这条最容易忘——开发时是对的，上架后不改会导致所有推送静默失败。
+- `conversation_id` 必填，是手机跳转的唯一依据；`si_` 的两个 id 按字典序。
+- `kind`：`message`（默认）或 `run_result`（agent 的最终结果，另带短 `run_id`）。
+- 不放消息全文之外的敏感内容。
+
+### 服务端集中决定的规则（`server/internal/push`）
+
+回调**整体替换**发送方填的文案和名单，规则如下；客户端不用自己实现，知道就行：
+
+| 情形 | 推不推 | 文案 |
+| --- | --- | --- |
+| 私聊 | 推 | 标题 = 发送者昵称，正文 = 预览 |
+| 群里被 @ 到的人（含 @所有人） | 推给被 @ 的 | 标题 = `#群名`，正文 = `发送者：预览` |
+| 群里没 @ 任何人的普通消息 | **不推** | — |
+| reaction / 自定义消息、输入状态、系统通知、agent 的「⏳ 正在处理…」占位 | 不推 | — |
+| agent 账号作为接收方 | 从名单里去掉 | — |
+
+预览按类型：文字原文（单行、80 字截断）、`[图片]`、`[语音]`、`[视频]`、`[文件] 名字`。
+
+### 线上配置（运维）
+
+`openim-push.yml`：`enable: jpush`（区分大小写；这个版本的段名是 `jpns`，写成 `jpush:`
+会静默读成空），`jpns.appKey / masterSecret / pushURL`，`iosPush.production: true`。
+`webhooks.yml`：`beforeOfflinePush.enable: true`、`failedContinue: false`（回调返回错误
+就是「这条不推」，`failedContinue: true` 会把它当成「继续推」）。改完只重启 `openim-push`。
+
+线上 OpenIM（release-v3.8 `6f49519`）的极光适配器回补了 v3.8.3 的两个文件，否则
+通知只显示标题、`ex` 传不到手机。
 
 ### Watch 的推送
 

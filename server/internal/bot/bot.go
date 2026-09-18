@@ -113,7 +113,8 @@ type Sessions interface {
 // carries the run id, so a client that knows about runs replaces it with the
 // live answer as it streams; one that does not shows the text and hides it
 // when the answer lands.
-const placeholderText = "⏳ 正在处理…"
+// 导出是给 beforeOfflinePush 回调认的：这条不该推到手机上。
+const PlaceholderText = "⏳ 正在处理…"
 
 // In a group the agent reacts to the question instead. A placeholder there
 // makes the stream jump around while everyone else keeps talking; a reaction
@@ -415,7 +416,7 @@ func (b *Bot) answer(ctx context.Context, m Message) (string, *run.Run) {
 				b.log.Warn("bot: ack reaction", "err", err, "conversation", m.ConversationID)
 			}
 		}
-	} else if id, err := b.say(ctx, m, placeholderText, pendingEx(r.ID())); err == nil {
+	} else if id, err := b.say(ctx, m, PlaceholderText, pendingEx(r.ID())); err == nil {
 		// The placeholder goes out first and at once: it is how a client learns
 		// the run id, and every second of silence before it looks like a broken bot.
 		r.SetPlaceholder(id)
