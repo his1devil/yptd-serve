@@ -393,6 +393,16 @@ func (b *Bot) answer(ctx context.Context, m Message) (string, *run.Run) {
 			prompt += fmt.Sprintf("\n- %s %s：%s", label, a.Name, a.URL)
 		}
 	}
+	// 账号、群号、消息 id 放在最后一行：Dummy 记 bug 要写「谁 (账号)」「#哪个群」和
+	// 能跳回原消息的 id，只给昵称它填不出来。别的 agent 多半用不上，一行也不碍事。
+	prompt += fmt.Sprintf("\n\n（发送者账号 %s", m.SenderID)
+	if m.GroupID != "" {
+		prompt += fmt.Sprintf("，群 %s", m.GroupID)
+	}
+	if m.ClientMsgID != "" {
+		prompt += fmt.Sprintf("，消息 id %s", m.ClientMsgID)
+	}
+	prompt += "）"
 
 	r := b.runs.Start(run.Summary{
 		AgentID: who.UserID, ConversationID: m.ConversationID, RequesterID: m.SenderID, Prompt: m.Text,
