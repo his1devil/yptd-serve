@@ -14,6 +14,9 @@ func (fakeNames) Nickname(id string) string {
 func (fakeNames) GroupName(id string) string {
 	return map[string]string{"g1": "Skywalker"}[id]
 }
+func (fakeNames) Avatar(id string) string {
+	return map[string]string{"lina": "https://im/object/lina.jpg"}[id]
+}
 func (fakeNames) IsAgent(id string) bool { return strings.HasPrefix(id, "agent") }
 
 const placeholder = "⏳ 正在处理…"
@@ -38,7 +41,7 @@ func TestDirectMessageIsPushedWithSenderAndPreview(t *testing.T) {
 	if d.Info.Title != "Lina" || d.Info.Desc != "晚上一起吃饭？" {
 		t.Fatalf("title/desc = %q / %q", d.Info.Title, d.Info.Desc)
 	}
-	if d.Info.Ex != `{"conversation_id":"si_asen_lina","kind":"message","v":1}` {
+	if d.Info.Ex != `{"avatar":"https://im/object/lina.jpg","conversation_id":"si_asen_lina","from":"lina","kind":"message","name":"Lina","v":1}` {
 		t.Fatalf("ex = %s", d.Info.Ex)
 	}
 	if d.Info.IOSPushSound != "default" || !d.Info.IOSBadgeCount {
@@ -188,7 +191,9 @@ func TestRunResultKindSurvivesFromTheSendersEx(t *testing.T) {
 		UserIDs: []string{"asen"}, SendID: "agentbot", SessionType: 1, ContentType: Text, Content: text("结论是…"),
 		Ex: `{"v":1,"conversation_id":"wrong","kind":"run_result","run_id":"run_x"}`,
 	}, fakeNames{}, placeholder)
-	if d.Info.Ex != `{"conversation_id":"si_agentbot_asen","kind":"run_result","run_id":"run_x","v":1}` {
+	if !strings.Contains(d.Info.Ex, `"conversation_id":"si_agentbot_asen"`) ||
+		!strings.Contains(d.Info.Ex, `"kind":"run_result"`) ||
+		!strings.Contains(d.Info.Ex, `"run_id":"run_x"`) {
 		t.Fatalf("ex = %s", d.Info.Ex)
 	}
 }
@@ -291,5 +296,45 @@ func TestExCarriesTheMessageID(t *testing.T) {
 	}
 	if !strings.Contains(d.Info.Ex, `"conversation_id":"si_asen_lina"`) {
 		t.Fatalf("会话 id 该用 recvID 算：%s", d.Info.Ex)
+	}
+}
+
+func TestExCarriesTheSendersAvatarWhenThereIsOne(t *testing.T) {
+	// 手机在通知里画发送者的头像；没设头像的人就留空，手机退回 app 自己的标记。
+	d := Decide(Request{
+		UserIDs: []string{"asen"}, RecvID: "asen", SendID: "lina", SessionType: 1,
+		ContentType: Text, Content: text("在吗"),
+	}, fakeNames{}, placeholder)
+	if !strings.Contains(d.Info.Ex, `"avatar":"https://im/object/lina.jpg"`) {
+		t.Fatalf("ex = %s", d.Info.Ex)
+	}
+	none := Decide(Request{
+		UserIDs: []string{"lina"}, RecvID: "lina", SendID: "asen", SessionType: 1,
+		ContentType: Text, Content: text("在"),
+	}, fakeNames{}, placeholder)
+	if strings.Contains(none.Info.Ex, "avatar") {
+		t.Fatalf("没设头像就不该有这个字段：%s", none.Info.Ex)
+	}
+}
+
+func TestExCarriesTheSenderAndRoomSeparately(t *testing.T) {
+	// iOS 的通知扩展要把发送者和群名分开填进 INSendMessageIntent 才能画大头像；
+	// 从「#群名」「张三：内容」这种拼好的字符串里往回拆是在跟格式较劲。
+	d := Decide(Request{
+		UserIDs: []string{"asen", "bob"}, SendID: "lina", GroupID: "g1", SessionType: 3,
+		ContentType: Text, Content: text("明天开会"),
+	}, fakeNames{}, placeholder)
+	for _, want := range []string{`"from":"lina"`, `"name":"Lina"`, `"room":"Skywalker"`} {
+		if !strings.Contains(d.Info.Ex, want) {
+			t.Errorf("ex 里少了 %s：%s", want, d.Info.Ex)
+		}
+	}
+	// 私聊没有群名
+	direct := Decide(Request{
+		UserIDs: []string{"asen"}, RecvID: "asen", SendID: "lina", SessionType: 1,
+		ContentType: Text, Content: text("在吗"),
+	}, fakeNames{}, placeholder)
+	if strings.Contains(direct.Info.Ex, `"room"`) {
+		t.Errorf("私聊不该有 room：%s", direct.Info.Ex)
 	}
 }

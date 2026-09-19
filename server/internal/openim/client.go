@@ -23,6 +23,13 @@ type Client struct {
 	adminID string
 	http    *http.Client
 
+	// PublicAPI is openim-api's address as clients reach it, e.g.
+	// https://im.example.com. OpenIM builds the object URLs it hands back from
+	// the request's own host, and this service talks to it over loopback — so
+	// without this an uploaded file comes back as http://127.0.0.1:10002/object/…,
+	// which no phone can open. Sent as X-Request-Api, the same header nginx sets.
+	PublicAPI string
+
 	// The admin token is valid for 90 days but costs a round trip, so it is
 	// cached and refreshed well before OpenIM would expire it.
 	mu         sync.Mutex
@@ -81,6 +88,9 @@ func (c *Client) post(ctx context.Context, path string, body any, token string, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("operationID", operationID())
+	if c.PublicAPI != "" {
+		req.Header.Set("X-Request-Api", c.PublicAPI)
+	}
 	if token != "" {
 		req.Header.Set("token", token)
 	}
@@ -219,6 +229,60 @@ func (c *Client) UserExists(ctx context.Context, userID string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// UserFaces reads many accounts' avatar URLs in one call. Accounts with none
+// are simply absent from the result.
+func (c *Client) UserFaces(ctx context.Context, userIDs []string) (map[string]string, error) {
+	out := map[string]string{}
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		UsersInfo []struct {
+			UserID  string `json:"userID"`
+			FaceURL string `json:"faceURL"`
+		} `json:"usersInfo"`
+	}
+	if err := c.post(ctx, "/user/get_users_info", map[string]any{"userIDs": userIDs}, admin, &resp); err != nil {
+		return nil, err
+	}
+	for _, u := range resp.UsersInfo {
+		if u.FaceURL != "" {
+			out[u.UserID] = u.FaceURL
+		}
+	}
+	return out, nil
+}
+
+// UserFace reads one account's avatar URL. Empty when the account has none,
+// which is the common case — most people never set one.
+//
+// yptd 自己的库里没有头像字段，头像只存在 OpenIM 的 faceURL 上。推送通知要用它。
+func (c *Client) UserFace(ctx context.Context, userID string) (string, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		UsersInfo []struct {
+			UserID  string `json:"userID"`
+			FaceURL string `json:"faceURL"`
+		} `json:"usersInfo"`
+	}
+	if err := c.post(ctx, "/user/get_users_info", map[string]any{"userIDs": []string{userID}}, admin, &out); err != nil {
+		return "", err
+	}
+	for _, u := range out.UsersInfo {
+		if u.UserID == userID {
+			return u.FaceURL, nil
+		}
+	}
+	return "", nil
 }
 
 func asError(err error, target **Error) bool {

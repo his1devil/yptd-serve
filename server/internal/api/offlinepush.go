@@ -85,6 +85,17 @@ func (n *pushNames) GroupName(groupID string) string {
 	})
 }
 
+func (n *pushNames) Avatar(userID string) string {
+	return n.s.faces.get(userID, func() string {
+		face, err := n.s.openim.UserFace(n.ctx, userID)
+		if err != nil {
+			n.s.log.Warn("offline push: avatar", "err", err, "user", userID)
+			return ""
+		}
+		return face
+	})
+}
+
 func (n *pushNames) IsAgent(userID string) bool {
 	for _, a := range n.s.cfg.Agents {
 		if a.UserID == userID {
@@ -123,4 +134,21 @@ func (c *nameCache) get(key string, load func() string) string {
 	c.m[key] = cached{name: name, at: time.Now()}
 	c.mu.Unlock()
 	return name
+}
+
+// peek 只看缓存，不加载。
+func (c *nameCache) peek(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.m[key]
+	if !ok || time.Since(v.at) >= c.ttl {
+		return "", false
+	}
+	return v.name, true
+}
+
+func (c *nameCache) put(key, name string) {
+	c.mu.Lock()
+	c.m[key] = cached{name: name, at: time.Now()}
+	c.mu.Unlock()
 }

@@ -37,12 +37,14 @@ type Server struct {
 	bot       *bot.Bot
 	botBudget time.Duration
 
-	// groupNames caches group names for offline push titles; see offlinepush.go.
+	// groupNames / faces cache what an offline push notification needs to say and
+	// draw, so a burst of messages in one room is not a burst of RPCs. See offlinepush.go.
 	groupNames *nameCache
+	faces      *nameCache
 }
 
 func New(cfg config.Config, st *store.Store, im *openim.Client, log *slog.Logger) *Server {
-	s := &Server{cfg: cfg, store: st, openim: im, log: log, groupNames: newNameCache(time.Minute)}
+	s := &Server{cfg: cfg, store: st, openim: im, log: log, groupNames: newNameCache(time.Minute), faces: newNameCache(5 * time.Minute)}
 	if cfg.BotEnabled() {
 		agent := bot.NewOpencode(
 			cfg.BotOpencodeURL, cfg.BotOpencodeUser, cfg.BotOpencodePassword,
@@ -420,6 +422,20 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, userRow(u, agents))
 	}
+	// 头像跟着名册一起给。每取一个对象有 ~0.5 秒和体积无关的固定开销，所以头像这种小
+	// 东西要省的是往返，不是字节：客户端拿到名册就知道每个人的头像地址，不用再按人去问
+	// OpenIM。取不到就不给，客户端各自有兜底，名册不该因为头像挂掉。
+	ids := make([]string, 0, len(out))
+	for _, row := range out {
+		ids = append(ids, row["user_id"].(string))
+	}
+	for id, face := range s.rosterFaces(r.Context(), ids) {
+		for _, row := range out {
+			if row["user_id"] == id {
+				row["avatar"] = face
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
 }
 
@@ -597,4 +613,35 @@ func deriveUserID(nickname string) string {
 		id = id[:32]
 	}
 	return id
+}
+
+// rosterFaces 一次把一批账号的头像地址问回来，结果按人缓存五分钟（和推送用的是同一份
+// 缓存）。出错只记日志、回已有的那部分。
+func (s *Server) rosterFaces(ctx context.Context, ids []string) map[string]string {
+	out := make(map[string]string, len(ids))
+	var missing []string
+	for _, id := range ids {
+		if face, ok := s.faces.peek(id); ok {
+			if face != "" {
+				out[id] = face
+			}
+			continue
+		}
+		missing = append(missing, id)
+	}
+	if len(missing) == 0 {
+		return out
+	}
+	found, err := s.openim.UserFaces(ctx, missing)
+	if err != nil {
+		s.log.Warn("roster: avatars", "err", err)
+		return out
+	}
+	for _, id := range missing {
+		s.faces.put(id, found[id]) // 没头像的也记一笔空串，省得每次都去问
+		if found[id] != "" {
+			out[id] = found[id]
+		}
+	}
+	return out
 }

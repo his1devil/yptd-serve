@@ -82,6 +82,8 @@ type Decision struct {
 type Names interface {
 	Nickname(userID string) string
 	GroupName(groupID string) string
+	// Avatar 是发送者的头像地址，没设就是空串。手机在通知里画它，空了退回 app 的标记。
+	Avatar(userID string) string
 	IsAgent(userID string) bool
 }
 
@@ -127,11 +129,11 @@ func Decide(req Request, names Names, placeholder string) Decision {
 	if sender == "" {
 		sender = name(req.SendID)
 	}
-	var conversation string
+	var conversation, room string
 	info := Info{IOSPushSound: "default", IOSBadgeCount: true}
 	if group {
 		conversation = "sg_" + req.GroupID
-		room := name(names.GroupName(req.GroupID))
+		room = name(names.GroupName(req.GroupID))
 		if room == "" {
 			room = "群聊"
 		}
@@ -149,7 +151,10 @@ func Decide(req Request, names Names, placeholder string) Decision {
 		info.Title = sender
 		info.Desc = preview
 	}
-	info.Ex = Ex(Route{Conversation: conversation, Kind: kind, RunID: runID, MsgID: req.ClientMsgID, At: at})
+	info.Ex = Ex(Route{
+		Conversation: conversation, Kind: kind, RunID: runID, MsgID: req.ClientMsgID,
+		From: req.SendID, Name: sender, Room: room, Avatar: names.Avatar(req.SendID), At: at,
+	})
 
 	d := Decision{Info: info}
 	if group && !sameSet(recipients, req.UserIDs) {
@@ -172,6 +177,14 @@ type Route struct {
 	// 本地往往还没同步到它，没有这个 id 就只能等一个粗粒度的「同步完了」信号。
 	// （OpenIM 自己的极光适配器也会塞 ClientMsgID，但那个字段全链路没人赋值，是死的。）
 	MsgID string
+	// From / Name / Room 是发送者的账号、显示名和群名。Title/Desc 是拼好的展示文字，
+	// 但 iOS 的通知扩展要把它们分开填进 INSendMessageIntent 才能画出大头像，从
+	// 「#群名」「张三：内容」里往回拆是在跟一个字符串格式较劲。Room 私聊时为空。
+	From string
+	Name string
+	Room string
+	// Avatar 是发送者的头像地址，没有就留空——手机端退回 app 自己的标记。
+	Avatar string
 	// At 是这条消息 @ 到的人，`["*"]` 表示 @所有人。一条群消息只有一份通知文案，服务端
 	// 没法对被 @ 的人说「提到了你」、对其他人说别的；把名单放进来，手机端知道自己是谁，
 	// 展示时自己加重。
@@ -190,6 +203,18 @@ func Ex(r Route) string {
 	}
 	if r.MsgID != "" {
 		m["msg_id"] = r.MsgID
+	}
+	if r.From != "" {
+		m["from"] = r.From
+	}
+	if r.Name != "" {
+		m["name"] = r.Name
+	}
+	if r.Room != "" {
+		m["room"] = r.Room
+	}
+	if r.Avatar != "" {
+		m["avatar"] = r.Avatar
 	}
 	if len(r.At) > 0 {
 		m["at"] = r.At

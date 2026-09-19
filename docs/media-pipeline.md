@@ -76,6 +76,13 @@ OpenIM 的 `faceURL` 只有一个字段，所以头像的小尺寸继续走 §5 
 - 桌面：不引入 ffmpeg（+70 MB），不转码。上限 100 MB，超过 10 MB 时在发送前提示
   「接收方下载约需 N 秒」。封面 `p` 和时长 `d` 用渲染进程的 `<video>` + canvas 生成。
 
+### 上传用的 hash
+
+OpenIM 秒传去重用的 `hash` **不是文件的 MD5**，而是「各分片 MD5 的十六进制用逗号连起来，再做一次
+MD5」；单片文件就是 `md5(md5hex(data))`。三端 SDK 都这么算，所以同一个文件从哪端传都能秒传。
+自己调上传接口时拿文件 MD5 当 hash，PUT 会成功，到 `complete_multipart_upload` 才报
+`md5 mismatching`（服务端 `openim.Client.Upload` 踩过）。
+
 ### 对象名
 
 `<userID>/<128 位随机 id，base32>.<ext>`。`<userID>/` 前缀是 OpenIM 强制的。原始文件名只进 `n`。

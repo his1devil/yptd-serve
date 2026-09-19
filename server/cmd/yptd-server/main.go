@@ -8,6 +8,8 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +27,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/his1devil/yptd/server/internal/api"
+	"github.com/his1devil/yptd/server/internal/art"
 	"github.com/his1devil/yptd/server/internal/bot"
 	"github.com/his1devil/yptd/server/internal/config"
 	"github.com/his1devil/yptd/server/internal/invite"
@@ -125,6 +128,7 @@ func open(ctx context.Context) (config.Config, *store.Store, *openim.Client, err
 		return config.Config{}, nil, nil, err
 	}
 	im := openim.New(cfg.OpenIMAPI, cfg.OpenIMSecret, cfg.OpenIMAdminUserID)
+	im.PublicAPI = cfg.PublicAPI
 	return cfg, st, im, nil
 }
 
@@ -446,7 +450,19 @@ func cmdBot(args []string) error {
 
 	switch args[0] {
 	case "setup":
+		pool, err := art.Pool(cfg.AgentArtDir)
+		if err != nil {
+			return err
+		}
 		for _, a := range cfg.Agents {
+			// 头像：agents.json 里是公网地址就原样用；是文件（或者没填，从池子里按 id 挑
+			// 一张）就传进对象存储。传过的内容再传是秒传，所以 setup 反复跑不产生新对象。
+			face, err := agentFace(ctx, im, a, cfg.AgentArtDir, pool)
+			if err != nil {
+				// 头像传不上不该拦住账号就绪：agent 照样能用，只是各端画兜底。
+				fmt.Printf("头像没传上 %s：%v\n", a.UserID, err)
+			}
+			a.Avatar = face
 			exists, err := im.UserExists(ctx, a.UserID)
 			if err != nil {
 				return err
@@ -570,4 +586,19 @@ func cmdBot(args []string) error {
 		return nil
 	}
 	return fmt.Errorf("未知子命令 bot %s", args[0])
+}
+
+// agentFace 得出一个 agent 头像的公网地址，必要时先把图传上去。
+func agentFace(ctx context.Context, im *openim.Client, a config.Agent, dir string, pool []string) (string, error) {
+	src := art.Resolve(a.Avatar, a.UserID, dir, pool)
+	if src.URL != "" || src.File == "" {
+		return src.URL, nil
+	}
+	data, err := os.ReadFile(src.File)
+	if err != nil {
+		return "", err
+	}
+	sum := md5.Sum(data)
+	name := art.ObjectName(a.UserID, src.File, hex.EncodeToString(sum[:]))
+	return im.Upload(ctx, name, art.ContentType(src.File), "avatar", data)
 }

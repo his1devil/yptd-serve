@@ -25,6 +25,13 @@ type Config struct {
 
 	// OpenIMAPI is the base URL of openim-api.
 	OpenIMAPI string
+	// PublicAPI is the same service as clients reach it (https://im.example.com).
+	// Only needed to upload files: OpenIM builds object URLs from the request's
+	// host, and OpenIMAPI is loopback.
+	PublicAPI string
+	// AgentArtDir holds the portraits agents wear when agents.json names none:
+	// one image per file, picked by a stable hash of the agent's id.
+	AgentArtDir string
 	// OpenIMSecret is the shared secret from OpenIM's share.yml. Holding it is
 	// what lets this service mint tokens for anyone, which is exactly why the
 	// TUI must not have it.
@@ -319,6 +326,8 @@ func Load() (Config, error) {
 		MongoURI:          env("YPTD_MONGO_URI", ""),
 		MongoDB:           env("YPTD_MONGO_DB", "yptd"),
 		OpenIMAPI:         strings.TrimRight(env("YPTD_OPENIM_API", "http://127.0.0.1:10002"), "/"),
+		PublicAPI:         strings.TrimRight(env("YPTD_PUBLIC_API", ""), "/"),
+		AgentArtDir:       env("YPTD_AGENT_ART_DIR", "/opt/openim/etc/agent-art"),
 		OpenIMSecret:      env("YPTD_OPENIM_SECRET", ""),
 		OpenIMAdminUserID: env("YPTD_OPENIM_ADMIN", "imAdmin"),
 		InviteTTL:         24 * time.Hour,
