@@ -39,7 +39,7 @@ type Message struct {
 // Attachment is one file a desktop client put in a message next to its text:
 // `ex` = {"yptd":"rich","a":[{"k":"i"|"f","u":url,"n":name,"s":bytes,...}]}.
 type Attachment struct {
-	Kind string // "image" or "file"
+	Kind string // "image", "video" or "file"
 	URL  string
 	Name string
 }
@@ -81,8 +81,13 @@ func parseRich(ex string) ([]Attachment, bool) {
 			continue
 		}
 		kind := "file"
-		if a.K == "i" {
+		switch a.K {
+		case "i":
 			kind = "image"
+		case "v":
+			// 视频以前落进「文件」，模型拿到的是「文件 1EF68611-….mp4」——iOS 用临时文件的
+			// UUID 当名字，光看这个它不知道那是一段视频。
+			kind = "video"
 		}
 		out = append(out, Attachment{Kind: kind, URL: a.U, Name: a.N})
 	}
@@ -388,8 +393,11 @@ func (b *Bot) answer(ctx context.Context, m Message) (string, *run.Run) {
 		prompt += "\n\n对方随消息附了文件（可以用工具读取链接）："
 		for _, a := range m.Attachments {
 			label := "文件"
-			if a.Kind == "image" {
+			switch a.Kind {
+			case "image":
 				label = "图片"
+			case "video":
+				label = "视频"
 			}
 			prompt += fmt.Sprintf("\n- %s %s：%s", label, a.Name, a.URL)
 		}

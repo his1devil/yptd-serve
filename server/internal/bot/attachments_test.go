@@ -37,3 +37,11 @@ func TestTextlessOnlyWhenRichSaysSoAndThereAreAttachments(t *testing.T) {
 		}
 	}
 }
+
+func TestVideoAttachmentsAreNotFiles(t *testing.T) {
+	ex := `{"yptd":"rich","a":[{"k":"v","u":"https://x/a.mp4","n":"1EF6.mp4","s":9,"p":"https://x/p.jpg","d":12.4}],"t":0}`
+	got := ParseAttachments(ex)
+	if len(got) != 1 || got[0].Kind != "video" {
+		t.Fatalf("got %+v", got)
+	}
+}
