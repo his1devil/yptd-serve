@@ -535,3 +535,48 @@ func pushKind(ex string) (kind, runID string) {
 	}
 	return push.Answer, p.Run
 }
+
+// OpenIM 的群角色。
+const (
+	RoleOwner    = 100
+	RoleAdmin    = 60
+	RoleOrdinary = 20
+)
+
+// Member is one person's membership in one group.
+type Member struct {
+	UserID        string `json:"userID"`
+	Nickname      string `json:"nickname"`
+	RoleLevel     int    `json:"roleLevel"`
+	InviterUserID string `json:"inviterUserID"`
+}
+
+// GroupMembers reads the named people's membership in a group. Anyone who is
+// not a member is simply absent from the result.
+func (c *Client) GroupMembers(ctx context.Context, groupID string, userIDs []string) ([]Member, error) {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Members []Member `json:"members"`
+	}
+	body := map[string]any{"groupID": groupID, "userIDs": userIDs}
+	if err := c.post(ctx, "/group/get_group_members_info", body, admin, &out); err != nil {
+		return nil, err
+	}
+	return out.Members, nil
+}
+
+// KickGroupMember removes people from a group, as the administrator: OpenIM
+// lets only the owner (or an admin, for ordinary members) kick, and checks the
+// caller's role — except for the app manager, which is what this token is.
+// 谁有资格让这件事发生，由调用方在这之前判断。
+func (c *Client) KickGroupMember(ctx context.Context, groupID string, userIDs []string, reason string) error {
+	admin, err := c.AdminToken(ctx)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"groupID": groupID, "kickedUserIDs": userIDs, "reason": reason}
+	return c.post(ctx, "/group/kick_group", body, admin, nil)
+}

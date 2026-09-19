@@ -306,6 +306,27 @@ Accept: text/event-stream
 
 ---
 
+### 把 agent 移出频道
+
+```
+DELETE /v1/groups/{groupID}/agents/{agentID}      Authorization: Bearer <device_token>
+→ 200 {"ok":true} | 403 {"error":"not_allowed","message":"…"} | 404 no_such_agent
+```
+
+**群主，或者当初把这个 agent 拉进来的人**可以移除它（邀请人取 OpenIM 成员记录的
+`inviterUserID`）。不要让客户端直接调 SDK 的踢人：OpenIM 只认群角色，而线上所有群都没有
+管理员，结果就是每个群只有群主动得了 agent。服务端验过资格后用管理员身份去踢，并且：
+
+- agent 走之前在群里留一句「X 把我移出了这个频道」——客户端不渲染 OpenIM 的成员变动通知，
+  没有这句话别人只会发现 @ 不到它了；
+- 删掉这个频道里给它配的盯盘 / 新闻。行情和新闻每轮都重查 agent 所在的群，所以推送自动停。
+
+403 的 `message` 是给人看的，直接显示。界面上的「移除」按钮按同一条规则决定显不显示
+（成员信息里有 `roleLevel` 和 `inviterUserID`）。踢**人**仍然走 SDK，仍然只有群主能做。
+
+agent 的配置接口（`/v1/agents/{id}/config`）同日补了成员校验：不在那个频道里的人读写都是
+403 `not_a_member`。
+
 ## 8. 隐私开关（2026-09 新增，对客户端有影响）
 
 每个账号有两个开关，**默认都是关的**：

@@ -106,6 +106,7 @@ func (s *Server) Routes() http.Handler {
 	// agent 在某个频道里怎么表现。表单由服务端描述，客户端通用渲染。
 	mux.HandleFunc("GET /v1/agents/{id}/config", s.handleAgentConfig)
 	mux.HandleFunc("PUT /v1/agents/{id}/config", s.handleAgentConfig)
+	mux.HandleFunc("DELETE /v1/groups/{group}/agents/{id}", s.handleRemoveAgent)
 	// Agent runs: live stream, record, list, stop.
 	mux.HandleFunc("GET /v1/runs", s.handleRuns)
 	mux.HandleFunc("GET /v1/runs/{id}", s.handleRun)

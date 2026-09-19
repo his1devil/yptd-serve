@@ -360,6 +360,16 @@ func (s *Store) AgentNews(ctx context.Context, agentID string) (map[string]confi
 }
 
 // SetAgentConfig writes one agent's settings in one group.
+// DeleteAgentConfig drops what an agent was set up to do in one group. Missing
+// is fine: most agents in most groups were never configured.
+func (s *Store) DeleteAgentConfig(ctx context.Context, agentID, groupID string) error {
+	_, err := s.db.Collection("agent_configs").DeleteOne(ctx, bson.M{"_id": agentConfigID(agentID, groupID)})
+	if err != nil {
+		return fmt.Errorf("store: delete agent config: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) SetAgentConfig(ctx context.Context, ga GroupAgent) error {
 	ga.ID = agentConfigID(ga.AgentID, ga.GroupID)
 	ga.UpdatedAt = time.Now()

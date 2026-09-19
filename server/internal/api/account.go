@@ -279,16 +279,27 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	if s.bot != nil {
 		descs = s.bot.Describe(r.Context())
 	}
+	ids := make([]string, 0, len(s.cfg.Agents))
+	for _, a := range s.cfg.Agents {
+		ids = append(ids, a.UserID)
+	}
+	// 头像取 OpenIM 里的 faceURL，不取 agents.json 的 avatar：后者可能是个文件名或者
+	// 留空（由池子按 id 挑），只有 setup 传完之后的那个地址才是客户端能用的。
+	faces := s.rosterFaces(r.Context(), ids)
 	out := make([]map[string]any, 0, len(s.cfg.Agents))
 	for _, a := range s.cfg.Agents {
 		tag := a.Tag
 		if tag == "" {
 			tag = "AGENT"
 		}
-		out = append(out, map[string]any{
+		row := map[string]any{
 			"user_id": a.UserID, "nickname": a.Nickname, "tag": tag, "color": a.Color,
 			"model": a.Model, "opencode": a.Opencode, "description": descs[a.UserID],
-		})
+		}
+		if face := faces[a.UserID]; face != "" {
+			row["avatar"] = face
+		}
+		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": out})
 }

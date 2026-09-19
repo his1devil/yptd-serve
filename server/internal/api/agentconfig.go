@@ -104,6 +104,12 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "no_such_agent", "没有这个 agent")
 		return
 	}
+	// 只有这个频道的成员能看、能改它里面 agent 的配置。以前这里只验了登录：任何有账号的人
+	// 都能改任何频道的盯盘清单。
+	if !s.isMember(r, groupID, cred.UserID) {
+		fail(w, http.StatusForbidden, "not_a_member", "你不在这个频道里")
+		return
+	}
 	shape, configurable := formFor(agent)
 	if !configurable {
 		fail(w, http.StatusNotFound, "not_configurable", "这个 agent 没有可配置的项")
